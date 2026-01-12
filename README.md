@@ -1,4 +1,4 @@
-# <img src="./assets/cafe_icon.png" alt="CAFÉ: Compression Adaptative Filtering Experiment" style="vertical-align: bottom"/> CAFE Format
+# <img src="./assets/cafe_logo.png" alt="CAFÉ: Compression Adaptative Filtering Experiment" style="vertical-align: bottom"/> CAFE Format
 
 ### Compression Adaptive Filtering Experiment
 
@@ -277,3 +277,4 @@ _"Good data formats are invisible; great ones make your entire pipeline faster."
 **Repository**: <https://github.com/seccofs/cafe>
 
 ☕ _Last updated: January 2025_
+
