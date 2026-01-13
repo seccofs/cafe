@@ -85,7 +85,7 @@ Store embeddings, labels, segmentation masks, and features directly alongside th
 
 ### Building from Source
 
-````bash
+```bash
 # Clone the repository
 git clone https://github.com/yourusername/cafe-format.git
 cd cafe-format
@@ -95,6 +95,7 @@ make
 
 # Install system-wide (optional)
 sudo make install
+```
 
 ### Basic Usage in C
 
@@ -275,5 +276,6 @@ _"Good data formats are invisible; great ones make your entire pipeline faster."
 **Repository**: <https://github.com/seccofs/cafe>
 
 ☕ _Last updated: January 2025_
+
 
 
