@@ -1,6 +1,4 @@
-# <img src="./assets/cafe_icon.png" alt="CAFÉ: Compression Adaptative Filtering Experiment" style="vertical-align: bottom"/> CAFE Format
-
-### Compression Adaptive Filtering Experiment
+# ![CAFÉ: Compression Adaptative Filtering Experiment](./assets/cafe_logo.png)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Status: Experimental](https://img.shields.io/badge/Status-Experimental-orange)](https://github.com/yourusername/cafe-format)
