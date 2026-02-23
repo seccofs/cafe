@@ -442,10 +442,10 @@ _"The best data format is the one you never think about—until you benchmark it
 
 ---
 
-**Maintainer**: Daniel Secco Ferreira e Silva
-**Status**: Specification complete, implementation Phase 0 (Bootstrap)
-**Contact**: daniel.secco@computer.org
-**Repository**: <https://github.com/seccofs/cafe>
-**License**: MIT
+**Maintainer**: Daniel Secco<br/>
+**Status**: Specification complete, implementation Phase 0 (Bootstrap)<br/>
+**Contact**: daniel.secco@computer.org<br/>
+**Repository**: <https://github.com/seccofs/cafe><br/>
+**License**: MIT<br/>
 
 ☕ _Specification v1.0 finalized: February 2026_
