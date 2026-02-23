@@ -1913,8 +1913,9 @@ VERSÃO 3.0 - RESEARCH (TBD)
 
 ---
 
-**Plano de Implementação v1.0 - Starting from Zero**
-**Última atualização**: 22 de Fevereiro de 2026 (HDR integrado + Future roadmap)
-**Autor**: Daniel Secco Ferreira e Silva
+**Plano de Implementação v1.0 - Starting from Zero**<br/>
+**Última atualização**: 22 de Fevereiro de 2026 (HDR integrado + Future roadmap)<br/>
+**Autor**: Daniel Secco<br/>
 
 *Este plano será atualizado conforme o projeto avança. Extensões futuras estão documentadas mas em standby até v1.0 release.*
+
