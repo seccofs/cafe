@@ -43,7 +43,7 @@ CAFE oferece:
 
 ```
 ┌─────────────────────────────────────────────┐
-│         CAFE File Structure                  │
+│         CAFE File Structure                 │
 ├─────────────────────────────────────────────┤
 │  [File Header]          (fixo: 256 bytes)   │
 ├─────────────────────────────────────────────┤
@@ -167,8 +167,8 @@ typedef enum {
 
 **Características por Formato**:
 
-| Formato       | Tamanho | Range      | Precisão | Uso Típico                      |
-|---------------|---------|------------|----------|---------------------------------|
+| Formato       | Tamanho | Range      | Precisão | Uso Típico                     |
+|---------------|---------|------------|----------|--------------------------------|
 | UINT8         | 1 byte  | [0, 255]   | 256 lvls | LDR padrão (fotos, web)        |
 | UINT10        | 1.25 B  | [0, 1023]  | 1024 lvls| Vídeo profissional             |
 | UINT12        | 1.5 B   | [0, 4095]  | 4096 lvls| RAW, medical imaging           |
@@ -2125,11 +2125,12 @@ typedef struct {
 
 ---
 
-**Documento de Especificação v1.0**
-**Última atualização**: 22 de Fevereiro de 2026
-**Autor**: Daniel Secco Ferreira e Silva
-**Contato**: daniel.secco@computer.org
+**Documento de Especificação v1.0**<br/>
+**Última atualização**: 22 de Fevereiro de 2026<br/>
+**Autor**: Daniel Secco<br/>
+**Contato**: daniel.secco@computer.org<br/>
 
 ---
 
 *Este documento descreve a especificação completa do formato CAFE v1.0, incluindo features core e extensões planejadas para versões futuras. Para status de implementação atual, consulte IMPLEMENTATION_PLAN.md*
+
