@@ -1,0 +1,43 @@
+[package]
+name = "cafe"
+version = "1.1.0"
+edition = "2021"
+authors = ["Daniel Secco <barista@format.cafe>"]
+license = "BSD-3-Clause OR GPL-2.0-or-later"
+description = "CAFE — Compression Adaptative Filtering Experiment. A modern chunk-based image format with ZSTD compression, advanced predictive filters, indexed palette, and structured metadata."
+repository = "https://github.com/yourusername/cafe"
+documentation = "https://docs.rs/cafe"
+readme = "README.md"
+keywords = ["image", "compression", "format", "zstd", "png"]
+categories = ["compression", "encoding"]
+
+[dependencies]
+image = "0.24"
+zstd = "0.13"
+serde_json = "1.0"
+half = "2.4"
+crc32fast = "1.3"
+
+[lib]
+name = "cafe"
+path = "src/cafe.rs"
+
+[[bin]]
+name = "cafe-encode"
+path = "tools/cafe-encode.rs"
+
+[[bin]]
+name = "cafe-decode"
+path = "tools/cafe-decode.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.test]
+opt-level = 1
