@@ -115,8 +115,10 @@ Each block/tile (set of lines in an `IDAT`) chooses a single filter, prefixed by
 
 **Selection heuristics (encoder decides, not part of spec):**
 - Shannon Entropy: Measures pattern redundancy in residuals (default, `FilterHeuristic::Entropy`)
-- Real compression test: Compresses each candidate (ZSTD) and uses smallest (costly, `FilterHeuristic::CompressionTest` — configurable via `--filter-heuristic test`)
-- MSAD: Sum of absolute residual values (fast, classic — available as future alternative)
+- MSAD: Sum of absolute residual values (fast, classic — available as alternative)
+- Real compression test: Compresses each candidate (ZSTD) and uses smallest (costly, `FilterHeuristic::CompressionTest`)
+- QuickPrune (v1.1): Fast MSAD followed by Shannon Entropy on top 8 candidates (~1-2% gain, `FilterHeuristic::QuickPrune`)
+- AdaptiveEntropy (v1.1): Block type analysis + content-aware selection (~2-3% gain on photos, `FilterHeuristic::AdaptiveEntropy`)
 
 ---
 

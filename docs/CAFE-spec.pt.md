@@ -310,6 +310,8 @@ Todos os filtros calculam o resíduo final (`byte_original − predição`) e o 
 | Soma dos valores absolutos dos resíduos (MSAD) | Baixo | Heurística clássica do PNG; assume que resíduo pequeno comprime bem, o que nem sempre é verdade |
 | Entropia de Shannon (ordem zero) dos resíduos | Baixo/médio | Captura repetição de padrão, mais alinhada ao que o estágio de entropia do ZSTD explora; recomendada como padrão |
 | Compressão de teste real (comprimir cada candidato e comparar o tamanho final) | Alto | Resultado ótimo, mas caro — apropriado para um modo de compressão máxima opcional, não para uso padrão |
+| QuickPrune (v1.1) | Baixo/médio | MSAD rápido seguido de Entropia de Shannon nos top 8 candidatos; ~1-2% de ganho de compressão com overhead modesto |
+| AdaptiveEntropy (v1.1) | Médio | Análise de tipo de bloco (Suave/Natural/AltaFreq/Misto) + seleção de filtro consciente do conteúdo; ~2-3% de ganho em fotos naturais |
 
 Um encoder é livre para implementar qualquer uma dessas (ou outra) sem quebrar compatibilidade com nenhum decoder CAFE, desde que grave corretamente o código do filtro efetivamente usado em cada bloco.
 
