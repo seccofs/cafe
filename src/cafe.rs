@@ -24,8 +24,6 @@ pub mod types;
 mod chunk;
 mod codec;
 mod color;
-mod decode;
-mod encode;
 mod filter;
 mod interlace;
 mod shuffle;
