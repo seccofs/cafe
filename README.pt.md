@@ -23,7 +23,7 @@ Um formato de imagem moderno baseado em chunks, inspirado em PNG, com suporte a 
 ### Filtros Preditivos Avançados
 - **16 tipos de filtros**: None, Sub, Up, Average, Paeth, MED, Gradient, Simple Median, 2nd Order, 4-way Directional (4 variantes), Context-Based, TR-Directional (WebP Predictor 10) e Weighted adaptativo (inspirado no JPEG-XL)
 - Aplicados por bloco (tile) para máxima eficiência
-- Seleção automática por heurística: **Entropia de Shannon** (padrão), **MSAD** (`--filter-heuristic msad`) ou **compressão de teste real** (`--filter-heuristic test`), que comprime cada preditor candidato e escolhe o de menor tamanho final
+- Seleção automática por heurística: **Entropia de Shannon** (padrão), **MSAD** (`--filter-heuristic msad`), **compressão de teste real** (`--filter-heuristic test`), **QuickPrune** (v1.1, MSAD rápido + Entropia nos top 8) ou **AdaptiveEntropy** (v1.1, análise consciente do conteúdo)
 
 ### Flexibilidade de Cores
 - **Color types**: Cinza, RGB, Indexado (paleta), Cinza+Alfa, RGBA
