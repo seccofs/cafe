@@ -4,7 +4,7 @@
 
 CAFE (Compression Adaptive Filtering Experiment) is a modern chunk-based image format inspired by PNG, with support for ZSTD compression, advanced predictive filters, indexed palette, and structured metadata (EXIF, JSON, ICC, XMP).
 
-**Specification:** `CAFE-spec.md` (v1.1)
+**Specification:** `docs/CAFE-spec.md` (v1.1)
 **Implementation:** Rust 2021 with dual license (BSD-3-Clause OR GPL-2.0-or-later)
 
 ---
@@ -15,10 +15,14 @@ CAFE (Compression Adaptive Filtering Experiment) is a modern chunk-based image f
 
 ```
 Cafe/
-├── CAFE-spec.md          # Complete format specification
 ├── CLAUDE.md             # This guide (you are here)
 ├── Cargo.toml            # Dependencies and configuration
 ├── Cargo.lock            # Lock of dependencies
+├── README.md             # English README
+├── README.pt.md          # Portuguese README
+├── LICENSE               # Dual license (BSD-3-Clause OR GPL-2.0)
+├── LICENSE-BSD           # BSD-3-Clause license text
+├── LICENSE-GPL           # GPL-2.0-or-later license text
 ├── src/
 │   ├── cafe.rs           # Core: encode/decode, chunks (re-exports)
 │   ├── constants.rs      # Signature, flags, color types, filters
@@ -37,7 +41,9 @@ Cafe/
 ├── tests/                # Integration and round-trip tests
 ├── examples/             # Usage examples
 ├── docs/                 # Spec, security audit, dev guide
-└── .github/workflows/    # CI (build, clippy -D warnings, fmt, doc)
+│   ├── CAFE-spec.md      # Complete format specification (v1.1)
+│   └── CAFE-spec.pt.md   # Portuguese version of the spec
+└── .github/workflows/    # CI (build, clippy -D warnings, fmt, doc, security audit)
 ```
 
 ### Main Dependencies
@@ -271,9 +277,13 @@ File .cafe
 
 ---
 
-## Reference Implementation (src/cafe.rs)
+## Reference Implementation
+
+Public entry points and chunk I/O live in `src/cafe.rs`; internal helpers are split across the modules listed above (`color.rs`, `filter.rs`, `codec.rs`, `chunk.rs`, etc.).
 
 ### Main Structures
+
+`CafeError` lives in `src/error.rs`; `Palette`, `iDim`, `cHDR`, `EncodeOptions`, `DecodeResult`, `FilterHeuristic`, `PaletteEntry` live in `src/types.rs`. All are re-exported from `src/cafe.rs`.
 
 ```rust
 pub enum CafeError {
@@ -340,6 +350,8 @@ pub struct DecodeResult {
 
 ### Color Conversion Functions
 
+Implemented in `src/color.rs`:
+
 ```rust
 // RGBA → color_type (with bit_depth reduction if necessary)
 fn convert_rgba_to_color_type(
@@ -368,6 +380,8 @@ fn convert_color_type_to_rgba(
 ```
 
 ### Predictive Filter Functions
+
+Implemented in `src/filter.rs`:
 
 ```rust
 // High level (per block/tile): chooses a single filter and prefixes 1 byte
@@ -405,6 +419,8 @@ fn choose_best_block_filter(tile_raw, tile_height, bytes_per_row, bpp, heuristic
 ```
 
 ### Sub-byte Packing/Unpacking
+
+Implemented in `src/color.rs`:
 
 ```rust
 fn pack_samples_row(
