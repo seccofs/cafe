@@ -56,8 +56,8 @@ jobs:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: rustsec/audit-check-action@v1
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@main
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
