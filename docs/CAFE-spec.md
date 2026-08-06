@@ -310,6 +310,8 @@ All filters calculate the final residual (`original_byte − prediction`) and re
 | Sum of absolute values of residuals (MSAD) | Low | Classic PNG heuristic; assumes small residual compresses well, which is not always true |
 | Shannon Entropy (order zero) of residuals | Low/medium | Captures pattern repetition, more aligned with what ZSTD entropy stage exploits; recommended as default |
 | Real compression test (compress each candidate and compare final size) | High | Optimal result, but expensive — appropriate for optional maximum compression mode, not standard use |
+| QuickPrune (v1.1) | Low/medium | Fast MSAD followed by Shannon Entropy on top 8 candidates; ~1-2% compression gain with modest overhead |
+| AdaptiveEntropy (v1.1) | Medium | Block type analysis (Smooth/Natural/HighFreq/Mixed) + content-aware filter selection; ~2-3% gain on natural photos |
 
 An encoder is free to implement any of these (or another) without breaking compatibility with any CAFE decoder, as long as it correctly writes the code of the filter actually used in each block.
 
