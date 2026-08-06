@@ -14,14 +14,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 3 {
-        eprintln!("Uso: {} <input.png> <output.cafe>", args[0]);
+        eprintln!("Usage: {} <input.png> <output.cafe>", args[0]);
         std::process::exit(1);
     }
 
     let input_path = &args[1];
     let output_path = &args[2];
 
-    println!("📦 Encodando {} → {}", input_path, output_path);
+    println!("📦 Encoding {} → {}", input_path, output_path);
 
     // Configure encoding options
     let opts = EncodeOptions {
@@ -35,14 +35,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Encode
     match encode(input_path, output_path, &opts) {
         Ok(()) => {
-            println!("✅ Sucesso! Arquivo salvo em: {}", output_path);
+            println!("✅ Success! File saved at: {}", output_path);
 
             // Show size
             let metadata = std::fs::metadata(output_path)?;
-            println!("   Tamanho: {} bytes", metadata.len());
+            println!("   Size: {} bytes", metadata.len());
         }
         Err(e) => {
-            eprintln!("❌ Erro ao encodar: {}", e);
+            eprintln!("❌ Error encoding: {}", e);
             std::process::exit(1);
         }
     }
