@@ -49,7 +49,7 @@ pub(crate) fn apply_byte_shuffle(
     // Validate buffer size
     if raw.len() != total_bytes {
         return Err(CafeError::TruncatedFile(format!(
-            "Byte-shuffle: esperado {} bytes, obtido {}",
+            "Byte-shuffle: expected {} bytes, got {}",
             total_bytes,
             raw.len()
         )));
@@ -103,7 +103,7 @@ pub(crate) fn undo_byte_shuffle(
 
     if shuffled.len() != total_bytes {
         return Err(CafeError::TruncatedFile(format!(
-            "Byte-unshuffle: esperado {} bytes, obtido {}",
+            "Byte-unshuffle: expected {} bytes, got {}",
             total_bytes,
             shuffled.len()
         )));

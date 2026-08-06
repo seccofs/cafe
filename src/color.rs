@@ -1227,7 +1227,7 @@ pub(crate) fn unpack_samples_row(
         let expected = width * bpp;
         if packed.len() < expected {
             return Err(CafeError::TruncatedFile(format!(
-                "unpack_samples_row: buffer curto para bit_depth=8, esperado {} obtido {}",
+                "unpack_samples_row: buffer too short for bit_depth=8, expected {} got {}",
                 expected,
                 packed.len()
             )));
@@ -1254,7 +1254,7 @@ pub(crate) fn unpack_samples_row(
     let expected_packed_len = bits_total.div_ceil(8) as usize;
     if packed.len() < expected_packed_len {
         return Err(CafeError::TruncatedFile(format!(
-            "unpack_samples_row: buffer curto, esperado {} bytes obtido {}",
+            "unpack_samples_row: buffer too short, expected {} bytes got {}",
             expected_packed_len,
             packed.len()
         )));
@@ -1293,7 +1293,7 @@ pub(crate) fn unpack_indices_row(packed: &[u8], bit_depth: u8, width: usize) -> 
     if bit_depth == 8 {
         if packed.len() < width {
             return Err(CafeError::TruncatedFile(format!(
-                "Buffer packed curto: esperado >= {} bytes, obtido {}",
+                "Packed buffer too short: expected >= {} bytes, got {}",
                 width,
                 packed.len()
             )));
@@ -1312,7 +1312,7 @@ pub(crate) fn unpack_indices_row(packed: &[u8], bit_depth: u8, width: usize) -> 
     let expected_packed_len = (width * bit_depth as usize).div_ceil(8);
     if packed.len() < expected_packed_len {
         return Err(CafeError::TruncatedFile(format!(
-            "Buffer packed curto para width={}, bit_depth={}: esperado {} bytes, obtido {}",
+            "Packed buffer too short for width={}, bit_depth={}: expected {} bytes, got {}",
             width,
             bit_depth,
             expected_packed_len,
