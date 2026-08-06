@@ -18,7 +18,7 @@ Complete security audit of CAFE v1.0 project revealed **excellent security pract
 
 **Severity**: MEDIUM  
 **CWE**: CWE-190 (Integer Overflow)  
-**Location**: `src/lib.rs:1356`
+**Location**: `src/interlace.rs` — `extract_adam7_pass()`
 
 **Problem**:
 - Use of `saturating_mul()` which silences overflow
@@ -36,7 +36,7 @@ Complete security audit of CAFE v1.0 project revealed **excellent security pract
 
 **Severity**: MEDIUM  
 **CWE**: CWE-252 (Unchecked Return Value)  
-**Location**: `src/lib.rs:2300`
+**Location**: `src/cafe.rs:1342`
 
 **Problem**:
 - Unpacked palette could remain empty without validation
@@ -133,13 +133,13 @@ Complete security audit of CAFE v1.0 project revealed **excellent security pract
 
 | Protection | CWE | Location | Status |
 |----------|-----|-----------|--------|
-| Decompression bomb | CWE-409 | `src/lib.rs:1691` | ✅ 1 GiB limit |
-| Truncated file handling | CWE-235 | `src/lib.rs:1598-1684` | ✅ Checked arithmetic |
-| Invalid chunk types | CWE-20 | `src/lib.rs:1623-1633` | ✅ ASCII validation |
-| Unknown critical chunks | CWE-327 | `src/lib.rs:3700-3709` | ✅ Rejects uppercase |
-| Degenerate dimensions | CWE-190 | `src/lib.rs:3276-3280` | ✅ Width/Height > 0 |
+| Decompression bomb | CWE-409 | `src/codec.rs` | ✅ 1 GiB limit |
+| Truncated file handling | CWE-235 | `src/cafe.rs` (decode loop) | ✅ Checked arithmetic |
+| Invalid chunk types | CWE-20 | `src/cafe.rs` | ✅ ASCII validation |
+| Unknown critical chunks | CWE-327 | `src/cafe.rs` | ✅ Rejects uppercase |
+| Degenerate dimensions | CWE-190 | `src/cafe.rs` | ✅ Width/Height > 0 |
 | Filter method validation | CWE-20 | `src/cafe.rs` | ✅ 0/1/2; byte-shuffle with bpp ∈ {2,4,8,16} |
-| Interlace validation | CWE-20 | `src/lib.rs:3514-3523` | ✅ 0, 1, 2 only |
+| Interlace validation | CWE-20 | `src/cafe.rs` | ✅ 0, 1, 2 only |
 
 ---
 
