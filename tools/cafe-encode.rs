@@ -6,35 +6,35 @@ use cafe::{cHDR, encode, encode_indexed, EncodeOptions, FilterHeuristic};
 use image::io::Reader as ImageReader;
 
 fn usage() {
-    eprintln!("Uso: cafe-encode <entrada> <saida.cafe> [opções]");
+    eprintln!("Usage: cafe-encode <input> <output.cafe> [options]");
     eprintln!();
-    eprintln!("Opções:");
-    eprintln!(
-        "  --no-filter              Desativa filtro preditivo (mais rápido, menos compressão)"
-    );
-    eprintln!("  --byte-shuffle           Usa byte-shuffle (Filter Method=1): reordena bytes de");
-    eprintln!("                           amostras multi-byte (bpp 2/4/8) para melhor compressão");
-    eprintln!("                           de dados float/HDR (v1.1)");
-    eprintln!("  --filter-heuristic <h>   Heurística de escolha do filtro por bloco:");
-    eprintln!("                           entropy (padrão, barato), msad (SAD clássico do PNG,");
-    eprintln!("                           muito barato) ou test (comprime cada candidato e");
-    eprintln!("                           escolhe o menor, custoso)");
-    eprintln!("  --level <1-22>           Nível de compressão ZSTD (padrão: 19, intervalo: 1-22)");
-    eprintln!("                           1=rápido/grande, 22=lento/pequeno");
-    eprintln!("  --color-type <tipo>      Tipo de cor (padrão: detecta automaticamente):");
+    eprintln!("Options:");
+    eprintln!("  --no-filter              Disable predictive filter (faster, less compression)");
+    eprintln!("  --byte-shuffle           Use byte-shuffle (Filter Method=1): reorders bytes of");
+    eprintln!("                           multi-byte samples (bpp 2/4/8) for better compression");
+    eprintln!("                           of float/HDR data (v1.1)");
+    eprintln!("  --filter-heuristic <h>  Filter selection heuristic per block:");
+    eprintln!("                           entropy (default, Shannon entropy),");
+    eprintln!("                           msad (PNG classic, very fast),");
+    eprintln!("                           test (real ZSTD compression, slow),");
+    eprintln!("                           quick-prune (MSAD+entropy, balanced, v1.1),");
+    eprintln!("                           adaptive (content-aware, better photos, v1.1)");
+    eprintln!("  --level <1-22>           ZSTD compression level (default: 19, range: 1-22)");
+    eprintln!("                           1=fast/large, 22=slow/small");
+    eprintln!("  --color-type <type>      Color type (default: auto-detect):");
     eprintln!("                           0=GRAY (1 byte/px, -75%), 2=RGB (3 bytes/px, -25%)");
     eprintln!("                           4=GRAY_ALPHA (2 bytes/px), 6=RGBA (4 bytes/px)");
-    eprintln!("  --bit-depth <d>           Bit depth alvo para uint (padrão: 8):");
+    eprintln!("  --bit-depth <d>          Target bit depth for uint (default: 8):");
     eprintln!(
         "                           GRAY/GRAY_ALPHA: 1,2,4,8,10,12,16,32; RGB/RGBA: 8,10,12,16,32"
     );
-    eprintln!("  --adaptive               Ativa análise de complexidade local por tile");
-    eprintln!("  --indexed                Codifica com paleta indexada (poucas cores: -70-90%)");
-    eprintln!("  --json-file <arquivo>    Arquivo JSON com metadados");
-    eprintln!("  --exif-file <arquivo>    Arquivo binário EXIF bruto");
+    eprintln!("  --adaptive               Enable local complexity analysis per tile");
+    eprintln!("  --indexed                Encode with indexed palette (few colors: -70-90%)");
+    eprintln!("  --json-file <file>       JSON file with metadata");
+    eprintln!("  --exif-file <file>       Raw EXIF binary blob");
     eprintln!();
-    eprintln!("  [v1.0 HDR e interlace]");
-    eprintln!("  --sample-format <fmt>    Formato de amostra (0=uint, 1=float, 2=half-float)");
+    eprintln!("  [v1.0 HDR and interlace]");
+    eprintln!("  --sample-format <fmt>    Sample format (0=uint, 1=float, 2=half-float)");
     eprintln!("  --chdr-transfer <func>   Transfer function (0=linear, 1=PQ, 2=HLG, 3=sRGB)");
     eprintln!("  --chdr-primaries <prim>  Color primaries (0=sRGB, 1=BT.2020, 2=DCI-P3)");
     eprintln!("  --chdr-max-lum <float>   Max luminance (nits)");
@@ -62,7 +62,7 @@ fn main() -> ExitCode {
     match run_encode(&args, src, dst) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("Erro: {e}");
+            eprintln!("Error: {e}");
             ExitCode::FAILURE
         }
     }
@@ -74,16 +74,19 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
     let adaptive_analysis = args.iter().any(|a| a == "--adaptive");
     let user_specified_indexed = args.iter().any(|a| a == "--indexed");
 
-    // Parse --filter-heuristic <entropy|msad|test>
+    // Parse --filter-heuristic <entropy|msad|test|quick-prune|adaptive>
     let filter_heuristic = if let Some(pos) = args.iter().position(|a| a == "--filter-heuristic") {
         let h = &args[pos + 1];
         match h.as_str() {
             "entropy" => FilterHeuristic::Entropy,
             "msad" => FilterHeuristic::Msad,
             "test" => FilterHeuristic::CompressionTest,
+            "quick-prune" => FilterHeuristic::QuickPrune,
+            "adaptive" => FilterHeuristic::AdaptiveEntropy,
             _ => {
                 return Err(format!(
-                    "--filter-heuristic: apenas 'entropy', 'msad' ou 'test', obtido: {h}"
+                    "--filter-heuristic: only 'entropy', 'msad', 'test', 'quick-prune', \
+                     or 'adaptive' accepted, got: {h}"
                 )
                 .into())
             }
@@ -96,10 +99,10 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
     let level = if let Some(pos) = args.iter().position(|a| a == "--level") {
         let level_str = &args[pos + 1];
         let level: i32 = level_str.parse().map_err(|_| {
-            format!("Erro: --level deve ser um número inteiro entre 1 e 22, obtido: {level_str}")
+            format!("Error: --level must be an integer between 1 and 22, got: {level_str}")
         })?;
         if !(1..=22).contains(&level) {
-            return Err(format!("Erro: --level deve estar entre 1 e 22, obtido: {level}").into());
+            return Err(format!("Error: --level must be between 1 and 22, got: {level}").into());
         }
         level
     } else {
@@ -114,9 +117,9 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
         let ct_str = &args[pos + 1];
         let ct: u8 = ct_str
             .parse()
-            .map_err(|_| format!("Erro: --color-type deve ser 0,2,4 ou 6, obtido: {ct_str}"))?;
+            .map_err(|_| format!("Error: --color-type must be 0, 2, 4, or 6, got: {ct_str}"))?;
         if ![0, 2, 4, 6].contains(&ct) {
-            return Err(format!("Erro: --color-type deve ser 0,2,4 ou 6, obtido: {ct}").into());
+            return Err(format!("Error: --color-type must be 0, 2, 4, or 6, got: {ct}").into());
         }
         ct
     } else {
@@ -128,10 +131,10 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
         let bd_str = &args[pos + 1];
         let bd: u8 = bd_str
             .parse()
-            .map_err(|_| format!("Erro: --bit-depth deve ser numérico, obtido: {bd_str}"))?;
+            .map_err(|_| format!("Error: --bit-depth must be numeric, got: {bd_str}"))?;
         if ![1, 2, 4, 8, 10, 12, 16, 32].contains(&bd) {
             return Err(format!(
-                "Erro: --bit-depth deve ser 1, 2, 4, 8, 10, 12, 16 ou 32, obtido: {bd}"
+                "Error: --bit-depth must be 1, 2, 4, 8, 10, 12, 16, or 32, got: {bd}"
             )
             .into());
         }
@@ -165,10 +168,10 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
     let sample_format = if let Some(pos) = args.iter().position(|a| a == "--sample-format") {
         let fmt_str = &args[pos + 1];
         let fmt: u8 = fmt_str.parse().map_err(|_| {
-            format!("--sample-format deve ser 0(uint), 1(float) ou 2(half), obtido: {fmt_str}")
+            format!("--sample-format must be 0(uint), 1(float) or 2(half), got: {fmt_str}")
         })?;
         if ![0, 1, 2].contains(&fmt) {
-            return Err("--sample-format: apenas 0, 1 ou 2 suportados".into());
+            return Err("--sample-format: only 0, 1 or 2 supported".into());
         }
         Some(fmt)
     } else {
@@ -237,10 +240,10 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
     let interlace_method = if let Some(pos) = args.iter().position(|a| a == "--interlace") {
         let method_str = &args[pos + 1];
         let method: u8 = method_str.parse().map_err(|_| {
-            format!("--interlace deve ser 0(none), 1(Adam7) ou 2(Even/Odd), obtido: {method_str}")
+            format!("--interlace must be 0(none), 1(Adam7) or 2(Even/Odd), got: {method_str}")
         })?;
         if ![0, 1, 2].contains(&method) {
-            return Err("--interlace: apenas 0, 1 ou 2 suportados".into());
+            return Err("--interlace: only 0, 1 or 2 supported".into());
         }
         method
     } else {
@@ -321,25 +324,25 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
             0 => "uint",
             1 => "float",
             2 => "half-float",
-            _ => "desconhecido",
+            _ => "unknown",
         };
         println!("  Sample format: {fmt_name}");
     }
 
     if let Some(ref chdr) = chdr {
-        println!("  cHDR encontrado:");
+        println!("  cHDR found:");
         let tf_name = match chdr.transfer_function {
             0 => "linear",
             1 => "PQ (Perceptual Quantizer)",
             2 => "HLG (Hybrid Log-Gamma)",
             3 => "sRGB/gamma",
-            _ => "desconhecido",
+            _ => "unknown",
         };
         let prim_name = match chdr.color_primaries {
             0 => "sRGB/BT.709",
             1 => "BT.2020",
             2 => "DCI-P3",
-            _ => "desconhecido",
+            _ => "unknown",
         };
         println!("    Transfer function: {tf_name}");
         println!("    Color primaries: {prim_name}");
@@ -348,14 +351,14 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
     }
 
     if zstd_dictionary.is_some() {
-        println!("  ZSTD dictionary: incluído");
+        println!("  ZSTD dictionary: included");
     }
 
     if interlace_method > 0 {
         let method_name = match interlace_method {
             1 => "Adam7",
             2 => "Even/Odd",
-            _ => "desconhecido",
+            _ => "unknown",
         };
         println!("  Interlace method: {method_name}");
     }
@@ -365,9 +368,13 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
 
 fn heuristic_name(h: FilterHeuristic) -> &'static str {
     match h {
-        FilterHeuristic::Entropy => "entropy (Entropia de Shannon)",
-        FilterHeuristic::Msad => "msad (soma dos resíduos absolutos)",
-        FilterHeuristic::CompressionTest => "test (compressão de teste real)",
+        FilterHeuristic::Entropy => "entropy (Shannon Entropy)",
+        FilterHeuristic::Msad => "msad (sum of absolute residuals)",
+        FilterHeuristic::CompressionTest => "test (real compression test)",
+        FilterHeuristic::QuickPrune => "quick-prune (fast MSAD + Entropy on top 8, v1.1)",
+        FilterHeuristic::AdaptiveEntropy => {
+            "adaptive (block type analysis + adaptive Entropy, v1.1)"
+        }
     }
 }
 
