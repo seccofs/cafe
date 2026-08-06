@@ -342,7 +342,7 @@ pub(crate) fn apply_tone_mapping_to_image(
 
     if pixels_float.len() != expected_bytes {
         return Err(CafeError::TruncatedFile(format!(
-            "Tone-mapping: esperado {} bytes float, obtido {}",
+            "Tone-mapping: expected {} float bytes, got {}",
             expected_bytes,
             pixels_float.len()
         )));
@@ -584,7 +584,7 @@ mod tests {
         for i in 0..3 {
             assert!(
                 (back[i] - rgb[i]).abs() < 0.02,
-                "roundtrip falhou: {rgb:?} -> {back:?}"
+                "roundtrip failed: {rgb:?} -> {back:?}"
             );
         }
     }
