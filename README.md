@@ -23,7 +23,7 @@ A modern chunk-based image format inspired by PNG, with support for ZSTD compres
 ### Advanced Predictive Filters
 - **16 filter types**: None, Sub, Up, Average, Paeth, MED, Gradient, Simple Median, 2nd Order, 4-way Directional (4 variants), Context-Based, TR-Directional (WebP Predictor 10), and adaptive Weighted (inspired by JPEG-XL)
 - Applied per block (tile) for maximum efficiency
-- Automatic selection via heuristic: **Shannon Entropy** (default), **MSAD** (`--filter-heuristic msad`), or **real compression test** (`--filter-heuristic test`), which compresses each candidate predictor and chooses the smallest final result
+- Automatic selection via heuristic: **Shannon Entropy** (default), **MSAD** (`--filter-heuristic msad`), **real compression test** (`--filter-heuristic test`), **QuickPrune** (v1.1, fast MSAD + Entropy on top 8), or **AdaptiveEntropy** (v1.1, content-aware analysis)
 
 ### Color Flexibility
 - **Color types**: Grayscale, RGB, Indexed (palette), Grayscale+Alpha, RGBA
