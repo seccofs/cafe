@@ -76,11 +76,11 @@ fn roundtrip(opts: &EncodeOptions, label: &str) -> Vec<u8> {
         cafe_path.to_str().unwrap(),
         opts,
     )
-    .expect("encode falhou");
-    decode(cafe_path.to_str().unwrap(), out_path.to_str().unwrap()).expect("decode falhou");
+    .expect("encode failed");
+    decode(cafe_path.to_str().unwrap(), out_path.to_str().unwrap()).expect("decode failed");
 
     let decoded = image::open(&out_path)
-        .expect("falha ao ler PNG decodificado")
+        .expect("failed to read decoded PNG")
         .to_rgba8();
     decoded.into_raw()
 }
@@ -88,12 +88,12 @@ fn roundtrip(opts: &EncodeOptions, label: &str) -> Vec<u8> {
 /// Compares RGBA pixels allowing a tolerance of ±2 per channel (float/half are
 /// lossy in floating-point conversion).
 fn assert_pixels_close(actual: &[u8], expected: &[u8], tolerance: u8) {
-    assert_eq!(actual.len(), expected.len(), "tamanho de pixels difere");
+    assert_eq!(actual.len(), expected.len(), "pixel size differs");
     for (a, e) in actual.iter().zip(expected.iter()) {
         let diff = (*a).abs_diff(*e);
         assert!(
             diff <= tolerance,
-            "pixel divergiu: obtido {a}, esperado {e} (tol {tolerance})"
+            "pixel diverged: got {a}, expected {e} (tol {tolerance})"
         );
     }
 }
@@ -252,11 +252,11 @@ fn roundtrip_image(img: image::RgbaImage, opts: &EncodeOptions, label: &str) -> 
         cafe_path.to_str().unwrap(),
         opts,
     )
-    .expect("encode falhou");
-    decode(cafe_path.to_str().unwrap(), out_path.to_str().unwrap()).expect("decode falhou");
+    .expect("encode failed");
+    decode(cafe_path.to_str().unwrap(), out_path.to_str().unwrap()).expect("decode failed");
 
     image::open(&out_path)
-        .expect("falha ao ler PNG decodificado")
+        .expect("failed to read decoded PNG")
         .to_rgba8()
         .into_raw()
 }
@@ -346,7 +346,7 @@ fn byte_shuffle_rejects_bpp3_rgb() {
         ..EncodeOptions::default()
     };
     let res = encode_result(&opts, "bs_reject_rgb");
-    assert!(res.is_err(), "byte-shuffle com bpp=3 deveria ser rejeitado");
+    assert!(res.is_err(), "byte-shuffle with bpp=3 should be rejected");
 }
 
 #[test]
@@ -358,10 +358,7 @@ fn byte_shuffle_rejects_interlace() {
         ..EncodeOptions::default()
     };
     let res = encode_result(&opts, "bs_reject_interlace");
-    assert!(
-        res.is_err(),
-        "byte-shuffle + interlace deveria ser rejeitado"
-    );
+    assert!(res.is_err(), "byte-shuffle + interlace should be rejected");
 }
 
 // ---------------------------------------------------------------------------
@@ -406,31 +403,31 @@ fn roundtrip_metadata_chunks() {
         cafe_path.to_str().unwrap(),
         &opts,
     )
-    .expect("encode falhou");
+    .expect("encode failed");
 
     let result =
-        decode(cafe_path.to_str().unwrap(), out_path.to_str().unwrap()).expect("decode falhou");
+        decode(cafe_path.to_str().unwrap(), out_path.to_str().unwrap()).expect("decode failed");
 
-    assert_eq!(result.json_metadata, json, "jSON metadata divergiu");
+    assert_eq!(result.json_metadata, json, "jSON metadata diverged");
     assert_eq!(
         result.exif.as_deref(),
         Some(exif.as_slice()),
-        "eXIF divergiu"
+        "eXIF diverged"
     );
     assert_eq!(
         result.icc_profile.as_deref(),
         Some(icc.as_slice()),
-        "iCCP divergiu"
+        "iCCP diverged"
     );
     assert_eq!(
         result.xmp_metadata.as_deref(),
         Some(xmp.as_str()),
-        "xMPd divergiu"
+        "xMPd diverged"
     );
     assert_eq!(
         result.zstd_dictionary.as_deref(),
         Some(dict.as_slice()),
-        "zDIC divergiu"
+        "zDIC diverged"
     );
 }
 
@@ -453,9 +450,9 @@ fn roundtrip_metadata_empty_json() {
         cafe_path.to_str().unwrap(),
         &opts,
     )
-    .expect("encode falhou");
+    .expect("encode failed");
     let result =
-        decode(cafe_path.to_str().unwrap(), out_path.to_str().unwrap()).expect("decode falhou");
+        decode(cafe_path.to_str().unwrap(), out_path.to_str().unwrap()).expect("decode failed");
     assert!(result.json_metadata.is_empty());
     assert!(result.exif.is_none());
     assert!(result.icc_profile.is_none());
