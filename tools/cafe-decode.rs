@@ -4,9 +4,9 @@ use std::process::ExitCode;
 use cafe::decode;
 
 fn usage() {
-    eprintln!("Uso: cafe-decode <entrada.cafe> <saida>");
+    eprintln!("Usage: cafe-decode <input.cafe> <output>");
     eprintln!();
-    eprintln!("Opções:");
+    eprintln!("Options:");
     eprintln!("  --extract-metadata       Extract and display all metadata including cHDR");
 }
 
@@ -29,7 +29,7 @@ fn main() -> ExitCode {
     match run_decode(&args, src, dst) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("Erro: {e}");
+            eprintln!("Error: {e}");
             ExitCode::FAILURE
         }
     }
@@ -39,15 +39,15 @@ fn run_decode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
     let extract_metadata = args.iter().any(|a| a == "--extract-metadata");
 
     let result = decode(src, dst)?;
-    println!("Decodificado: {src} -> {dst}");
+    println!("Decoded: {src} -> {dst}");
 
     if let Some(exif) = &result.exif {
-        println!("  EXIF encontrado: {} bytes", exif.len());
+        println!("  EXIF found: {} bytes", exif.len());
     }
 
     if !result.json_metadata.is_empty() {
         let keys: Vec<&str> = result.json_metadata.keys().map(String::as_str).collect();
-        println!("  Metadados jSON encontrados: {keys:?}");
+        println!("  jSON metadata found: {keys:?}");
         if extract_metadata {
             for (ns, obj) in &result.json_metadata {
                 println!("    [{ns}] {obj}");
@@ -57,19 +57,19 @@ fn run_decode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
 
     // Extract cHDR metadata if present
     if let Some(chdr) = &result.chdr_metadata {
-        println!("  cHDR encontrado:");
+        println!("  cHDR found:");
         let tf_name = match chdr.transfer_function {
             0 => "linear",
             1 => "PQ (Perceptual Quantizer)",
             2 => "HLG (Hybrid Log-Gamma)",
             3 => "sRGB/gamma",
-            _ => "desconhecido",
+            _ => "unknown",
         };
         let prim_name = match chdr.color_primaries {
             0 => "sRGB/BT.709",
             1 => "BT.2020",
             2 => "DCI-P3",
-            _ => "desconhecido",
+            _ => "unknown",
         };
         println!("    Transfer function: {tf_name}");
         println!("    Color primaries: {prim_name}");
@@ -91,17 +91,17 @@ fn run_decode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
 
     // ICC Profile info
     if let Some(icc) = &result.icc_profile {
-        println!("  ICC Profile encontrado: {} bytes", icc.len());
+        println!("  ICC Profile found: {} bytes", icc.len());
     }
 
     // XMP metadata info
     if let Some(xmp) = &result.xmp_metadata {
-        println!("  XMP metadata encontrado: {} bytes", xmp.len());
+        println!("  XMP metadata found: {} bytes", xmp.len());
     }
 
     // ZSTD dictionary info
     if let Some(dict) = &result.zstd_dictionary {
-        println!("  ZSTD dictionary encontrado: {} bytes", dict.len());
+        println!("  ZSTD dictionary found: {} bytes", dict.len());
     }
 
     Ok(())
