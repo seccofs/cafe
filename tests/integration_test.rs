@@ -54,14 +54,14 @@ fn test_encode_with_chdr_metadata() {
         ..EncodeOptions::default()
     };
 
-    encode(&p.input.to_string_lossy(), &p.cafe.to_string_lossy(), &opts).expect("encode falhou");
+    encode(&p.input.to_string_lossy(), &p.cafe.to_string_lossy(), &opts).expect("encode failed");
 
     let result =
-        decode(&p.cafe.to_string_lossy(), &p.out.to_string_lossy()).expect("decode falhou");
+        decode(&p.cafe.to_string_lossy(), &p.out.to_string_lossy()).expect("decode failed");
 
     let chdr = result
         .chdr_metadata
-        .expect("cHDR metadata deveria estar presente");
+        .expect("cHDR metadata should be present");
     assert_eq!(chdr.transfer_function, 1);
     assert_eq!(chdr.color_primaries, 1);
     assert_eq!(chdr.max_luminance, 10000.0);
@@ -81,9 +81,9 @@ fn test_encode_with_sample_format_float() {
     };
 
     encode(&p.input.to_string_lossy(), &p.cafe.to_string_lossy(), &opts)
-        .expect("encode com float falhou");
-    decode(&p.cafe.to_string_lossy(), &p.out.to_string_lossy()).expect("decode de float falhou");
-    assert!(p.out.exists(), "PNG decodificado deveria existir");
+        .expect("encode with float failed");
+    decode(&p.cafe.to_string_lossy(), &p.out.to_string_lossy()).expect("decode with float failed");
+    assert!(p.out.exists(), "Decoded PNG should exist");
 }
 
 #[test]
@@ -97,7 +97,7 @@ fn test_encode_with_sample_format_half() {
     };
 
     encode(&p.input.to_string_lossy(), &p.cafe.to_string_lossy(), &opts)
-        .expect("encode com half falhou");
-    decode(&p.cafe.to_string_lossy(), &p.out.to_string_lossy()).expect("decode com half falhou");
-    assert!(p.out.exists(), "PNG decodificado deveria existir");
+        .expect("encode with half failed");
+    decode(&p.cafe.to_string_lossy(), &p.out.to_string_lossy()).expect("decode with half failed");
+    assert!(p.out.exists(), "Decoded PNG should exist");
 }
