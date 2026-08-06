@@ -60,6 +60,8 @@ cafe/
 │   ├── codec.rs                   # Compressão ZSTD com fallback (seção 3.2)
 │   ├── color.rs                   # Conversões de cor, pack/unpack, float/half
 │   ├── filter.rs                  # 16 filtros preditivos + heurísticas
+│   ├── shuffle.rs                 # Byte-shuffle (Filter Method=1, v1.1)
+│   ├── tonemap.rs                 # HDR tone-mapping (EOTF, primaries, operadores, v1.1)
 │   ├── interlace.rs               # Adam7 e par/ímpar
 │   ├── types.rs                   # EncodeOptions, iDim, cHDR, Palette, etc.
 │   └── error.rs                   # CafeError
@@ -67,15 +69,19 @@ cafe/
 │   ├── cafe-encode.rs            # Encoder binário
 │   └── cafe-decode.rs            # Decoder binário
 ├── docs/                          # Documentação
-│   ├── CAFE-spec.md              # Especificação completa (v1.1, 566 linhas)
+│   ├── CAFE-spec.md              # Especificação completa (v1.1, 602 linhas)
+│   ├── CAFE-spec.pt.md           # Especificação em português
 │   ├── SECURITY_AUDIT.md         # Auditoria de segurança
 │   └── DEVELOPER_GUIDE.md        # Guia para desenvolvedores
 ├── tests/                         # Testes de integração e round-trip
 ├── examples/                      # Exemplos de uso
 ├── Cargo.toml                     # Dependências e configuração
 ├── Cargo.lock                     # Lock de versões
-├── README.md                      # Este arquivo
-├── LICENSE                        # Dual license (BSD-3 OR GPL-2)
+├── README.md                      # Versão em inglês
+├── README.pt.md                   # Este arquivo
+├── LICENSE                        # Dual license (BSD-3-Clause OR GPL-2.0)
+├── LICENSE-BSD                    # Texto da licença BSD-3-Clause
+├── LICENSE-GPL                    # Texto da licença GPL-2.0-or-later
 └── .github/
     └── workflows/                 # CI (build, clippy -D warnings, fmt, doc)
 ```
@@ -206,7 +212,7 @@ crc32fast = "1.3"       # CRC32 para chunks
 
 ## 📚 Documentação
 
-- **[CAFE Specification](docs/CAFE-spec.md)** — Especificação completa (566 linhas)
+- **[CAFE Specification](docs/CAFE-spec.md)** — Especificação completa (602 linhas)
 - **[Security Audit](docs/SECURITY_AUDIT.md)** — Auditoria de segurança detalhada
 - **[Developer Guide](docs/DEVELOPER_GUIDE.md)** — Guia técnico para contribuidores
 - **[API Docs](https://docs.rs/cafe)** — Documentação Rust (gerada por `cargo doc`)
