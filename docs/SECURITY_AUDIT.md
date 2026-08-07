@@ -230,6 +230,40 @@ To report vulnerabilities:
 
 ---
 
+---
+
+## Round 9 — SIMD Vectorization (AVX2, v1.1, August 2026)
+
+New `src/simd.rs` module added for AVX2 optimization of Filters 1, 2, 3:
+
+| CWE | Vector | Check | Status |
+|-----|-------|-------------|--------|
+| CWE-190 (overflow) | `row.len()` on large images | Validated during filter application (existing checks) | ✅ |
+| CWE-125 (OOB read) | SIMD loop bounds in `filter_sub_avx2` | Loop condition ensures `i + 32 <= len` before SIMD load | ✅ |
+| CWE-125 (OOB read) | bpp parameter used for indexing | All SIMD functions receive validated `bpp` from `filter_row` | ✅ |
+| CWE-476 (null ptr) | Unsafe block boundaries | `_mm256_loadu_si256`, `_mm256_storeu_si256` used on valid pointers only | ✅ |
+| CWE-20 (validation) | Feature gate enforcement | `#[cfg(feature = "simd")]` ensures SIMD only compiles when enabled | ✅ |
+| CWE-20 (validation) | Scalar fallback correctness | Fallback functions identical to previous scalar implementation | ✅ |
+
+**Tests added (v1.1):**
+- `simd::tests::test_filter_sub_avx2_roundtrip` — Filter 1 encode/decode
+- `simd::tests::test_filter_up_avx2_roundtrip` — Filter 2 encode/decode
+- `simd::tests::test_filter_average_avx2_roundtrip` — Filter 3 encode/decode
+- `simd::tests::test_filter_sub_avx2_large_bpp` — Tests with bpp=4 (RGBA)
+- `simd::tests::test_filter_sub_avx2_large_row` — Row > 1KB (exercises SIMD loop)
+- `simd::tests::test_filter_up_avx2_large_row` — Large row with Filter 2
+
+**Audit findings:**
+- ✅ No unsafe code outside feature-gated `#[cfg(target_feature = "avx2")]` blocks
+- ✅ Automatic CPU detection via RUSTFLAGS (not hardcoded)
+- ✅ Scalar fallback always available (no dependency on AVX2)
+- ✅ All roundtrip tests pass with and without SIMD enabled
+- ✅ No panic on untrusted input (same error handling as scalar)
+
+**Updated spec compliance (12.5)**: ✅ — SIMD is transparent optimization, no new attack surface.
+
+---
+
 **Audited by**: OpenCode Security Analysis  
-**Version**: 1.1 (rounds 1-8)  
+**Version**: 1.1 (rounds 1-9)  
 **Next review**: 2027-08-05
