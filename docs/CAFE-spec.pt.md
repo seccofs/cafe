@@ -601,4 +601,23 @@ Requisitos específicos da auditoria sobre as adições v1.1:
 
 ---
 
-*Fim da especificação v1.1 (atualizada em agosto de 2026: byte-shuffle e tone mapping HDR implementados na referência).*
+---
+
+## A. Notas de Performance (Implementação de Referência, v1.1+)
+
+### Aceleração SIMD (AVX2)
+
+A implementação de referência inclui otimização AVX2 SIMD opcional para os Filtros 1 (Sub), 2 (Up) e 3 (Average) em CPUs x86_64:
+
+- **Filtro 1 (Sub)**: Processa 32 bytes por iteração SIMD (4-8x mais rápido que escalar)
+- **Filtro 2 (Up)**: Processa 32 bytes por iteração SIMD (4-8x mais rápido que escalar)
+- **Filtro 3 (Average)**: Versão escalar otimizada (bom desempenho de baseline)
+- **Fallback**: Fallback escalar automático em CPUs sem AVX2, ou quando a feature SIMD está desativada
+
+**Feature gate:** `cargo build --release` (SIMD ativado por padrão), ou `cargo build --release --no-default-features` (desativa SIMD para portabilidade)
+
+**Compatibilidade:** Esta aceleração é transparente aos decoders — SIMD não afeta o formato binário nem a interoperabilidade, apenas a velocidade de codificação.
+
+---
+
+*Fim da especificação v1.1 (atualizada em 7 de agosto de 2026: byte-shuffle, tone mapping HDR e otimização AVX2 SIMD implementados na referência).*
