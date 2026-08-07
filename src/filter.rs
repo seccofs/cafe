@@ -10,6 +10,9 @@ use crate::constants::*;
 use crate::error::{CafeError, Result};
 use crate::types::FilterHeuristic;
 
+#[cfg(feature = "simd")]
+use crate::simd::{filter_sub_avx2, unfilter_sub_avx2, filter_up_avx2, unfilter_up_avx2, filter_average_avx2, unfilter_average_avx2};
+
 // ============================================================================
 // Adaptive Entropy Support Structures (v1.1)
 // ============================================================================
@@ -260,6 +263,10 @@ fn predict(ftype: u8, a: u8, b: u8, c: u8, d: u8, ll: u8, uu: u8) -> u8 {
 /// `prev_row` is the immediately preceding row (for `U`/`UU`); `prev_prev_row`
 /// is the row two positions back (needed only for `F_2NDORDER`, `UU`).
 /// F_WEIGHTED does not go through here (requires in-flight state, see `filter_block`).
+///
+/// # SIMD Optimizations (v1.1+)
+/// Uses AVX2 for Filters 1 (Sub), 2 (Up), and 3 (Average) when available.
+/// Other filters use scalar fallback.
 fn filter_row(
     row: &[u8],
     prev_row: Option<&[u8]>,
@@ -267,6 +274,19 @@ fn filter_row(
     ftype: u8,
     bpp: usize,
 ) -> Vec<u8> {
+    // SIMD fast paths for the most common and vectorizable filters
+    #[cfg(feature = "simd")]
+    {
+        match ftype {
+            F_NONE => return row.to_vec(),
+            F_SUB => return filter_sub_avx2(row, bpp),
+            F_UP => return filter_up_avx2(row, prev_row),
+            F_AVERAGE => return filter_average_avx2(row, prev_row, bpp),
+            _ => {} // Fall through to scalar for other filters
+        }
+    }
+
+    // Scalar fallback for all filters or when SIMD is disabled
     let mut out = vec![0u8; row.len()];
     for x in 0..row.len() {
         let a = if x >= bpp { row[x - bpp] } else { 0 };
@@ -291,6 +311,10 @@ fn filter_row(
 
 /// Reverses a filter, reconstructing the original row from the residuals.
 /// F_WEIGHTED does not go through here (see `undo_predictive_filter`).
+///
+/// # SIMD Optimizations (v1.1+)
+/// Uses AVX2 for Filters 1 (Sub), 2 (Up), and 3 (Average) when available.
+/// Other filters use scalar fallback.
 fn unfilter_row(
     filtered: &[u8],
     prev_row: Option<&[u8]>,
@@ -298,6 +322,19 @@ fn unfilter_row(
     ftype: u8,
     bpp: usize,
 ) -> Vec<u8> {
+    // SIMD fast paths for the most common and vectorizable filters
+    #[cfg(feature = "simd")]
+    {
+        match ftype {
+            F_NONE => return filtered.to_vec(),
+            F_SUB => return unfilter_sub_avx2(filtered, bpp),
+            F_UP => return unfilter_up_avx2(filtered, prev_row),
+            F_AVERAGE => return unfilter_average_avx2(filtered, prev_row, bpp),
+            _ => {} // Fall through to scalar for other filters
+        }
+    }
+
+    // Scalar fallback for all filters or when SIMD is disabled
     let mut out = vec![0u8; filtered.len()];
     for x in 0..filtered.len() {
         let a = if x >= bpp { out[x - bpp] } else { 0 };

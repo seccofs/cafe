@@ -28,6 +28,8 @@ mod filter;
 mod interlace;
 mod shuffle;
 mod tonemap;
+#[cfg(feature = "simd")]
+mod simd;
 
 // Public re-exports for convenience
 pub use error::{CafeError, Result};
