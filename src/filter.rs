@@ -11,7 +11,10 @@ use crate::error::{CafeError, Result};
 use crate::types::FilterHeuristic;
 
 #[cfg(feature = "simd")]
-use crate::simd::{filter_sub_avx2, unfilter_sub_avx2, filter_up_avx2, unfilter_up_avx2, filter_average_avx2, unfilter_average_avx2};
+use crate::simd::{
+    filter_average_avx2, filter_sub_avx2, filter_up_avx2, unfilter_average_avx2, unfilter_sub_avx2,
+    unfilter_up_avx2,
+};
 
 // ============================================================================
 // Adaptive Entropy Support Structures (v1.1)

@@ -27,9 +27,9 @@ mod color;
 mod filter;
 mod interlace;
 mod shuffle;
-mod tonemap;
 #[cfg(feature = "simd")]
 mod simd;
+mod tonemap;
 
 // Public re-exports for convenience
 pub use error::{CafeError, Result};
@@ -103,6 +103,22 @@ fn compute_decompress_budget(
             }
         }
     }
+}
+
+/// Writes an IDAT chunk with compression fallback (refactoring v1.1).
+/// Common pattern in encode() and encode_indexed() — compresses data using fallback strategy
+/// (raw vs ZSTD) and appends the chunk to the output buffer.
+/// Returns whether ZSTD was used for this chunk.
+#[inline]
+fn append_idat_chunk(
+    out: &mut Vec<u8>,
+    data: &[u8],
+    level: i32,
+    dict: Option<&[u8]>,
+) -> Result<bool> {
+    let (flag, compressed) = compress_with_fallback_dict(data, level, dict)?;
+    out.extend_from_slice(&write_chunk(CHUNK_IDAT, flag, &compressed));
+    Ok(flag == FLAG_ZSTD)
 }
 
 /// Encodes an image (any format the `image` crate can read) to `.cafe`.
@@ -188,6 +204,10 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
                      "Color type {target_color_type} incompatible with sample format {sample_format_final}"
                  ))
              })?;
+        // SECURITY: This assertion validates that bytes_per_pixel and bytes_per_pixel_with_format
+        // return consistent values for this configuration. It's development-only (removed in --release),
+        // but the _bpp_with_format computation above validates that the combination is supported.
+        // In production, if the invariant is violated, earlier checks would have already caught it.
         debug_assert_eq!(_bpp_with_format, bpp, "bpp mismatch between functions");
     }
 
@@ -338,13 +358,12 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
                 let pass_number = (pass_idx + 1) as u8;
                 let mut pass_payload = vec![pass_number];
                 pass_payload.extend_from_slice(pass_data);
-                let (flag, data) = compress_with_fallback_dict(
+                uses_zstd |= append_idat_chunk(
+                    &mut out,
                     &pass_payload,
                     opts.level,
                     opts.zstd_dictionary.as_deref(),
                 )?;
-                uses_zstd |= flag == FLAG_ZSTD;
-                out.extend_from_slice(&write_chunk(CHUNK_IDAT, flag, &data));
             }
         } else {
             let passes = apply_even_odd_interlace(&raw, width, height);
@@ -352,13 +371,12 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
                 let pass_number = (pass_idx + 1) as u8;
                 let mut pass_payload = vec![pass_number];
                 pass_payload.extend_from_slice(pass_data);
-                let (flag, data) = compress_with_fallback_dict(
+                uses_zstd |= append_idat_chunk(
+                    &mut out,
                     &pass_payload,
                     opts.level,
                     opts.zstd_dictionary.as_deref(),
                 )?;
-                uses_zstd |= flag == FLAG_ZSTD;
-                out.extend_from_slice(&write_chunk(CHUNK_IDAT, flag, &data));
             }
         }
     } else if let Some(idim) = &opts.idim {
@@ -370,7 +388,7 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
                 "iDIM (tiling 2D) requires bit_depth >= 8 in encode".into(),
             ));
         }
-        for (tx, ty) in idim.tile_order() {
+        for (tx, ty) in idim.tile_order()? {
             let (tile_w, tile_h) = idim.tile_dimensions(tx, ty, width, height);
             let tw = tile_w as usize;
             let th = tile_h as usize;
@@ -417,13 +435,12 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
                 tile_raw
             };
 
-            let (flag, data) = compress_with_fallback_dict(
+            uses_zstd |= append_idat_chunk(
+                &mut out,
                 &tile_payload,
                 opts.level,
                 opts.zstd_dictionary.as_deref(),
             )?;
-            uses_zstd |= flag == FLAG_ZSTD;
-            out.extend_from_slice(&write_chunk(CHUNK_IDAT, flag, &data));
         }
     } else {
         // No interlace (v1.0): row tiles, with optional predictive filter
@@ -459,13 +476,12 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
                 tile_raw.to_vec()
             };
 
-            let (flag, data) = compress_with_fallback_dict(
+            uses_zstd |= append_idat_chunk(
+                &mut out,
                 &tile_payload,
                 opts.level,
                 opts.zstd_dictionary.as_deref(),
             )?;
-            uses_zstd |= flag == FLAG_ZSTD;
-            out.extend_from_slice(&write_chunk(CHUNK_IDAT, flag, &data));
 
             row_start = row_end;
             tile_count += 1;
@@ -505,6 +521,89 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
 
 /// Decodes a `.cafe` back into an image (PNG, by the extension of
 /// `output_path`). Returns the raw EXIF and any JSON metadata found.
+/// Parameters for final pixel reconstruction (refactoring v1.1).
+struct ReconstructParams<'a> {
+    interlace_method: u8,
+    color_type: u8,
+    bit_depth: u8,
+    sample_format: u8,
+    width: u32,
+    height: u32,
+    palette: Option<&'a Palette>,
+    chdr: Option<&'a cHDR>,
+    adam7_passes: &'a [Vec<u8>; ADAM7_NUM_PASSES],
+    even_odd_passes: &'a [Vec<u8>; EVEN_ODD_NUM_PASSES],
+}
+
+/// Reconstructs final RGBA image from pixel data (refactoring v1.1).
+/// Handles interlace deinterlacing, palette dequantization, color type conversion,
+/// and HDR tone-mapping. Returns final RGBA pixel buffer.
+fn reconstruct_final_pixels(pixel_rows: Vec<u8>, params: &ReconstructParams) -> Result<Vec<u8>> {
+    // Step 1: Deinterlace if needed
+    let pixel_rows = if params.interlace_method == INTERLACE_ADAM7 {
+        reconstruct_adam7(params.adam7_passes, params.width, params.height)?
+    } else if params.interlace_method == INTERLACE_EVEN_ODD {
+        reconstruct_even_odd(params.even_odd_passes, params.width, params.height)?
+    } else {
+        pixel_rows
+    };
+
+    // Step 2: Convert to RGBA based on color type and sample format
+    if params.color_type == COLOR_TYPE_INDEXED {
+        if let Some(pal) = params.palette {
+            Ok(dequantize_from_palette(
+                &pixel_rows,
+                pal,
+                params.width,
+                params.height,
+            ))
+        } else {
+            Err(CafeError::UnsupportedFeature(
+                "Color type=3 found without PLTE chunk".into(),
+            ))
+        }
+    } else if params.sample_format == SAMPLE_FORMAT_FLOAT && params.chdr.is_some() {
+        // v1.1: HDR tone-mapping — converts linear HDR float → SDR sRGB 8-bit
+        let target = 0u8; // 0=sRGB, 1=Rec.709, 2=DCI-P3, 3=Linear
+        tonemap::apply_tone_mapping_to_image(
+            &pixel_rows,
+            params.width,
+            params.height,
+            params.chdr.unwrap(),
+            target,
+            tonemap::ToneMapOperator::Filmic,
+        )
+    } else if params.sample_format == SAMPLE_FORMAT_FLOAT
+        || params.sample_format == SAMPLE_FORMAT_HALF
+    {
+        // float/half: reduces samples to 8 bits and converts color → RGBA
+        convert_color_type_to_rgba_with_format(
+            &pixel_rows,
+            params.width,
+            params.height,
+            params.color_type,
+            params.bit_depth,
+            params.sample_format,
+        )
+    } else {
+        // uint: convert back to RGBA
+        let _bpp_from_color =
+            bytes_per_pixel(params.color_type, params.bit_depth).ok_or_else(|| {
+                CafeError::UnsupportedFeature(format!(
+                    "Color type {}, bit depth {} not supported in output conversion",
+                    params.color_type, params.bit_depth
+                ))
+            })?;
+        convert_color_type_to_rgba(
+            &pixel_rows,
+            params.width,
+            params.height,
+            params.color_type,
+            params.bit_depth,
+        )
+    }
+}
+
 pub fn decode(input_path: &str, output_path: &str) -> Result<DecodeResult> {
     let buf = std::fs::read(input_path)?;
 
@@ -1034,7 +1133,8 @@ pub fn decode(input_path: &str, output_path: &str) -> Result<DecodeResult> {
                                 "tile buffer inconsistent with IHDR (iDIM)".into(),
                             ));
                         }
-                        let (tx, ty) = idim.tile_order()[tiles_seen];
+                        let tile_order = idim.tile_order()?;
+                        let (tx, ty) = tile_order[tiles_seen];
                         tiles_seen += 1;
                         let (tile_w, tile_h) = idim.tile_dimensions(tx, ty, img_width, img_height);
                         let tw = tile_w as usize;
@@ -1232,60 +1332,20 @@ pub fn decode(input_path: &str, output_path: &str) -> Result<DecodeResult> {
     let width = width.ok_or(CafeError::MissingIhdr)?;
     let height = height.ok_or(CafeError::MissingIhdr)?;
 
-    // v1.0/+5: If interlaced, reconstruct the image from the passes
-    let pixel_rows = if interlace_method_read == INTERLACE_ADAM7 {
-        reconstruct_adam7(&adam7_passes, width, height)?
-    } else if interlace_method_read == INTERLACE_EVEN_ODD {
-        reconstruct_even_odd(&even_odd_passes, width, height)?
-    } else {
-        pixel_rows
+    // Reconstruct final pixels: deinterlace, dequantize, convert color type
+    let params = ReconstructParams {
+        interlace_method: interlace_method_read,
+        color_type,
+        bit_depth,
+        sample_format,
+        width,
+        height,
+        palette: palette.as_ref(),
+        chdr: chdr.as_ref(),
+        adam7_passes: &adam7_passes,
+        even_odd_passes: &even_odd_passes,
     };
-
-    // If PLTE (color_type=3), dequantize indices to RGBA
-    // If another color type, convert to RGBA (section 4.1.3, v1.0)
-    let final_pixels = if color_type == COLOR_TYPE_INDEXED {
-        // Always dequantize for color_type=3 (no Adam7, since Adam7 uses color_type=6)
-        if let Some(pal) = palette {
-            dequantize_from_palette(&pixel_rows, &pal, width, height)
-        } else {
-            return Err(CafeError::UnsupportedFeature(
-                "Color type=3 found without PLTE chunk".into(),
-            ));
-        }
-    } else if sample_format == SAMPLE_FORMAT_FLOAT && chdr.is_some() {
-        // v1.1: HDR tone-mapping — converts linear HDR float → SDR sRGB 8-bit
-        // Only if sample_format==FLOAT and cHDR is present
-        let target = 0u8; // 0=sRGB, 1=Rec.709, 2=DCI-P3, 3=Linear
-        tonemap::apply_tone_mapping_to_image(
-            &pixel_rows,
-            width,
-            height,
-            &chdr.clone().unwrap(),
-            target,
-            tonemap::ToneMapOperator::Filmic,
-        )?
-    } else if sample_format == SAMPLE_FORMAT_FLOAT || sample_format == SAMPLE_FORMAT_HALF {
-        // float/half (any color type, incl. RGBA): reduces samples to 8 bits
-        // and converts color -> RGBA (section 4.1.3, v1.0)
-        // No tone-mapping (passthrough)
-        convert_color_type_to_rgba_with_format(
-            &pixel_rows,
-            width,
-            height,
-            color_type,
-            bit_depth,
-            sample_format,
-        )?
-    } else {
-        // uint: convert back to RGBA (section 4.1.3, v1.0).
-        // RGBA/8 passa direto; RGB/GRAY/GRAY_ALPHA e bit depths 16/32 convertem.
-        let _bpp_from_color = bytes_per_pixel(color_type, bit_depth).ok_or_else(|| {
-            CafeError::UnsupportedFeature(format!(
-                "Color type {color_type}, bit depth {bit_depth} not supported in output conversion"
-            ))
-        })?;
-        convert_color_type_to_rgba(&pixel_rows, width, height, color_type, bit_depth)?
-    };
+    let final_pixels = reconstruct_final_pixels(pixel_rows, &params)?;
 
     // Validate final buffer: must have exactly width × height × 4 bytes (always RGBA)
     let expected_len = (width as u64)
@@ -1471,13 +1531,12 @@ pub fn encode_indexed(input_path: &str, output_path: &str, opts: &EncodeOptions)
                 let pass_number = (pass_idx + 1) as u8;
                 let mut pass_payload = vec![pass_number];
                 pass_payload.extend_from_slice(pass_data);
-                let (flag, data) = compress_with_fallback_dict(
+                uses_zstd |= append_idat_chunk(
+                    &mut out,
                     &pass_payload,
                     opts.level,
                     opts.zstd_dictionary.as_deref(),
                 )?;
-                uses_zstd |= flag == FLAG_ZSTD;
-                out.extend_from_slice(&write_chunk(CHUNK_IDAT, flag, &data));
             }
         } else if opts.interlace_method == INTERLACE_EVEN_ODD {
             let passes = apply_even_odd_interlace(&rgba_raw, width, height);
@@ -1486,13 +1545,12 @@ pub fn encode_indexed(input_path: &str, output_path: &str, opts: &EncodeOptions)
                 let pass_number = (pass_idx + 1) as u8;
                 let mut pass_payload = vec![pass_number];
                 pass_payload.extend_from_slice(pass_data);
-                let (flag, data) = compress_with_fallback_dict(
+                uses_zstd |= append_idat_chunk(
+                    &mut out,
                     &pass_payload,
                     opts.level,
                     opts.zstd_dictionary.as_deref(),
                 )?;
-                uses_zstd |= flag == FLAG_ZSTD;
-                out.extend_from_slice(&write_chunk(CHUNK_IDAT, flag, &data));
             }
         }
     } else {
@@ -1529,13 +1587,12 @@ pub fn encode_indexed(input_path: &str, output_path: &str, opts: &EncodeOptions)
                 tile_packed
             };
 
-            let (flag, data) = compress_with_fallback_dict(
+            uses_zstd |= append_idat_chunk(
+                &mut out,
                 &tile_payload,
                 opts.level,
                 opts.zstd_dictionary.as_deref(),
             )?;
-            uses_zstd |= flag == FLAG_ZSTD;
-            out.extend_from_slice(&write_chunk(CHUNK_IDAT, flag, &data));
 
             row_start = row_end;
         }
@@ -2497,7 +2554,7 @@ mod tests {
     fn test_idim_tile_order_row_major() {
         // Test row-major (scan_order = 0)
         let idim = iDim::new(64, 64, 256, 256, 0);
-        let order = idim.tile_order();
+        let order = idim.tile_order().expect("valid scan_order");
 
         // 4x4 = 16 tiles, row-major
         assert_eq!(order.len(), 16);
@@ -2689,7 +2746,7 @@ mod tests {
     fn test_idim_tile_order_zorder() {
         // 4x4 grid with Z-order
         let idim = iDim::new(64, 64, 256, 256, 1); // scan_order = 1 (Z-order)
-        let order = idim.tile_order();
+        let order = idim.tile_order().expect("valid scan_order");
 
         // Must have 16 tiles
         assert_eq!(order.len(), 16);
@@ -2710,8 +2767,8 @@ mod tests {
         let idim_row = iDim::new(64, 64, 256, 256, 0); // Row-major
         let idim_z = iDim::new(64, 64, 256, 256, 1); // Z-order
 
-        let order_row = idim_row.tile_order();
-        let order_z = idim_z.tile_order();
+        let order_row = idim_row.tile_order().expect("valid scan_order");
+        let order_z = idim_z.tile_order().expect("valid scan_order");
 
         // Both have 16 tiles
         assert_eq!(order_row.len(), 16);
@@ -2729,6 +2786,21 @@ mod tests {
 
         // First line Z-order (2x2 quadrant)
         assert_eq!(order_z[0..4], [(0, 0), (1, 0), (0, 1), (1, 1)]);
+    }
+
+    #[test]
+    fn test_idim_tile_order_invalid_scan_order() {
+        // Test that invalid scan_order returns Err instead of panicking
+        let mut idim = iDim::new(64, 64, 256, 256, 0);
+        idim.scan_order = 2; // Invalid: only 0 and 1 are allowed
+
+        let result = idim.tile_order();
+        assert!(result.is_err(), "Expected error for invalid scan_order=2");
+
+        if let Err(e) = result {
+            // Verify the error message contains the scan order value
+            assert!(e.to_string().contains("Unknown scan order"));
+        }
     }
 
     #[test]

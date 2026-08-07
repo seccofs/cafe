@@ -7,18 +7,19 @@ use crc32fast::Hasher;
 
 /// Assembles a complete chunk: Length + Type + Flag + Data + CRC32.
 pub(crate) fn write_chunk(chunk_type: &[u8; 4], flag: u8, data: &[u8]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(4 + 1 + data.len());
-    body.extend_from_slice(chunk_type);
-    body.push(flag);
-    body.extend_from_slice(data);
-
+    // Compute CRC32 incrementally without allocating intermediate body vector
     let mut hasher = Hasher::new();
-    hasher.update(&body);
+    hasher.update(chunk_type);
+    hasher.update(&[flag]);
+    hasher.update(data);
     let crc = hasher.finalize();
 
-    let mut out = Vec::with_capacity(4 + body.len() + 4);
+    // Assemble output: Length (4) + Type (4) + Flag (1) + Data (N) + CRC32 (4)
+    let mut out = Vec::with_capacity(4 + 4 + 1 + data.len() + 4);
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    out.extend_from_slice(&body);
+    out.extend_from_slice(chunk_type);
+    out.push(flag);
+    out.extend_from_slice(data);
     out.extend_from_slice(&crc.to_be_bytes());
     out
 }
@@ -45,7 +46,7 @@ pub(crate) fn read_chunk(buf: &[u8], offset: usize) -> Result<ReadChunk> {
         .is_none_or(|end| end > buf.len())
     {
         return Err(CafeError::TruncatedFile(format!(
-            "incomplete chunk header no offset {offset} ({} bytes remaining, {HEADER_LEN} needed)",
+            "incomplete chunk header at offset {offset} ({} bytes remaining, {HEADER_LEN} needed)",
             buf.len().saturating_sub(offset)
         )));
     }
@@ -102,12 +103,11 @@ pub(crate) fn read_chunk(buf: &[u8], offset: usize) -> Result<ReadChunk> {
     );
     o += 4;
 
-    let mut body = Vec::with_capacity(4 + 1 + data.len());
-    body.extend_from_slice(&chunk_type);
-    body.push(flag);
-    body.extend_from_slice(&data);
+    // Compute CRC32 incrementally without allocating intermediate body vector
     let mut hasher = Hasher::new();
-    hasher.update(&body);
+    hasher.update(&chunk_type);
+    hasher.update(&[flag]);
+    hasher.update(&data);
     let crc_actual = hasher.finalize();
 
     if crc_actual != crc_expected {

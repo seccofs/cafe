@@ -146,7 +146,10 @@ impl iDim {
     /// Generates the tile order according to scan_order (section 4.2, v1.0 Phase 2).
     /// - scan_order = 0: row-major (left→right, top→bottom)
     /// - scan_order = 1: Z-order (Morton code, per-region preview)
-    pub fn tile_order(&self) -> Vec<(u16, u16)> {
+    ///
+    /// # Errors
+    /// Returns `CafeError::UnsupportedFeature` if `scan_order` is not 0 or 1.
+    pub fn tile_order(&self) -> crate::error::Result<Vec<(u16, u16)>> {
         if self.scan_order == 0 {
             // Row-major: left→right, then top→bottom
             let mut order = Vec::new();
@@ -155,7 +158,7 @@ impl iDim {
                     order.push((tx, ty));
                 }
             }
-            order
+            Ok(order)
         } else if self.scan_order == 1 {
             // Z-order (Morton): interleaves tile_x and tile_y bits
             // Enables per-region preview during streaming
@@ -169,9 +172,12 @@ impl iDim {
             // Sort by Morton code
             tiles.sort_by_key(|&(_, _, code)| code);
             // Remove the code, keeping only (tx, ty)
-            tiles.into_iter().map(|(tx, ty, _)| (tx, ty)).collect()
+            Ok(tiles.into_iter().map(|(tx, ty, _)| (tx, ty)).collect())
         } else {
-            panic!("Unknown scan order: {}", self.scan_order);
+            Err(crate::error::CafeError::UnsupportedFeature(format!(
+                "Unknown scan order: {}",
+                self.scan_order
+            )))
         }
     }
 }
