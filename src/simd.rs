@@ -59,10 +59,7 @@ pub(crate) fn filter_sub_avx2(row: &[u8], bpp: usize) -> Vec<u8> {
             let pixels = _mm256_loadu_si256(row.as_ptr().add(i) as *const __m256i);
             let left = _mm256_loadu_si256(row.as_ptr().add(i - bpp) as *const __m256i);
             let residual = _mm256_sub_epi8(pixels, left);
-            _mm256_storeu_si256(
-                filtered.as_mut_ptr().add(i) as *mut __m256i,
-                residual,
-            );
+            _mm256_storeu_si256(filtered.as_mut_ptr().add(i) as *mut __m256i, residual);
             i += 32;
         }
     }
@@ -138,10 +135,7 @@ pub(crate) fn filter_up_avx2(row: &[u8], prev_row: Option<&[u8]>) -> Vec<u8> {
                 let pixels = _mm256_loadu_si256(row.as_ptr().add(i) as *const __m256i);
                 let above = _mm256_loadu_si256(prev.as_ptr().add(i) as *const __m256i);
                 let residual = _mm256_sub_epi8(pixels, above);
-                _mm256_storeu_si256(
-                    filtered.as_mut_ptr().add(i) as *mut __m256i,
-                    residual,
-                );
+                _mm256_storeu_si256(filtered.as_mut_ptr().add(i) as *mut __m256i, residual);
                 i += 32;
             }
         }
@@ -186,10 +180,7 @@ pub(crate) fn unfilter_up_avx2(filtered: &[u8], prev_row: Option<&[u8]>) -> Vec<
                 let residuals = _mm256_loadu_si256(filtered.as_ptr().add(i) as *const __m256i);
                 let above = _mm256_loadu_si256(prev.as_ptr().add(i) as *const __m256i);
                 let reconstructed = _mm256_add_epi8(residuals, above);
-                _mm256_storeu_si256(
-                    out.as_mut_ptr().add(i) as *mut __m256i,
-                    reconstructed,
-                );
+                _mm256_storeu_si256(out.as_mut_ptr().add(i) as *mut __m256i, reconstructed);
                 i += 32;
             }
         }
@@ -217,11 +208,7 @@ pub(crate) fn unfilter_up_avx2(filtered: &[u8], prev_row: Option<&[u8]>) -> Vec<
 /// # Returns
 /// Vector of residuals
 #[cfg(target_feature = "avx2")]
-pub(crate) fn filter_average_avx2(
-    row: &[u8],
-    prev_row: Option<&[u8]>,
-    bpp: usize,
-) -> Vec<u8> {
+pub(crate) fn filter_average_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
     let len = row.len();
     let mut filtered = vec![0u8; len];
 
@@ -365,11 +352,7 @@ pub(crate) fn unfilter_up_avx2(filtered: &[u8], prev_row: Option<&[u8]>) -> Vec<
 
 /// Scalar-only version of Filter 3 (Average).
 #[cfg(not(target_feature = "avx2"))]
-pub(crate) fn filter_average_avx2(
-    row: &[u8],
-    prev_row: Option<&[u8]>,
-    bpp: usize,
-) -> Vec<u8> {
+pub(crate) fn filter_average_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
     let mut filtered = vec![0u8; row.len()];
     for i in 0..row.len() {
         let a = if i >= bpp { row[i - bpp] } else { 0 };
