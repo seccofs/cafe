@@ -1,0 +1,27 @@
+CAFE — Compression Adaptative Filtering Experiment
+Dual License: BSD-3-Clause OR GPL-2.0-or-later
+
+Copyright © 2026 Daniel Secco
+
+This project is licensed under TWO licenses. You may choose to use it under
+either one, at your option:
+
+1. BSD 3-Clause License (LICENSE-BSD)
+   - Permissive, allows commercial use
+   - No copyleft requirement
+   - Short and simple
+
+2. GNU General Public License v2+ (LICENSE-GPL)
+   - Open-source copyleft
+   - Requires derivative works to be open-source
+   - Provides strong freedoms
+
+This dual licensing follows the model of ZSTD (by Yann Collet) and other
+major open-source projects, maximizing compatibility with different projects
+and use cases.
+
+---
+
+Read LICENSE-BSD or LICENSE-GPL for full legal text.
+
+For questions about licensing: daniel@cafe-format.dev
