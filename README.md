@@ -1,6 +1,6 @@
 # CAFE — Compression Adaptive Filtering Experiment
 
-[![License](https://img.shields.io/badge/license-BSD--3--Clause%20OR%20GPL--2.0-blue)](LICENSE)
+[![License](https://img.shields.io/badge/license-BSD--3--Clause-green)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)](https://www.rust-lang.org)
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)]()
 [![Security](https://img.shields.io/badge/security-audited-green)](docs/SECURITY_AUDIT.md)
@@ -60,9 +60,7 @@ cafe/
 ├── deny.toml                      # Cargo-deny security and license configuration
 ├── README.md                      # English README
 ├── README.pt.md                   # Portuguese README
-├── LICENSE                        # Dual license (BSD-3-Clause OR GPL-2.0)
-├── LICENSE-BSD                    # BSD-3-Clause license text
-├── LICENSE-GPL                    # GPL-2.0-or-later license text
+├── LICENSE                        # BSD-3-Clause license
 ├── src/                           # Main library
 │   ├── cafe.rs                    # Core: encode/decode, chunks (re-exports)
 │   ├── constants.rs               # Signature, flags, color types, filters
@@ -247,9 +245,7 @@ crc32fast = "1.3"       # CRC32 for chunks
 
 ## 📝 License
 
-Dual license: **BSD-3-Clause OR GPL-2.0-or-later**
-
-Same approach as ZSTD — choose the license that works best for you.
+Licensed under **BSD-3-Clause** — permissive, commercial-friendly, no copyleft requirements.
 
 ---
 

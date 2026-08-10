@@ -556,7 +556,7 @@ IEND                  (mandatory, last)
 ## 11. Licensing
 
 - **Text of this specification**: © 2026 Daniel Secco. Licensed under [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/) — anyone can implement CAFE format freely, including commercially, as long as credit is given to original author (Daniel Secco).
-- **Reference implementations** (code): **BSD-3-Clause OR GPL-2.0-or-later** (same dual licensing scheme as ZSTD) — users choose which of the two licenses to apply.
+- **Reference implementations** (code): **BSD-3-Clause** — permissive, allows commercial use, no copyleft requirements.
 
 ---
 
