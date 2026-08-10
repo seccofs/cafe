@@ -15,9 +15,15 @@ CAFE (Compression Adaptive Filtering Experiment) is a modern chunk-based image f
 
 ```
 Cafe/
-├── CLAUDE.md             # Technical guide (you are here)
-├── Cargo.toml            # Dependencies and configuration
-├── Cargo.lock            # Dependency lock
+├── AGENTS.md             # Developer technical guide (you are here)
+├── CLAUDE.md             # Symbolic link to AGENTS.md
+├── Cargo.toml            # Dependencies and configuration (with simd feature)
+├── deny.toml             # Cargo-deny security and license configuration
+├── README.md             # English README
+├── README.pt.md          # Portuguese README
+├── LICENSE               # Dual license (BSD-3-Clause OR GPL-2.0)
+├── LICENSE-BSD           # BSD-3-Clause license text
+├── LICENSE-GPL           # GPL-2.0-or-later license text
 ├── src/
 │   ├── cafe.rs           # Core: encode/decode, chunks (re-exports)
 │   ├── constants.rs      # Signature, flags, color types, filters
@@ -25,7 +31,7 @@ Cafe/
 │   ├── codec.rs          # ZSTD compression with fallback (section 3.2)
 │   ├── color.rs          # Color conversions, pack/unpack, float/half
 │   ├── filter.rs         # 16 predictive filters + heuristics (with SIMD integration)
-│   ├── simd.rs           # AVX2/NEON vectorized filters 1-3 (v1.1+, optional feature)
+│   ├── simd.rs           # AVX2 vectorized filters 1-3 (v1.1+, optional feature)
 │   ├── shuffle.rs        # Byte-shuffle (Filter Method=1, v1.1)
 │   ├── tonemap.rs        # HDR tone-mapping (EOTF, primaries, operators, v1.1)
 │   ├── interlace.rs      # Adam7 and even/odd
@@ -36,22 +42,23 @@ Cafe/
 │   └── cafe-decode.rs    # Decode binary (CLI)
 ├── tests/                # Integration and round-trip tests
 ├── examples/             # Usage examples
+│   ├── basic_encode.rs   # Basic encoding example
+│   └── basic_decode.rs   # Basic decoding example
 ├── docs/                 # Spec, security audit, dev guide
 │   ├── CAFE-spec.md      # Complete format specification (v1.1)
-│   └── CAFE-spec.pt.md   # Portuguese version of the spec
-├── README.md             # English README
-├── README.pt.md          # Portuguese README
-├── LICENSE               # Dual license (BSD-3-Clause OR GPL-2.0)
+│   ├── CAFE-spec.pt.md   # Portuguese version of the spec
+│   ├── SECURITY_AUDIT.md # Security audit report
+│   └── DEVELOPER_GUIDE.md # Developer guide
 └── .github/workflows/    # CI (build, clippy -D warnings, fmt, doc, security audit)
 ```
 
 ### Main Dependencies
 
 ```toml
-image = "0.24"            # Image read/write (PNG, JPEG, etc.)
+image = "0.25"            # Image read/write (PNG, JPEG, WebP, AVIF, etc.)
 zstd = "0.13"             # ZSTD compression/decompression
 serde_json = "1.0"        # JSON metadata parsing
-half = "2.4"              # Half-float (fp16) for sample_format HALF (HDR, v1.0)
+half = "2.7"              # Half-float (fp16) for sample_format HALF (HDR, v1.0)
 crc32fast = "1.3"         # Chunk validation via CRC32
 ```
 
