@@ -5,7 +5,7 @@
 CAFE (Compression Adaptive Filtering Experiment) is a modern chunk-based image format, inspired by PNG, with support for ZSTD compression, advanced predictive filters, indexed palette, and structured metadata (EXIF, JSON, ICC, XMP).
 
 **Specification:** `docs/CAFE-spec.md` (602 lines, v1.1)
-**Implementation:** Rust 2021 with dual license (BSD-3-Clause OR GPL-2.0-or-later)
+**Implementation:** Rust 2021 with BSD-3-Clause license
 
 ---
 
@@ -21,9 +21,7 @@ Cafe/
 ├── deny.toml             # Cargo-deny security and license configuration
 ├── README.md             # English README
 ├── README.pt.md          # Portuguese README
-├── LICENSE               # Dual license (BSD-3-Clause OR GPL-2.0)
-├── LICENSE-BSD           # BSD-3-Clause license text
-├── LICENSE-GPL           # GPL-2.0-or-later license text
+├── LICENSE               # BSD-3-Clause license text
 ├── src/
 │   ├── cafe.rs           # Core: encode/decode, chunks (re-exports)
 │   ├── constants.rs      # Signature, flags, color types, filters

@@ -27,5 +27,5 @@ allow = [
 
 [licenses]
 unlicensed = "deny"
-copyleft = "warn"
-allow-dual-licensing = true
+copyleft = "deny"
+allow-dual-licensing = false
