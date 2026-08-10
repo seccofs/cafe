@@ -15,9 +15,10 @@ CAFE (Compression Adaptive Filtering Experiment) is a modern chunk-based image f
 
 ```
 Cafe/
-├── CLAUDE.md             # This guide (you are here)
+├── AGENTS.md             # This guide (you are here)
 ├── Cargo.toml            # Dependencies and configuration (with simd feature)
 ├── Cargo.lock            # Lock of dependencies
+├── deny.toml             # Cargo-deny security and license configuration
 ├── README.md             # English README
 ├── README.pt.md          # Portuguese README
 ├── LICENSE               # Dual license (BSD-3-Clause OR GPL-2.0)
@@ -50,10 +51,10 @@ Cafe/
 ### Main Dependencies
 
 ```toml
-image = "0.24"            # Image read/write (PNG, JPEG, etc.)
+image = "0.25"            # Image read/write (PNG, JPEG, WebP, AVIF, etc.)
 zstd = "0.13"             # ZSTD compression/decompression
 serde_json = "1.0"        # JSON metadata parsing
-half = "2.4"              # Half-float (fp16) for sample_format HALF (HDR, v1.0)
+half = "2.7"              # Half-float (fp16) for sample_format HALF (HDR, v1.0)
 crc32fast = "1.3"         # Chunk validation via CRC32
 ```
 
@@ -566,6 +567,7 @@ cargo test --release                 # Release mode (faster)
 cargo test -- --nocapture           # With output
 cargo clippy                         # Linting and warnings
 cargo fmt --check                   # Verify formatting
+cargo deny check                     # Security and license audit (requires: cargo install cargo-deny)
 ```
 
 ---
@@ -681,4 +683,4 @@ cargo doc --open
 
 ---
 
-**Last updated:** August 7, 2026 | **Project version:** v1.1.0 | **Security audit round 5 (Aug/2026):** fixed CWE-369 (DoS via division-by-zero) in decode of `color_type=3` without PLTE (`src/cafe.rs`). **Round 6 (Aug/2026):** aligned PLTE to spec §4.1.2 — decoder respects compression flag and encoder uses fallback (§3.2). **Round 7 (Aug/2026):** HDR tone-mapping — audited EOTF, matrices, overflow (checked_mul), NaN/Inf (is_finite), division-by-zero (`max_luminance.max(1.0)`, PQ denominator) (`src/tonemap.rs`). **Round 8 (Aug/2026):** closed gaps — real color primaries conversion via XYZ, Reinhard/Filmic operators, complete byte-shuffle encode; audited byte-shuffle (bpp ∈ {2,4,8,16}, width×height×bpp overflow, truncated buffer, defensive tile derivation) and new primaries/conversion pipeline (`src/shuffle.rs`, `src/tonemap.rs`). **Round 9 (Aug 7/2026):** SIMD vectorization (AVX2) for Filters 1-3 added in `src/simd.rs` — automatic CPU detection, scalar fallback, feature-gated compilation; audited for unsafe boundaries, pointer validity, overflow protection; 6 new roundtrip tests; transparent optimization with no format changes.
+**Last updated:** August 10, 2026 | **Project version:** v1.1.0 | **Security audit round 5 (Aug/2026):** fixed CWE-369 (DoS via division-by-zero) in decode of `color_type=3` without PLTE (`src/cafe.rs`). **Round 6 (Aug/2026):** aligned PLTE to spec §4.1.2 — decoder respects compression flag and encoder uses fallback (§3.2). **Round 7 (Aug/2026):** HDR tone-mapping — audited EOTF, matrices, overflow (checked_mul), NaN/Inf (is_finite), division-by-zero (`max_luminance.max(1.0)`, PQ denominator) (`src/tonemap.rs`). **Round 8 (Aug/2026):** closed gaps — real color primaries conversion via XYZ, Reinhard/Filmic operators, complete byte-shuffle encode; audited byte-shuffle (bpp ∈ {2,4,8,16}, width×height×bpp overflow, truncated buffer, defensive tile derivation) and new primaries/conversion pipeline (`src/shuffle.rs`, `src/tonemap.rs`). **Round 9 (Aug 7/2026):** SIMD vectorization (AVX2) for Filters 1-3 added in `src/simd.rs` — automatic CPU detection, scalar fallback, feature-gated compilation; audited for unsafe boundaries, pointer validity, overflow protection; 6 new roundtrip tests; transparent optimization with no format changes. **Round 10 (Aug 10/2026):** upgraded `image` crate from 0.24 to 0.25, added `deny.toml` to manage unmaintained dependency warnings (RUSTSEC-2024-0436: paste), improved CI workflow with `cargo-deny` for better supply-chain security auditing, fixed deprecated imports in `cafe-encode.rs`.
