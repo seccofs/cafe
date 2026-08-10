@@ -20,6 +20,11 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         rust: [stable, beta]
     steps:
+      # Enable symlinks on Windows (required for .gitattributes symlink handling)
+      - name: Enable symlinks on Windows
+        if: runner.os == 'Windows'
+        run: git config --global core.symlinks true
+      
       - uses: actions/checkout@v5
       
       - uses: dtolnay/rust-toolchain@master
@@ -38,6 +43,11 @@ jobs:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
+      # Enable symlinks on Windows (required for .gitattributes symlink handling)
+      - name: Enable symlinks on Windows
+        if: runner.os == 'Windows'
+        run: git config --global core.symlinks true
+      
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -48,6 +58,11 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
+      # Enable symlinks on Windows (required for .gitattributes symlink handling)
+      - name: Enable symlinks on Windows
+        if: runner.os == 'Windows'
+        run: git config --global core.symlinks true
+      
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -58,6 +73,11 @@ jobs:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
+      # Enable symlinks on Windows (required for .gitattributes symlink handling)
+      - name: Enable symlinks on Windows
+        if: runner.os == 'Windows'
+        run: git config --global core.symlinks true
+      
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: EmbarkStudios/cargo-deny-action@v1
@@ -68,6 +88,11 @@ jobs:
     name: Documentation
     runs-on: ubuntu-latest
     steps:
+      # Enable symlinks on Windows (required for .gitattributes symlink handling)
+      - name: Enable symlinks on Windows
+        if: runner.os == 'Windows'
+        run: git config --global core.symlinks true
+      
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo doc --no-deps
