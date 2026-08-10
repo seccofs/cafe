@@ -1,0 +1,28 @@
+[package]
+name = "cafe-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.cafe]
+path = ".."
+
+[[bin]]
+name = "decode_fuzz"
+path = "fuzz_targets/decode_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunk_roundtrip_fuzz"
+path = "fuzz_targets/chunk_roundtrip_fuzz.rs"
+test = false
+doc = false
+bench = false
