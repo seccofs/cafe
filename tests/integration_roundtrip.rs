@@ -86,22 +86,19 @@ fn test_roundtrip_256x256_rgba_checkerboard() {
     encode(&input_png, &output_cafe, &opts).expect("Encode failed");
 
     // Verify CAFE exists and is smaller than PNG
-    assert!(
-        Path::new(&output_cafe).exists(),
-        "CAFE file not created"
-    );
+    assert!(Path::new(&output_cafe).exists(), "CAFE file not created");
     let cafe_size = fs::metadata(&output_cafe).unwrap().len() as usize;
     let png_size = fs::metadata(&input_png).unwrap().len() as usize;
-    println!("Roundtrip test (256×256 checkerboard): PNG={} bytes, CAFE={} bytes", png_size, cafe_size);
+    println!(
+        "Roundtrip test (256×256 checkerboard): PNG={} bytes, CAFE={} bytes",
+        png_size, cafe_size
+    );
 
     // Decode back to PNG
     let _result = decode(&output_cafe, &output_png).expect("Decode failed");
 
     // Verify output exists
-    assert!(
-        Path::new(&output_png).exists(),
-        "Output PNG not created"
-    );
+    assert!(Path::new(&output_png).exists(), "Output PNG not created");
 
     // Cleanup
     let _ = fs::remove_file(&input_png);
@@ -138,7 +135,10 @@ fn test_roundtrip_512x512_rgba_gradient() {
     assert!(Path::new(&output_png).exists());
 
     let cafe_size = fs::metadata(&output_cafe).unwrap().len() as usize;
-    println!("Roundtrip test (512×512 gradient): CAFE size={} bytes", cafe_size);
+    println!(
+        "Roundtrip test (512×512 gradient): CAFE size={} bytes",
+        cafe_size
+    );
 
     // Cleanup
     let _ = fs::remove_file(&input_png);
@@ -175,7 +175,10 @@ fn test_roundtrip_1024x768_rgba_random() {
     assert!(Path::new(&output_png).exists());
 
     let cafe_size = fs::metadata(&output_cafe).unwrap().len() as usize;
-    println!("Roundtrip test (1024×768 random): CAFE size={} bytes", cafe_size);
+    println!(
+        "Roundtrip test (1024×768 random): CAFE size={} bytes",
+        cafe_size
+    );
 
     // Cleanup
     let _ = fs::remove_file(&input_png);
