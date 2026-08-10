@@ -34,3 +34,14 @@ Thumbs.db
 # Test artifacts
 *.profraw
 *.profdata
+
+# Fuzzing
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/
+
+# Benchmarking
+/target/criterion/
+
+# Property testing regressions
+/proptest-regressions/
