@@ -30,6 +30,8 @@ mod quantize;
 mod shuffle;
 #[cfg(feature = "simd")]
 mod simd;
+#[cfg(feature = "simd")]
+mod simd_packing;
 mod tonemap;
 
 // Public re-exports for convenience
