@@ -32,6 +32,8 @@ mod shuffle;
 mod simd;
 #[cfg(feature = "simd")]
 mod simd_packing;
+#[cfg(feature = "simd")]
+mod simd_sample_conversion;
 mod tonemap;
 
 // Public re-exports for convenience
