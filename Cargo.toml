@@ -12,7 +12,7 @@ keywords = ["image", "compression", "format", "zstd", "png"]
 categories = ["compression", "encoding"]
 
 [dependencies]
-image = "0.24"
+image = "0.25"
 zstd = "0.13"
 serde_json = "1.0"
 half = "2.7"

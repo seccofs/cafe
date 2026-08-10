@@ -60,7 +60,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions-rust-lang/audit@v1
+      - uses: EmbarkStudios/cargo-deny-action@v1
+        with:
+          log-level: warn
 
   doc:
     name: Documentation

@@ -3,7 +3,7 @@ use std::env;
 use std::process::ExitCode;
 
 use cafe::{cHDR, encode, encode_indexed, EncodeOptions, FilterHeuristic};
-use image::io::Reader as ImageReader;
+use image::ImageReader;
 
 fn usage() {
     eprintln!("Usage: cafe-encode <input> <output.cafe> [options]");
