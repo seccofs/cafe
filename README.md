@@ -54,6 +54,15 @@ A modern chunk-based image format inspired by PNG, with support for ZSTD compres
 
 ```
 cafe/
+├── AGENTS.md                      # Developer technical guide
+├── CLAUDE.md                      # Symbolic link to AGENTS.md
+├── Cargo.toml                     # Dependencies and configuration (with simd feature)
+├── deny.toml                      # Cargo-deny security and license configuration
+├── README.md                      # English README
+├── README.pt.md                   # Portuguese README
+├── LICENSE                        # Dual license (BSD-3-Clause OR GPL-2.0)
+├── LICENSE-BSD                    # BSD-3-Clause license text
+├── LICENSE-GPL                    # GPL-2.0-or-later license text
 ├── src/                           # Main library
 │   ├── cafe.rs                    # Core: encode/decode, chunks (re-exports)
 │   ├── constants.rs               # Signature, flags, color types, filters
@@ -65,27 +74,22 @@ cafe/
 │   ├── shuffle.rs                 # Byte-shuffle (Filter Method=1, v1.1)
 │   ├── tonemap.rs                 # HDR tone-mapping (EOTF, primaries, operators, v1.1)
 │   ├── interlace.rs               # Adam7 and even/odd
-│   ├── types.rs                   # EncodeOptions, iDim, cHDR, Palette, etc.
+│   ├── types.rs                   # EncodeOptions, Palette, iDim, cHDR, etc.
 │   └── error.rs                   # CafeError
 ├── tools/                         # CLI tools
 │   ├── cafe-encode.rs            # Encoder binary
 │   └── cafe-decode.rs            # Decoder binary
 ├── docs/                          # Documentation
-│   ├── CAFE-spec.md              # Complete specification (v1.1, 602 lines)
+│   ├── CAFE-spec.md              # Complete specification (v1.1)
 │   ├── CAFE-spec.pt.md           # Portuguese version of the spec
 │   ├── SECURITY_AUDIT.md         # Security audit
 │   └── DEVELOPER_GUIDE.md        # Developer guide
 ├── tests/                         # Integration and round-trip tests
 ├── examples/                      # Usage examples
-├── Cargo.toml                     # Dependencies and configuration
-├── Cargo.lock                     # Version lock
-├── README.md                      # This file (English version)
-├── README.pt.md                   # Portuguese version
-├── LICENSE                        # Dual license (BSD-3-Clause OR GPL-2.0)
-├── LICENSE-BSD                    # BSD-3-Clause license text
-├── LICENSE-GPL                    # GPL-2.0-or-later license text
+│   ├── basic_encode.rs           # Basic encoding example
+│   └── basic_decode.rs           # Basic decoding example
 └── .github/
-    └── workflows/                 # CI (build, clippy -D warnings, fmt, doc)
+    └── workflows/                 # CI (build, clippy -D warnings, fmt, doc, security audit)
 ```
 
 ---
@@ -209,10 +213,10 @@ cafe-decode --help
 ## 📋 Dependencies
 
 ```toml
-image = "0.24"          # PNG, JPEG, etc. read/write
+image = "0.25"          # PNG, JPEG, etc. read/write
 zstd = "0.13"           # ZSTD compression
 serde_json = "1.0"      # JSON parsing
-half = "2.4"            # Half-float (fp16)
+half = "2.7"            # Half-float (fp16)
 crc32fast = "1.3"       # CRC32 for chunks
 ```
 
