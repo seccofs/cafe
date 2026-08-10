@@ -54,6 +54,15 @@ Um formato de imagem moderno baseado em chunks, inspirado em PNG, com suporte a 
 
 ```
 cafe/
+├── AGENTS.md                      # Guia técnico para desenvolvedores
+├── CLAUDE.md                      # Link simbólico para AGENTS.md
+├── Cargo.toml                     # Dependências e configuração (com feature simd)
+├── deny.toml                      # Configuração de segurança e licenças do Cargo-deny
+├── README.md                      # README em inglês
+├── README.pt.md                   # README em português
+├── LICENSE                        # Dual license (BSD-3-Clause OR GPL-2.0)
+├── LICENSE-BSD                    # Texto da licença BSD-3-Clause
+├── LICENSE-GPL                    # Texto da licença GPL-2.0-or-later
 ├── src/                           # Biblioteca principal
 │   ├── cafe.rs                    # Núcleo: encode/decode, chunks (re-exports)
 │   ├── constants.rs               # Assinatura, flags, color types, filtros
@@ -65,27 +74,22 @@ cafe/
 │   ├── shuffle.rs                 # Byte-shuffle (Filter Method=1, v1.1)
 │   ├── tonemap.rs                 # HDR tone-mapping (EOTF, primaries, operadores, v1.1)
 │   ├── interlace.rs               # Adam7 e par/ímpar
-│   ├── types.rs                   # EncodeOptions, iDim, cHDR, Palette, etc.
+│   ├── types.rs                   # EncodeOptions, Palette, iDim, cHDR, etc.
 │   └── error.rs                   # CafeError
 ├── tools/                         # Ferramentas CLI
-│   ├── cafe-encode.rs            # Encoder binário
-│   └── cafe-decode.rs            # Decoder binário
+│   ├── cafe-encode.rs            # Binário encoder
+│   └── cafe-decode.rs            # Binário decoder
 ├── docs/                          # Documentação
-│   ├── CAFE-spec.md              # Especificação completa (v1.1, 602 linhas)
-│   ├── CAFE-spec.pt.md           # Especificação em português
+│   ├── CAFE-spec.md              # Especificação completa (v1.1)
+│   ├── CAFE-spec.pt.md           # Versão portuguesa da especificação
 │   ├── SECURITY_AUDIT.md         # Auditoria de segurança
-│   └── DEVELOPER_GUIDE.md        # Guia para desenvolvedores
+│   └── DEVELOPER_GUIDE.md        # Guia técnico para contribuidores
 ├── tests/                         # Testes de integração e round-trip
 ├── examples/                      # Exemplos de uso
-├── Cargo.toml                     # Dependências e configuração
-├── Cargo.lock                     # Lock de versões
-├── README.md                      # Versão em inglês
-├── README.pt.md                   # Este arquivo
-├── LICENSE                        # Dual license (BSD-3-Clause OR GPL-2.0)
-├── LICENSE-BSD                    # Texto da licença BSD-3-Clause
-├── LICENSE-GPL                    # Texto da licença GPL-2.0-or-later
+│   ├── basic_encode.rs           # Exemplo básico de encoding
+│   └── basic_decode.rs           # Exemplo básico de decoding
 └── .github/
-    └── workflows/                 # CI (build, clippy -D warnings, fmt, doc)
+    └── workflows/                 # CI (build, clippy -D warnings, fmt, doc, security audit)
 ```
 
 ---
@@ -209,10 +213,10 @@ cafe-decode --help
 ## 📋 Dependências
 
 ```toml
-image = "0.24"          # Leitura/escrita de PNG, JPEG, etc.
+image = "0.25"          # Leitura/escrita de PNG, JPEG, etc.
 zstd = "0.13"           # Compressão ZSTD
 serde_json = "1.0"      # Parsing JSON
-half = "2.4"            # Half-float (fp16)
+half = "2.7"            # Half-float (fp16)
 crc32fast = "1.3"       # CRC32 para chunks
 ```
 

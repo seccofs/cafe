@@ -17,7 +17,6 @@ CAFE (Compression Adaptive Filtering Experiment) is a modern chunk-based image f
 Cafe/
 ├── AGENTS.md             # This guide (you are here)
 ├── Cargo.toml            # Dependencies and configuration (with simd feature)
-├── Cargo.lock            # Lock of dependencies
 ├── deny.toml             # Cargo-deny security and license configuration
 ├── README.md             # English README
 ├── README.pt.md          # Portuguese README
