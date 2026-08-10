@@ -34,7 +34,10 @@ mod tonemap;
 
 // Public re-exports for convenience
 pub use error::{CafeError, Result};
-pub use types::{cHDR, iDim, DecodeResult, EncodeOptions, FilterHeuristic, Palette, PaletteAlgorithm, PaletteEntry};
+pub use types::{
+    cHDR, iDim, DecodeResult, EncodeOptions, FilterHeuristic, Palette, PaletteAlgorithm,
+    PaletteEntry,
+};
 
 use crate::constants::*;
 
@@ -114,20 +117,20 @@ fn train_zstd_dictionary(samples: &[Vec<u8>]) -> Option<Vec<u8>> {
     if samples.is_empty() {
         return None;
     }
-    
+
     // Calculate total size
     let total_size: usize = samples.iter().map(|s| s.len()).sum();
     if total_size < 512 {
         // Not enough data to train a useful dictionary
         return None;
     }
-    
+
     // Heuristic: dictionary size is 10% of total data, clamped to [256, 65536]
     let dict_size = (total_size / 10).clamp(256, 65536);
-    
+
     // Convert samples to references
     let sample_refs: Vec<&[u8]> = samples.iter().map(|v| v.as_slice()).collect();
-    
+
     // Train the dictionary (fall back silently to no dictionary on failure)
     zstd::dict::from_samples(&sample_refs, dict_size).ok()
 }
@@ -375,12 +378,12 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
         let mut row_start = 0;
         let mut tile_idx = 0;
         const MAX_SAMPLE_TILES: usize = 10;
-        
+
         while row_start < height_usize && tile_idx < MAX_SAMPLE_TILES {
             let row_end = (row_start + sample_tile_rows).min(height_usize);
             let tile_h = row_end - row_start;
             let tile_raw = &raw[row_start * bytes_per_row..row_end * bytes_per_row];
-            
+
             let tile_payload = if opts.use_byte_shuffle {
                 shuffle::apply_byte_shuffle(tile_raw, bpp, width, tile_h as u32)?
             } else if opts.use_filter {
@@ -395,12 +398,12 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
             } else {
                 tile_raw.to_vec()
             };
-            
+
             samples.push(tile_payload);
             row_start = row_end;
             tile_idx += 1;
         }
-        
+
         train_zstd_dictionary(&samples)
     } else {
         opts.zstd_dictionary.clone()
@@ -1455,12 +1458,13 @@ pub fn decode_bytes(buf: &[u8]) -> Result<(Vec<u8>, DecodeResult)> {
 pub fn decode(input_path: &str, output_path: &str) -> Result<DecodeResult> {
     let buf = std::fs::read(input_path)?;
     let (final_pixels, result) = decode_bytes(&buf)?;
-    
-    let img_buf = image::RgbaImage::from_raw(result.width, result.height, final_pixels).ok_or_else(|| {
-        CafeError::TruncatedFile(
-            "unexpected failure assembling final image from pixel buffer".to_string(),
-        )
-    })?;
+
+    let img_buf = image::RgbaImage::from_raw(result.width, result.height, final_pixels)
+        .ok_or_else(|| {
+            CafeError::TruncatedFile(
+                "unexpected failure assembling final image from pixel buffer".to_string(),
+            )
+        })?;
     img_buf.save(output_path)?;
 
     Ok(result)
@@ -1943,12 +1947,8 @@ fn quantize_to_palette(
     algorithm: PaletteAlgorithm,
 ) -> (Vec<u8>, Palette) {
     match algorithm {
-        PaletteAlgorithm::NearestNeighbor => {
-            quantize_nearest_neighbor(rgba, max_colors)
-        }
-        PaletteAlgorithm::MedianCut => {
-            quantize_median_cut_wrapper(rgba, max_colors)
-        }
+        PaletteAlgorithm::NearestNeighbor => quantize_nearest_neighbor(rgba, max_colors),
+        PaletteAlgorithm::MedianCut => quantize_median_cut_wrapper(rgba, max_colors),
     }
 }
 
@@ -2566,7 +2566,8 @@ mod tests {
             rgba.extend_from_slice(&[0, 255, 0, 255]); // Green
         }
 
-        let (indices, palette) = quantize_to_palette(&rgba, 100, 256, PaletteAlgorithm::NearestNeighbor);
+        let (indices, palette) =
+            quantize_to_palette(&rgba, 100, 256, PaletteAlgorithm::NearestNeighbor);
         assert!(palette.entries.len() <= 256);
         assert_eq!(indices.len(), 200);
     }
@@ -3389,7 +3390,8 @@ mod tests {
         }
 
         // Quantize
-        let (indices, palette) = quantize_to_palette(&rgba, width, 256, PaletteAlgorithm::NearestNeighbor);
+        let (indices, palette) =
+            quantize_to_palette(&rgba, width, 256, PaletteAlgorithm::NearestNeighbor);
         eprintln!("Quantized {} colors", palette.entries.len());
 
         // Convert indices->RGBA (encoder flow)
@@ -3524,7 +3526,8 @@ mod tests {
         }
 
         // Quantize
-        let (indices, palette) = quantize_to_palette(&rgba, width, 256, PaletteAlgorithm::NearestNeighbor);
+        let (indices, palette) =
+            quantize_to_palette(&rgba, width, 256, PaletteAlgorithm::NearestNeighbor);
 
         eprintln!("Quantized to {} colors", palette.entries.len());
         eprintln!(

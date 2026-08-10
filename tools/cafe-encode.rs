@@ -22,7 +22,9 @@ fn usage() {
     eprintln!("  --level <1-22>           ZSTD compression level (default: 19, range: 1-22)");
     eprintln!("                           1=fast/large, 22=slow/small");
     eprintln!("  --auto-dict              Auto-train ZSTD dictionary from image data (v1.1)");
-    eprintln!("                           Useful for small/repetitive images, improves compression");
+    eprintln!(
+        "                           Useful for small/repetitive images, improves compression"
+    );
     eprintln!("  --palette-algorithm <a>  Palette quantization algorithm (v1.1, indexed only):");
     eprintln!("                           nearest (default, fast), median-cut (better quality)");
     eprintln!("  --color-type <type>      Color type (default: auto-detect):");
@@ -78,9 +80,10 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
     let adaptive_analysis = args.iter().any(|a| a == "--adaptive");
     let user_specified_indexed = args.iter().any(|a| a == "--indexed");
     let auto_dictionary = args.iter().any(|a| a == "--auto-dict");
-    
+
     // Parse --palette-algorithm <nearest|median-cut>
-    let palette_algorithm = if let Some(pos) = args.iter().position(|a| a == "--palette-algorithm") {
+    let palette_algorithm = if let Some(pos) = args.iter().position(|a| a == "--palette-algorithm")
+    {
         let algo = &args.get(pos + 1).map(|s| s.as_str()).unwrap_or("nearest");
         use std::str::FromStr;
         match cafe::PaletteAlgorithm::from_str(algo) {

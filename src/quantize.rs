@@ -92,10 +92,14 @@ pub fn quantize_median_cut(rgba: &[u8], max_colors: usize) -> Result<Palette> {
     let mut entries = Vec::new();
     for bucket in &buckets {
         if !bucket.is_empty() {
-            let (r_sum, g_sum, b_sum): (u32, u32, u32) = bucket.iter().fold(
-                (0, 0, 0),
-                |(r, g, b), color| (r + color[0] as u32, g + color[1] as u32, b + color[2] as u32),
-            );
+            let (r_sum, g_sum, b_sum): (u32, u32, u32) =
+                bucket.iter().fold((0, 0, 0), |(r, g, b), color| {
+                    (
+                        r + color[0] as u32,
+                        g + color[1] as u32,
+                        b + color[2] as u32,
+                    )
+                });
             let count = bucket.len() as u32;
             entries.push(PaletteEntry {
                 r: (r_sum / count) as u8,
@@ -118,10 +122,10 @@ fn bucket_variance(colors: &[[u8; 3]]) -> f64 {
     }
 
     // Mean of each channel
-    let (r_sum, g_sum, b_sum): (f64, f64, f64) = colors.iter().fold(
-        (0.0, 0.0, 0.0),
-        |(r, g, b), c| (r + c[0] as f64, g + c[1] as f64, b + c[2] as f64),
-    );
+    let (r_sum, g_sum, b_sum): (f64, f64, f64) =
+        colors.iter().fold((0.0, 0.0, 0.0), |(r, g, b), c| {
+            (r + c[0] as f64, g + c[1] as f64, b + c[2] as f64)
+        });
     let count = colors.len() as f64;
     let (r_mean, g_mean, b_mean) = (r_sum / count, g_sum / count, b_sum / count);
 
@@ -186,9 +190,9 @@ mod tests {
     fn test_median_cut_simple() {
         // Simple test: 8 colors, should return all 8
         let rgba = vec![
-            255, 0, 0, 255,   // Red
-            0, 255, 0, 255,   // Green
-            0, 0, 255, 255,   // Blue
+            255, 0, 0, 255, // Red
+            0, 255, 0, 255, // Green
+            0, 0, 255, 255, // Blue
             255, 255, 0, 255, // Yellow
             255, 0, 255, 255, // Magenta
             0, 255, 255, 255, // Cyan
@@ -217,7 +221,11 @@ mod tests {
 
         // All entries should have some red (since input is red gradient)
         for entry in &palette.entries {
-            assert!(entry.r >= 50, "Entry should have red >= 50, got r={}", entry.r);
+            assert!(
+                entry.r >= 50,
+                "Entry should have red >= 50, got r={}",
+                entry.r
+            );
         }
     }
 }
