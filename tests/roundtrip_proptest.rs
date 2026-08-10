@@ -8,7 +8,7 @@
 use proptest::prelude::*;
 
 /// Tests round-trip encode->decode with arbitrary valid configurations.
-/// 
+///
 /// This property test:
 /// - Generates small random images (1..=16 pixels each dimension)
 /// - Chooses valid color_type + bit_depth combinations
@@ -25,11 +25,11 @@ fn prop_roundtrip_arbitrary_config() {
         // Create deterministic but varied pixel data
         let num_pixels = width as usize * height as usize;
         let mut pixels = vec![0u8; num_pixels * 4]; // RGBA
-        
-        for i in 0..pixels.len() {
-            pixels[i] = ((seed.wrapping_add(i as u64) ^ 0xDEADBEEF) % 256) as u8;
+
+        for (i, pixel) in pixels.iter_mut().enumerate() {
+            *pixel = ((seed.wrapping_add(i as u64) ^ 0xDEADBEEF) % 256) as u8;
         }
-        
+
         // We need a temporary file to use encode() API
         // For now, we test decode_bytes() robustness instead
         // Workaround: test decode_bytes() robustness with the pixel data
@@ -59,10 +59,10 @@ fn prop_minimal_valid_cafe_structure() {
     )| {
         // Build a minimal valid CAFE file in memory
         let mut buf = Vec::new();
-        
+
         // Signature
         buf.extend_from_slice(&[0x89, 0x43, 0x41, 0x46, 0x45, 0x0D, 0x0A, 0x1A, 0x0A]);
-        
+
         // IHDR chunk
         let ihdr_data = {
             let mut data = Vec::new();
@@ -76,15 +76,15 @@ fn prop_minimal_valid_cafe_structure() {
             data.push(0x00); // interlace_method = NONE
             data
         };
-        
+
         buf.extend_from_slice(&(ihdr_data.len() as u32).to_be_bytes());
         buf.extend_from_slice(b"IHDR");
         buf.push(0x00); // flag = raw
         buf.extend_from_slice(&ihdr_data);
-        
+
         // Compute CRC32 (we'll just use a dummy one; decode may complain but shouldn't panic)
         buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Dummy CRC
-        
+
         // Empty IDAT (data is minimal)
         let idat_data = vec![0u8; (width * height * 4) as usize];
         buf.extend_from_slice(&(idat_data.len() as u32).to_be_bytes());
@@ -92,13 +92,13 @@ fn prop_minimal_valid_cafe_structure() {
         buf.push(0x00); // flag = raw
         buf.extend_from_slice(&idat_data);
         buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Dummy CRC
-        
+
         // IEND chunk
         buf.extend_from_slice(&(0u32).to_be_bytes());
         buf.extend_from_slice(b"IEND");
         buf.push(0x00);
         buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Dummy CRC
-        
+
         // Attempt decode - should not panic (may fail on CRC, but that's expected)
         let result = cafe::decode_bytes(&buf);
         // Result doesn't matter as much as "no panic"
