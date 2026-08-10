@@ -26,6 +26,7 @@ mod codec;
 mod color;
 mod filter;
 mod interlace;
+mod quantize;
 mod shuffle;
 #[cfg(feature = "simd")]
 mod simd;
@@ -33,7 +34,7 @@ mod tonemap;
 
 // Public re-exports for convenience
 pub use error::{CafeError, Result};
-pub use types::{cHDR, iDim, DecodeResult, EncodeOptions, FilterHeuristic, Palette, PaletteEntry};
+pub use types::{cHDR, iDim, DecodeResult, EncodeOptions, FilterHeuristic, Palette, PaletteAlgorithm, PaletteEntry};
 
 use crate::constants::*;
 
@@ -103,6 +104,32 @@ fn compute_decompress_budget(
             }
         }
     }
+}
+
+/// Trains a ZSTD dictionary from the given tile payloads.
+/// Returns a dictionary if training is successful, otherwise None.
+/// Silently falls back to no dictionary on small images or training failure.
+fn train_zstd_dictionary(samples: &[Vec<u8>]) -> Option<Vec<u8>> {
+    // Skip if too few or too small samples
+    if samples.is_empty() {
+        return None;
+    }
+    
+    // Calculate total size
+    let total_size: usize = samples.iter().map(|s| s.len()).sum();
+    if total_size < 512 {
+        // Not enough data to train a useful dictionary
+        return None;
+    }
+    
+    // Heuristic: dictionary size is 10% of total data, clamped to [256, 65536]
+    let dict_size = (total_size / 10).clamp(256, 65536);
+    
+    // Convert samples to references
+    let sample_refs: Vec<&[u8]> = samples.iter().map(|v| v.as_slice()).collect();
+    
+    // Train the dictionary (fall back silently to no dictionary on failure)
+    zstd::dict::from_samples(&sample_refs, dict_size).ok()
 }
 
 /// Writes an IDAT chunk with compression fallback (refactoring v1.1).
@@ -337,10 +364,52 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
         out.extend_from_slice(&chunk);
     }
 
+    // --- Auto-dictionary training (v1.1, opt-in) ---
+    // If auto_dictionary is enabled and no explicit dictionary provided,
+    // collect samples from the first few tiles and train a dictionary.
+    let final_zstd_dict = if opts.auto_dictionary && opts.zstd_dictionary.is_none() {
+        // Collect samples from the first few tiles (max 10) for training
+        let mut samples = Vec::new();
+        let sample_tile_rows = opts.tile_rows as usize;
+        let height_usize = height as usize;
+        let mut row_start = 0;
+        let mut tile_idx = 0;
+        const MAX_SAMPLE_TILES: usize = 10;
+        
+        while row_start < height_usize && tile_idx < MAX_SAMPLE_TILES {
+            let row_end = (row_start + sample_tile_rows).min(height_usize);
+            let tile_h = row_end - row_start;
+            let tile_raw = &raw[row_start * bytes_per_row..row_end * bytes_per_row];
+            
+            let tile_payload = if opts.use_byte_shuffle {
+                shuffle::apply_byte_shuffle(tile_raw, bpp, width, tile_h as u32)?
+            } else if opts.use_filter {
+                apply_predictive_filter(
+                    tile_raw,
+                    tile_h,
+                    bytes_per_row,
+                    bpp,
+                    opts.filter_heuristic,
+                    opts.level,
+                )?
+            } else {
+                tile_raw.to_vec()
+            };
+            
+            samples.push(tile_payload);
+            row_start = row_end;
+            tile_idx += 1;
+        }
+        
+        train_zstd_dictionary(&samples)
+    } else {
+        opts.zstd_dictionary.clone()
+    };
+
     // --- zDIC (optional, single instance, section 4.9) ---
     // zDIC is actually used when compressing the IDATs (compress_with_fallback_dict),
     // it is not merely informational — see section 4.9 of the spec.
-    if let Some(dict) = &opts.zstd_dictionary {
+    if let Some(dict) = &final_zstd_dict {
         let chunk = write_zdic_chunk(dict, opts.level)?;
         uses_zstd |= chunk_uses_zstd(&chunk);
         out.extend_from_slice(&chunk);
@@ -362,7 +431,7 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
                     &mut out,
                     &pass_payload,
                     opts.level,
-                    opts.zstd_dictionary.as_deref(),
+                    final_zstd_dict.as_deref(),
                 )?;
             }
         } else {
@@ -375,7 +444,7 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
                     &mut out,
                     &pass_payload,
                     opts.level,
-                    opts.zstd_dictionary.as_deref(),
+                    final_zstd_dict.as_deref(),
                 )?;
             }
         }
@@ -604,9 +673,9 @@ fn reconstruct_final_pixels(pixel_rows: Vec<u8>, params: &ReconstructParams) -> 
     }
 }
 
-pub fn decode(input_path: &str, output_path: &str) -> Result<DecodeResult> {
-    let buf = std::fs::read(input_path)?;
-
+/// Decodes a CAFE buffer (bytes) and returns pixels + metadata.
+/// This is the core decode implementation without file I/O.
+pub fn decode_bytes(buf: &[u8]) -> Result<(Vec<u8>, DecodeResult)> {
     if buf.len() < 9 || buf[0..9] != SIGNATURE {
         return Err(CafeError::InvalidSignature);
     }
@@ -639,7 +708,7 @@ pub fn decode(input_path: &str, output_path: &str) -> Result<DecodeResult> {
     let mut chdr: Option<cHDR> = None; // cHDR chunk (v1.0, ancilar, HDR metadata)
 
     while offset < buf.len() {
-        let chunk = read_chunk(&buf, offset)?;
+        let chunk = read_chunk(buf, offset)?;
         offset = chunk.next_offset;
 
         match &chunk.chunk_type {
@@ -1362,18 +1431,14 @@ pub fn decode(input_path: &str, output_path: &str) -> Result<DecodeResult> {
              final_pixels.len()
          )));
     }
-    let img_buf = image::RgbaImage::from_raw(width, height, final_pixels).ok_or_else(|| {
-        CafeError::TruncatedFile(
-            "unexpected failure assembling final image from pixel buffer".to_string(),
-        )
-    })?;
-    img_buf.save(output_path)?;
 
     // Optional: Add compression statistics (always None for now)
     // Note: For true tracking, would need to store sizes during decoding
     let compression_stats = None;
 
-    Ok(DecodeResult {
+    let result = DecodeResult {
+        width,
+        height,
         exif,
         json_metadata,
         compression_stats,
@@ -1381,7 +1446,24 @@ pub fn decode(input_path: &str, output_path: &str) -> Result<DecodeResult> {
         xmp_metadata,
         zstd_dictionary,
         chdr_metadata: chdr,
-    })
+    };
+
+    Ok((final_pixels, result))
+}
+
+/// Decodes a CAFE file to RGBA image on disk.
+pub fn decode(input_path: &str, output_path: &str) -> Result<DecodeResult> {
+    let buf = std::fs::read(input_path)?;
+    let (final_pixels, result) = decode_bytes(&buf)?;
+    
+    let img_buf = image::RgbaImage::from_raw(result.width, result.height, final_pixels).ok_or_else(|| {
+        CafeError::TruncatedFile(
+            "unexpected failure assembling final image from pixel buffer".to_string(),
+        )
+    })?;
+    img_buf.save(output_path)?;
+
+    Ok(result)
 }
 
 /// **New feature (v1.0):** Encodes an image with an indexed palette (section 4.1.2).
@@ -1398,7 +1480,7 @@ pub fn encode_indexed(input_path: &str, output_path: &str, opts: &EncodeOptions)
     let raw = img.into_raw();
 
     // Quantize to palette (max 256 colors in v1.0)
-    let (indices, palette) = quantize_to_palette(&raw, width, 256);
+    let (indices, palette) = quantize_to_palette(&raw, width, 256, opts.palette_algorithm);
 
     // Validate palette
     if palette.entries.is_empty() {
@@ -1854,7 +1936,23 @@ fn read_chdr_chunk(flag: u8, data: &[u8]) -> Result<cHDR> {
 }
 
 // Palette quantization (finds best color matches and creates indices)
-fn quantize_to_palette(rgba: &[u8], _width: u32, max_colors: u32) -> (Vec<u8>, Palette) {
+fn quantize_to_palette(
+    rgba: &[u8],
+    _width: u32,
+    max_colors: u32,
+    algorithm: PaletteAlgorithm,
+) -> (Vec<u8>, Palette) {
+    match algorithm {
+        PaletteAlgorithm::NearestNeighbor => {
+            quantize_nearest_neighbor(rgba, max_colors)
+        }
+        PaletteAlgorithm::MedianCut => {
+            quantize_median_cut_wrapper(rgba, max_colors)
+        }
+    }
+}
+
+fn quantize_nearest_neighbor(rgba: &[u8], max_colors: u32) -> (Vec<u8>, Palette) {
     let mut palette = Palette {
         entries: Vec::new(),
         has_alpha: true,
@@ -1892,6 +1990,49 @@ fn quantize_to_palette(rgba: &[u8], _width: u32, max_colors: u32) -> (Vec<u8>, P
     }
 
     (indices, palette)
+}
+
+/// Wrapper around quantize::quantize_median_cut for use in encode_indexed
+fn quantize_median_cut_wrapper(rgba: &[u8], max_colors: u32) -> (Vec<u8>, Palette) {
+    // Use only RGB (ignoring alpha for now, as median-cut is RGB-based)
+    let rgb_only: Vec<u8> = rgba
+        .chunks(4)
+        .flat_map(|chunk| vec![chunk[0], chunk[1], chunk[2], 255])
+        .collect();
+
+    match quantize::quantize_median_cut(&rgb_only, max_colors as usize) {
+        Ok(palette) => {
+            // Now map original RGBA pixels to palette indices using nearest-neighbor
+            let mut indices = Vec::new();
+            for chunk in rgba.chunks_exact(4) {
+                let r = chunk[0];
+                let g = chunk[1];
+                let b = chunk[2];
+
+                let mut best_idx = 0;
+                let mut best_dist = u32::MAX;
+
+                for (i, entry) in palette.entries.iter().enumerate() {
+                    // Only consider RGB distance (ignore alpha in palette matching)
+                    let dist = ((r as i32 - entry.r as i32).pow(2)
+                        + (g as i32 - entry.g as i32).pow(2)
+                        + (b as i32 - entry.b as i32).pow(2)) as u32;
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best_idx = i;
+                    }
+                }
+
+                indices.push(best_idx as u8);
+            }
+
+            (indices, palette)
+        }
+        Err(_) => {
+            // Fall back to nearest-neighbor on error
+            quantize_nearest_neighbor(rgba, max_colors)
+        }
+    }
 }
 
 // Dequantize palette (convert indices to RGBA)
@@ -2425,7 +2566,7 @@ mod tests {
             rgba.extend_from_slice(&[0, 255, 0, 255]); // Green
         }
 
-        let (indices, palette) = quantize_to_palette(&rgba, 100, 256);
+        let (indices, palette) = quantize_to_palette(&rgba, 100, 256, PaletteAlgorithm::NearestNeighbor);
         assert!(palette.entries.len() <= 256);
         assert_eq!(indices.len(), 200);
     }
@@ -3248,7 +3389,7 @@ mod tests {
         }
 
         // Quantize
-        let (indices, palette) = quantize_to_palette(&rgba, width, 256);
+        let (indices, palette) = quantize_to_palette(&rgba, width, 256, PaletteAlgorithm::NearestNeighbor);
         eprintln!("Quantized {} colors", palette.entries.len());
 
         // Convert indices->RGBA (encoder flow)
@@ -3383,7 +3524,7 @@ mod tests {
         }
 
         // Quantize
-        let (indices, palette) = quantize_to_palette(&rgba, width, 256);
+        let (indices, palette) = quantize_to_palette(&rgba, width, 256, PaletteAlgorithm::NearestNeighbor);
 
         eprintln!("Quantized to {} colors", palette.entries.len());
         eprintln!(

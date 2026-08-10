@@ -21,6 +21,10 @@ fn usage() {
     eprintln!("                           adaptive (content-aware, better photos, v1.1)");
     eprintln!("  --level <1-22>           ZSTD compression level (default: 19, range: 1-22)");
     eprintln!("                           1=fast/large, 22=slow/small");
+    eprintln!("  --auto-dict              Auto-train ZSTD dictionary from image data (v1.1)");
+    eprintln!("                           Useful for small/repetitive images, improves compression");
+    eprintln!("  --palette-algorithm <a>  Palette quantization algorithm (v1.1, indexed only):");
+    eprintln!("                           nearest (default, fast), median-cut (better quality)");
     eprintln!("  --color-type <type>      Color type (default: auto-detect):");
     eprintln!("                           0=GRAY (1 byte/px, -75%), 2=RGB (3 bytes/px, -25%)");
     eprintln!("                           4=GRAY_ALPHA (2 bytes/px), 6=RGBA (4 bytes/px)");
@@ -73,6 +77,22 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
     let use_byte_shuffle = args.iter().any(|a| a == "--byte-shuffle");
     let adaptive_analysis = args.iter().any(|a| a == "--adaptive");
     let user_specified_indexed = args.iter().any(|a| a == "--indexed");
+    let auto_dictionary = args.iter().any(|a| a == "--auto-dict");
+    
+    // Parse --palette-algorithm <nearest|median-cut>
+    let palette_algorithm = if let Some(pos) = args.iter().position(|a| a == "--palette-algorithm") {
+        let algo = &args.get(pos + 1).map(|s| s.as_str()).unwrap_or("nearest");
+        use std::str::FromStr;
+        match cafe::PaletteAlgorithm::from_str(algo) {
+            Ok(alg) => alg,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return Err(e.into());
+            }
+        }
+    } else {
+        cafe::PaletteAlgorithm::NearestNeighbor
+    };
 
     // Parse --filter-heuristic <entropy|msad|test|quick-prune|adaptive>
     let filter_heuristic = if let Some(pos) = args.iter().position(|a| a == "--filter-heuristic") {
@@ -262,6 +282,8 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
         zstd_dictionary: zstd_dictionary.clone(),
         interlace_method,
         filter_heuristic,
+        auto_dictionary,
+        palette_algorithm,
         ..EncodeOptions::default()
     };
     opts.target_color_type = target_color_type;

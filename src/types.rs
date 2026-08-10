@@ -313,6 +313,36 @@ pub struct EncodeOptions {
     /// ZSTD compression of float/HDR data. Mutually exclusive with
     /// `use_filter` (byte-shuffle takes precedence). v1.1.
     pub use_byte_shuffle: bool,
+    /// Automatically train a ZSTD dictionary from the image data when
+    /// `zstd_dictionary` is None. Useful for improving compression of
+    /// small or repetitive images. Default: false (for backward compatibility).
+    pub auto_dictionary: bool,
+    /// Palette quantization algorithm for indexed mode (v1.1).
+    /// Default: NearestNeighbor (existing behavior).
+    pub palette_algorithm: PaletteAlgorithm,
+}
+
+/// Palette quantization algorithm selector (v1.1)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaletteAlgorithm {
+    /// Simple greedy nearest-neighbor (existing behavior, fastest)
+    NearestNeighbor,
+    /// Median-cut algorithm: recursively splits color space for better quality
+    MedianCut,
+}
+
+impl std::str::FromStr for PaletteAlgorithm {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_lowercase().as_str() {
+            "nearest" | "nearest-neighbor" | "nn" => Ok(PaletteAlgorithm::NearestNeighbor),
+            "median-cut" | "mediancut" | "median" => Ok(PaletteAlgorithm::MedianCut),
+            other => Err(format!(
+                "unknown palette algorithm '{}': use 'nearest' or 'median-cut'",
+                other
+            )),
+        }
+    }
 }
 
 impl Default for EncodeOptions {
@@ -335,6 +365,8 @@ impl Default for EncodeOptions {
             chdr_metadata: None, // Default: no HDR metadata
             filter_heuristic: FilterHeuristic::Entropy,
             use_byte_shuffle: false,
+            auto_dictionary: false,
+            palette_algorithm: PaletteAlgorithm::NearestNeighbor,
         }
     }
 }
@@ -357,6 +389,8 @@ pub struct CompressionStats {
 
 /// Decoding result
 pub struct DecodeResult {
+    pub width: u32,
+    pub height: u32,
     pub exif: Option<Vec<u8>>,
     pub json_metadata: std::collections::HashMap<String, serde_json::Value>,
     pub compression_stats: Option<CompressionStats>,
