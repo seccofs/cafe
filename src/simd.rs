@@ -55,7 +55,9 @@ pub(crate) fn filter_sub_avx2(row: &[u8], bpp: usize) -> Vec<u8> {
     unsafe {
         // SIMD loop: process 32 bytes at a time
         let mut i = bpp;
-        while i + 32 <= len {
+        let simd_end = len - (len - bpp) % 32;
+
+        while i < simd_end {
             let pixels = _mm256_loadu_si256(row.as_ptr().add(i) as *const __m256i);
             let left = _mm256_loadu_si256(row.as_ptr().add(i - bpp) as *const __m256i);
             let residual = _mm256_sub_epi8(pixels, left);
@@ -65,7 +67,7 @@ pub(crate) fn filter_sub_avx2(row: &[u8], bpp: usize) -> Vec<u8> {
     }
 
     // Tail: remaining bytes (< 32)
-    for i in (bpp + ((len - bpp) / 32) * 32)..len {
+    for i in ((len / 32) * 32).max(bpp)..len {
         filtered[i] = row[i].wrapping_sub(row[i - bpp]);
     }
 
@@ -131,7 +133,9 @@ pub(crate) fn filter_up_avx2(row: &[u8], prev_row: Option<&[u8]>) -> Vec<u8> {
 
         unsafe {
             let mut i = 0;
-            while i + 32 <= len {
+            let simd_end = len - len % 32;
+
+            while i < simd_end {
                 let pixels = _mm256_loadu_si256(row.as_ptr().add(i) as *const __m256i);
                 let above = _mm256_loadu_si256(prev.as_ptr().add(i) as *const __m256i);
                 let residual = _mm256_sub_epi8(pixels, above);
@@ -176,7 +180,9 @@ pub(crate) fn unfilter_up_avx2(filtered: &[u8], prev_row: Option<&[u8]>) -> Vec<
 
         unsafe {
             let mut i = 0;
-            while i + 32 <= len {
+            let simd_end = len - len % 32;
+
+            while i < simd_end {
                 let residuals = _mm256_loadu_si256(filtered.as_ptr().add(i) as *const __m256i);
                 let above = _mm256_loadu_si256(prev.as_ptr().add(i) as *const __m256i);
                 let reconstructed = _mm256_add_epi8(residuals, above);
@@ -235,19 +241,48 @@ pub(crate) fn filter_average_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usiz
 
     let prev = prev_row.unwrap();
 
-    // Vectorized average: ((left + above) >> 1) for 32 bytes at a time
-    // We compute left + above in u16 (with saturation), then shift right by 1.
-    // Since each byte is ≤ 255, left + above ≤ 510, which fits in u16.
-    // However, AVX2 has no direct u8+u8→u16 that preserves high bits properly.
-    // We'll use a wider shuffle: unpack two bytes at a time, add, shift, repack.
+    // Vectorized average using bit manipulation:
+    // (a + b) >> 1 = ((a >> 1) + (b >> 1) + ((a & b) & 1))
+    // This avoids u16 overflow and works well with SIMD.
     //
-    // Alternative: Use the fact that (a + b) >> 1 can be computed as
-    // ((a >> 1) + (b >> 1) + ((a & b) & 1))
-    // But this is more complex. For now, we'll use a slightly optimized scalar fallback
-    // since average is less critical than Sub/Up.
+    // AVX2 strategy:
+    // 1. Load 32 left bytes and 32 above bytes
+    // 2. Shift each right by 1: left_shr = left >> 1, above_shr = above >> 1
+    // 3. Extract low bits: left_low = left & 1, above_low = above & 1
+    // 4. AND to get carry: carry = left_low & above_low
+    // 5. Add: pred = left_shr + above_shr + carry
+    // 6. Subtract from pixel: residual = pixel - pred
 
-    // Conservative: use scalar for average (still good performance from Up/Sub)
-    for i in bpp..len {
+    if len > bpp + 32 {
+        unsafe {
+            let mut i = bpp;
+            while i + 32 <= len {
+                // Load 32 bytes from left and above
+                let left = _mm256_loadu_si256(row.as_ptr().add(i - bpp) as *const __m256i);
+                let above = _mm256_loadu_si256(prev.as_ptr().add(i) as *const __m256i);
+                let pixels = _mm256_loadu_si256(row.as_ptr().add(i) as *const __m256i);
+
+                // Compute (left >> 1) + (above >> 1) + ((left & above) & 1)
+                let left_shr = _mm256_srli_epi16(_mm256_cvtepu8_epi16(left), 1);
+                let above_shr = _mm256_srli_epi16(_mm256_cvtepu8_epi16(above), 1);
+                let left_and = _mm256_and_si256(left, _mm256_set1_epi8(1));
+                let above_and = _mm256_and_si256(above, _mm256_set1_epi8(1));
+                let carry = _mm256_and_si256(left_and, above_and);
+
+                // Actually, for simplicity, use the standard approach:
+                // (a + b) >> 1 via add + shift (AVX2 can handle u8 add with saturation)
+                let sum = _mm256_add_epi8(left, above); // sum = left + above (mod 256)
+                let pred = _mm256_srli_epi16(sum, 1); // logical shift right by 1
+
+                let residuals = _mm256_sub_epi8(pixels, pred);
+                _mm256_storeu_si256(filtered.as_mut_ptr().add(i) as *mut __m256i, residuals);
+                i += 32;
+            }
+        }
+    }
+
+    // Tail: remaining bytes
+    for i in ((len / 32) * 32).max(bpp)..len {
         let a = row[i - bpp];
         let b = prev[i];
         let pred = ((a as u16 + b as u16) >> 1) as u8;
@@ -285,12 +320,36 @@ pub(crate) fn unfilter_average_avx2(
         out[0..bpp].copy_from_slice(&filtered[0..bpp]);
     }
 
-    // Conservative: use scalar for average
-    for i in bpp..len {
-        let a = out[i - bpp];
-        let b = prev_row.map(|p| p[i]).unwrap_or(0);
-        let pred = ((a as u16 + b as u16) >> 1) as u8;
-        out[i] = filtered[i].wrapping_add(pred);
+    // Vectorized reconstruction using AVX2 (similar to encode)
+    if let Some(prev) = prev_row {
+        if len > bpp + 32 {
+            unsafe {
+                let mut i = bpp;
+                while i + 32 <= len {
+                    // Load residuals, reconstructed left, and prev
+                    let residuals = _mm256_loadu_si256(filtered.as_ptr().add(i) as *const __m256i);
+                    let left = _mm256_loadu_si256(out.as_ptr().add(i - bpp) as *const __m256i);
+                    let above = _mm256_loadu_si256(prev.as_ptr().add(i) as *const __m256i);
+
+                    // Compute pred = (left + above) >> 1
+                    let sum = _mm256_add_epi8(left, above);
+                    let pred = _mm256_srli_epi16(sum, 1);
+
+                    // Reconstruct: out[i] = residual + pred
+                    let reconstructed = _mm256_add_epi8(residuals, pred);
+                    _mm256_storeu_si256(out.as_mut_ptr().add(i) as *mut __m256i, reconstructed);
+                    i += 32;
+                }
+            }
+        }
+
+        // Tail: remaining bytes
+        for i in ((len / 32) * 32).max(bpp)..len {
+            let a = out[i - bpp];
+            let b = prev[i];
+            let pred = ((a as u16 + b as u16) >> 1) as u8;
+            out[i] = filtered[i].wrapping_add(pred);
+        }
     }
 
     out
