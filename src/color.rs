@@ -1156,6 +1156,41 @@ pub(crate) fn pack_samples_row(
         )));
     }
 
+    // Try SIMD path for single-channel packing (bpp=1, typical case)
+    #[cfg(feature = "simd")]
+    if bpp == 1 {
+        match bit_depth {
+            1 => {
+                if let Ok(packed) = crate::simd_packing::pack_1bit_samples(samples, width) {
+                    return Ok(packed);
+                }
+            }
+            2 => {
+                if let Ok(packed) = crate::simd_packing::pack_2bit_samples(samples, width) {
+                    return Ok(packed);
+                }
+            }
+            4 => {
+                if let Ok(packed) = crate::simd_packing::pack_4bit_samples(samples, width) {
+                    return Ok(packed);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Fallback to scalar implementation
+    pack_samples_row_scalar(samples, bit_depth, width, bpp)
+}
+
+/// Scalar fallback for pack_samples_row (used when SIMD not available or bpp > 1)
+#[inline]
+fn pack_samples_row_scalar(
+    samples: &[u8],
+    bit_depth: u8,
+    width: usize,
+    bpp: usize,
+) -> Result<Vec<u8>> {
     // Computes the expected packed buffer size
     let bits_total = (width as u64)
         .checked_mul(bit_depth as u64)
@@ -1242,6 +1277,41 @@ pub(crate) fn unpack_samples_row(
         )));
     }
 
+    // Try SIMD path for single-channel unpacking (bpp=1, typical case)
+    #[cfg(feature = "simd")]
+    if bpp == 1 {
+        match bit_depth {
+            1 => {
+                if let Ok(unpacked) = crate::simd_packing::unpack_1bit_samples(packed, width) {
+                    return Ok(unpacked);
+                }
+            }
+            2 => {
+                if let Ok(unpacked) = crate::simd_packing::unpack_2bit_samples(packed, width) {
+                    return Ok(unpacked);
+                }
+            }
+            4 => {
+                if let Ok(unpacked) = crate::simd_packing::unpack_4bit_samples(packed, width) {
+                    return Ok(unpacked);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Fallback to scalar implementation
+    unpack_samples_row_scalar(packed, bit_depth, width, bpp)
+}
+
+/// Scalar fallback for unpack_samples_row (used when SIMD not available or bpp > 1)
+#[inline]
+fn unpack_samples_row_scalar(
+    packed: &[u8],
+    bit_depth: u8,
+    width: usize,
+    bpp: usize,
+) -> Result<Vec<u8>> {
     // Validates buffer size
     let bits_total = (width as u64)
         .checked_mul(bit_depth as u64)
