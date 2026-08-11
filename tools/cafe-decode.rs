@@ -1,13 +1,15 @@
 use std::env;
 use std::process::ExitCode;
 
-use cafe::decode;
+use cafe::{decode_with_opts, EncodeOptions, ToneMapOperator};
 
 fn usage() {
-    eprintln!("Usage: cafe-decode <input.cafe> <output>");
+    eprintln!("Usage: cafe-decode <input.cafe> <output> [options]");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --extract-metadata       Extract and display all metadata including cHDR");
+    eprintln!("  --extract-metadata           Extract and display all metadata including cHDR");
+    eprintln!("  --tonemap-operator <op>      Tone-map operator for HDR images (reinhard|filmic)");
+    eprintln!("                               Default: filmic (ACES curve, recommended)");
 }
 
 fn main() -> ExitCode {
@@ -37,8 +39,29 @@ fn main() -> ExitCode {
 
 fn run_decode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::error::Error>> {
     let extract_metadata = args.iter().any(|a| a == "--extract-metadata");
+    
+    // Parse tone-map operator option
+    let tonemap_operator = if let Some(idx) = args.iter().position(|a| a == "--tonemap-operator") {
+        if idx + 1 < args.len() {
+            match ToneMapOperator::from_str(&args[idx + 1]) {
+                Ok(op) => op,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return Err(e.into());
+                }
+            }
+        } else {
+            eprintln!("Error: --tonemap-operator requires an argument (reinhard|filmic)");
+            return Err("missing tone-map operator argument".into());
+        }
+    } else {
+        ToneMapOperator::Filmic
+    };
 
-    let result = decode(src, dst)?;
+    // Decode with custom options
+    let mut opts = EncodeOptions::default();
+    opts.tonemap_operator = tonemap_operator;
+    let result = decode_with_opts(src, dst, &opts)?;
     println!("Decoded: {src} -> {dst}");
 
     if let Some(exif) = &result.exif {
