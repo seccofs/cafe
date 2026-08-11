@@ -217,7 +217,8 @@ impl ToneMapOperator {
     }
 
     /// Parse tone-map operator from string (case-insensitive)
-    pub fn from_str(s: &str) -> std::result::Result<Self, String> {
+    /// This is the implementation for the FromStr trait below.
+    fn parse_from_str(s: &str) -> std::result::Result<Self, String> {
         match s.to_lowercase().as_str() {
             "reinhard" => Ok(ToneMapOperator::Reinhard),
             "filmic" | "aces" => Ok(ToneMapOperator::Filmic),
@@ -232,7 +233,7 @@ impl ToneMapOperator {
 impl std::str::FromStr for ToneMapOperator {
     type Err = String;
     fn from_str(s: &str) -> std::result::Result<Self, String> {
-        ToneMapOperator::from_str(s)
+        ToneMapOperator::parse_from_str(s)
     }
 }
 

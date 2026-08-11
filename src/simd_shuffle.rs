@@ -277,6 +277,7 @@ pub fn undo_byte_shuffle_simd(
 }
 
 #[cfg(not(all(feature = "simd", target_arch = "x86_64", target_feature = "avx2")))]
+#[allow(dead_code)] // Used via shuffle.rs dispatch on non-AVX2 platforms
 pub fn undo_byte_shuffle_simd(
     data: &[u8],
     _bpp: usize,

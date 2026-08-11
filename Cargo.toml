@@ -1,10 +1,10 @@
 [package]
 name = "cafe"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 authors = ["Daniel Secco <barista@format.cafe>"]
 license = "BSD-3-Clause"
-description = "CAFE — Compression Adaptative Filtering Experiment. A modern chunk-based image format with ZSTD compression, advanced predictive filters, indexed palette, and structured metadata. v1.2.0: Aggressive AVX2 SIMD acceleration (2.8-3.5x speedup)."
+description = "CAFE — Compression Adaptative Filtering Experiment. A modern chunk-based image format with ZSTD compression, advanced predictive filters, indexed palette, and structured metadata. v1.2.1: Tone-map operator selection, SIMD dispatcher, aggressive AVX2 acceleration."
 repository = "https://github.com/seccofs/cafe"
 documentation = "https://format.cafe"
 readme = "README.md"

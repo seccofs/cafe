@@ -1,5 +1,6 @@
 use std::env;
 use std::process::ExitCode;
+use std::str::FromStr;
 
 use cafe::{decode_with_opts, EncodeOptions, ToneMapOperator};
 
@@ -59,8 +60,10 @@ fn run_decode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
     };
 
     // Decode with custom options
-    let mut opts = EncodeOptions::default();
-    opts.tonemap_operator = tonemap_operator;
+    let opts = EncodeOptions {
+        tonemap_operator,
+        ..Default::default()
+    };
     let result = decode_with_opts(src, dst, &opts)?;
     println!("Decoded: {src} -> {dst}");
 
