@@ -320,6 +320,9 @@ pub struct EncodeOptions {
     /// Palette quantization algorithm for indexed mode (v1.1).
     /// Default: NearestNeighbor (existing behavior).
     pub palette_algorithm: PaletteAlgorithm,
+    /// Tone-map operator for HDR decode (v1.2.1)
+    /// Default: ToneMapOperator::Filmic (recommended for most images)
+    pub tonemap_operator: crate::tonemap::ToneMapOperator,
 }
 
 /// Palette quantization algorithm selector (v1.1)
@@ -357,6 +360,7 @@ impl Default for EncodeOptions {
             exif: None,
             json_metadata: std::collections::HashMap::new(),
             icc_profile: None,
+            tonemap_operator: crate::tonemap::ToneMapOperator::Filmic,
             xmp_metadata: None,
             idim: None,
             interlace_method: crate::constants::INTERLACE_NONE,

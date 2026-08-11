@@ -34,6 +34,8 @@ mod simd;
 mod simd_packing;
 #[cfg(feature = "simd")]
 mod simd_sample_conversion;
+#[cfg(feature = "simd")]
+mod simd_shuffle;
 mod tonemap;
 
 // Public re-exports for convenience
@@ -42,6 +44,7 @@ pub use types::{
     cHDR, iDim, DecodeResult, EncodeOptions, FilterHeuristic, Palette, PaletteAlgorithm,
     PaletteEntry,
 };
+pub use tonemap::ToneMapOperator;
 
 use crate::constants::*;
 
@@ -609,6 +612,8 @@ struct ReconstructParams<'a> {
     chdr: Option<&'a cHDR>,
     adam7_passes: &'a [Vec<u8>; ADAM7_NUM_PASSES],
     even_odd_passes: &'a [Vec<u8>; EVEN_ODD_NUM_PASSES],
+    /// Tone-map operator for HDR images (v1.2.1)
+    tonemap_operator: tonemap::ToneMapOperator,
 }
 
 /// Reconstructs final RGBA image from pixel data (refactoring v1.1).
@@ -638,17 +643,17 @@ fn reconstruct_final_pixels(pixel_rows: Vec<u8>, params: &ReconstructParams) -> 
                 "Color type=3 found without PLTE chunk".into(),
             ))
         }
-    } else if params.sample_format == SAMPLE_FORMAT_FLOAT && params.chdr.is_some() {
-        // v1.1: HDR tone-mapping — converts linear HDR float → SDR sRGB 8-bit
-        let target = 0u8; // 0=sRGB, 1=Rec.709, 2=DCI-P3, 3=Linear
-        tonemap::apply_tone_mapping_to_image(
-            &pixel_rows,
-            params.width,
-            params.height,
-            params.chdr.unwrap(),
-            target,
-            tonemap::ToneMapOperator::Filmic,
-        )
+     } else if params.sample_format == SAMPLE_FORMAT_FLOAT && params.chdr.is_some() {
+         // v1.1: HDR tone-mapping — converts linear HDR float → SDR sRGB 8-bit
+         let target = 0u8; // 0=sRGB, 1=Rec.709, 2=DCI-P3, 3=Linear
+         tonemap::apply_tone_mapping_to_image(
+             &pixel_rows,
+             params.width,
+             params.height,
+             params.chdr.unwrap(),
+             target,
+             params.tonemap_operator,
+         )
     } else if params.sample_format == SAMPLE_FORMAT_FLOAT
         || params.sample_format == SAMPLE_FORMAT_HALF
     {
@@ -682,7 +687,15 @@ fn reconstruct_final_pixels(pixel_rows: Vec<u8>, params: &ReconstructParams) -> 
 
 /// Decodes a CAFE buffer (bytes) and returns pixels + metadata.
 /// This is the core decode implementation without file I/O.
+/// 
+/// Uses default tone-map operator (Filmic). For custom operator selection, use decode_bytes_with_opts().
 pub fn decode_bytes(buf: &[u8]) -> Result<(Vec<u8>, DecodeResult)> {
+    decode_bytes_with_opts(buf, &EncodeOptions::default())
+}
+
+/// Decodes a CAFE buffer with custom decode options (tone-map operator selection, etc.)
+/// This is the core decode implementation without file I/O, with customizable options.
+fn decode_bytes_internal(buf: &[u8], tonemap_operator: tonemap::ToneMapOperator) -> Result<(Vec<u8>, DecodeResult)> {
     if buf.len() < 9 || buf[0..9] != SIGNATURE {
         return Err(CafeError::InvalidSignature);
     }
@@ -1420,6 +1433,7 @@ pub fn decode_bytes(buf: &[u8]) -> Result<(Vec<u8>, DecodeResult)> {
         chdr: chdr.as_ref(),
         adam7_passes: &adam7_passes,
         even_odd_passes: &even_odd_passes,
+        tonemap_operator,
     };
     let final_pixels = reconstruct_final_pixels(pixel_rows, &params)?;
 
@@ -1458,10 +1472,25 @@ pub fn decode_bytes(buf: &[u8]) -> Result<(Vec<u8>, DecodeResult)> {
     Ok((final_pixels, result))
 }
 
+/// Decodes a CAFE buffer with custom decode options (tone-map operator selection, etc.)
+/// 
+/// # Arguments
+/// * `buf` - Buffer containing CAFE-encoded data
+/// * `opts` - Decode options (tone-map operator, etc.)
+pub fn decode_bytes_with_opts(buf: &[u8], opts: &EncodeOptions) -> Result<(Vec<u8>, DecodeResult)> {
+    decode_bytes_internal(buf, opts.tonemap_operator)
+}
+
 /// Decodes a CAFE file to RGBA image on disk.
-pub fn decode(input_path: &str, output_path: &str) -> Result<DecodeResult> {
+/// Decodes a CAFE file with custom options (tone-map operator selection, etc.)
+/// 
+/// # Arguments
+/// * `input_path` - Path to input .cafe file
+/// * `output_path` - Path to output image file
+/// * `opts` - Decode options (primarily for tone-map operator selection)
+pub fn decode_with_opts(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Result<DecodeResult> {
     let buf = std::fs::read(input_path)?;
-    let (final_pixels, result) = decode_bytes(&buf)?;
+    let (final_pixels, result) = decode_bytes_with_opts(&buf, opts)?;
 
     let img_buf = image::RgbaImage::from_raw(result.width, result.height, final_pixels)
         .ok_or_else(|| {
@@ -1472,6 +1501,10 @@ pub fn decode(input_path: &str, output_path: &str) -> Result<DecodeResult> {
     img_buf.save(output_path)?;
 
     Ok(result)
+}
+
+pub fn decode(input_path: &str, output_path: &str) -> Result<DecodeResult> {
+    decode_with_opts(input_path, output_path, &EncodeOptions::default())
 }
 
 /// **New feature (v1.0):** Encodes an image with an indexed palette (section 4.1.2).

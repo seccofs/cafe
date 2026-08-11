@@ -190,14 +190,15 @@ fn convert_primaries(rgb: &[f32; 3], src: u8, dst: u8) -> [f32; 3] {
 /// Applies an S-shape/conic curve over the relative linear luminance [0, ∞)
 /// and produces output in [0, 1].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ToneMapOperator {
+pub enum ToneMapOperator {
     /// `L_out = L / (1 + L)` — classic Reinhard operator (1996).
     /// Smoothly compresses highlights; slightly darkens midtones.
-    #[allow(dead_code)] // Selectable in future use (CLI/decode configurable)
+    /// Good for images that benefit from gentle compression.
     Reinhard,
     /// ACES filmic curve (Narkowicz 2015) — `f(x) = x(2.51x + 0.03) /
     /// (x(2.43x + 0.59) + 0.14)`. Better preserves the perceived brightness of
-    /// midtones with smooth roll-off in highlights. Default.
+    /// midtones with smooth roll-off in highlights. Default. More aggressive
+    /// highlight compression.
     Filmic,
 }
 
@@ -213,6 +214,25 @@ impl ToneMapOperator {
         };
         // Filmic curve can exceed 1.0 for very large inputs; clamp
         v.clamp(0.0, 1.0)
+    }
+
+    /// Parse tone-map operator from string (case-insensitive)
+    pub fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s.to_lowercase().as_str() {
+            "reinhard" => Ok(ToneMapOperator::Reinhard),
+            "filmic" | "aces" => Ok(ToneMapOperator::Filmic),
+            other => Err(format!(
+                "unknown tone-map operator '{}': use 'reinhard' or 'filmic'",
+                other
+            )),
+        }
+    }
+}
+
+impl std::str::FromStr for ToneMapOperator {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        ToneMapOperator::from_str(s)
     }
 }
 
@@ -603,5 +623,30 @@ mod tests {
         let a = tonemap_hdr(&[0.5, 0.5, 0.5], 0, 0, 0, 1.0, ToneMapOperator::Reinhard).unwrap();
         let b = tonemap_hdr(&[0.5, 0.5, 0.5], 0, 0, 0, 1.0, ToneMapOperator::Filmic).unwrap();
         assert_ne!(a, b, "operators must produce different outputs");
+    }
+
+    #[test]
+    fn test_tonemap_operator_from_str() {
+        // Test case-insensitive parsing
+        assert_eq!(ToneMapOperator::from_str("reinhard").unwrap(), ToneMapOperator::Reinhard);
+        assert_eq!(ToneMapOperator::from_str("REINHARD").unwrap(), ToneMapOperator::Reinhard);
+        assert_eq!(ToneMapOperator::from_str("Reinhard").unwrap(), ToneMapOperator::Reinhard);
+        
+        // Filmic and ACES are aliases
+        assert_eq!(ToneMapOperator::from_str("filmic").unwrap(), ToneMapOperator::Filmic);
+        assert_eq!(ToneMapOperator::from_str("aces").unwrap(), ToneMapOperator::Filmic);
+        assert_eq!(ToneMapOperator::from_str("FILMIC").unwrap(), ToneMapOperator::Filmic);
+        
+        // Invalid operators should error
+        assert!(ToneMapOperator::from_str("invalid").is_err());
+        assert!(ToneMapOperator::from_str("").is_err());
+    }
+
+    #[test]
+    fn test_tonemap_operator_fromstr_trait() {
+        // Test the FromStr trait implementation
+        assert_eq!(ToneMapOperator::from_str("reinhard").unwrap(), ToneMapOperator::Reinhard);
+        assert_eq!(ToneMapOperator::from_str("filmic").unwrap(), ToneMapOperator::Filmic);
+        assert!(ToneMapOperator::from_str("unknown").is_err());
     }
 }
