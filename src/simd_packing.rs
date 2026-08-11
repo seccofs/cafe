@@ -892,7 +892,7 @@ pub fn pack_1bit_samples(samples: &[u8], width: usize) -> Result<Vec<u8>> {
         if width == 0 {
             return Ok(Vec::new());
         }
-        let expected_packed_len = (width + 7) / 8;
+        let expected_packed_len = width.div_ceil(8);
         let mut packed = vec![0u8; expected_packed_len];
         pack_1bit_samples_scalar(samples, width, &mut packed)?;
         Ok(packed)
@@ -910,7 +910,7 @@ pub fn pack_2bit_samples(samples: &[u8], width: usize) -> Result<Vec<u8>> {
         if width == 0 {
             return Ok(Vec::new());
         }
-        let expected_packed_len = (width * 2 + 7) / 8;
+        let expected_packed_len = (width * 2).div_ceil(8);
         let mut packed = vec![0u8; expected_packed_len];
         pack_2bit_samples_scalar(samples, width, &mut packed)?;
         Ok(packed)
@@ -928,7 +928,7 @@ pub fn pack_4bit_samples(samples: &[u8], width: usize) -> Result<Vec<u8>> {
         if width == 0 {
             return Ok(Vec::new());
         }
-        let expected_packed_len = (width * 4 + 7) / 8;
+        let expected_packed_len = (width * 4).div_ceil(8);
         let mut packed = vec![0u8; expected_packed_len];
         pack_4bit_samples_scalar(samples, width, &mut packed)?;
         Ok(packed)
