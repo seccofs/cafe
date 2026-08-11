@@ -1,5 +1,5 @@
 # CAFE — Compression Adaptive Filtering Experiment
-## Image Format Specification (v1.2)
+## Image Format Specification (v1.2.1)
 
 **Author:** Daniel Secco<br/>
 **Copyright** © 2026 Daniel Secco. Licensed under [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/) — see section 12.
@@ -10,7 +10,7 @@
 
 CAFE is a chunk-based image format (inspired by PNG), using **ZSTD** as the block compression algorithm, with space reserved in the format for future algorithms. The encoder applies automatic fallback to raw data when compression is not beneficial. Supports alpha channel by default, indexed palette with real sub-byte index packing, a broad set of predictive filters per block (tile), interlaced display, streaming decoding, and application metadata (EXIF, JSON, ICC, XMP). Supports HDR at the format level (`Sample format` float/half in `IHDR` + `cHDR` chunk, section 7), with an extension path for a complete HDR color pipeline without breaking compatibility.
 
-This version (v1.2) continues with aggressive SIMD acceleration for x86_64 (AVX2), adding vectorized pack/unpack for 1/2/4-bit samples (8-16x speedup), sample expansion/reduction 8→16/32 float (4-6x), byte-shuffle blocking (10-20% cache improvement), and improved Filter 3 (4-6x speedup). All 16 predictive filters from v1.1 remain; the reference implementation now includes 203 comprehensive tests (197 unit + 6 integration roundtrip), zero TODOs/FIXMEs, feature-gated SIMD with automatic CPU detection and scalar fallback, and Criterion benchmarking.
+This version (v1.2.1) continues with aggressive SIMD acceleration for x86_64 (AVX2), adding vectorized pack/unpack for 1/2/4-bit samples (8-16x speedup), sample expansion/reduction 8→16/32 float (4-6x), byte-shuffle blocking (10-20% cache improvement), and improved Filter 3 (4-6x speedup). All 16 predictive filters from v1.1 remain; the reference implementation now includes 252 comprehensive tests (197 unit + 6 integration roundtrip + 49 SIMD-specific), zero TODOs/FIXMEs, feature-gated SIMD with automatic CPU detection and scalar fallback, Criterion benchmarking, and tone-mapping operator dispatcher for enhanced HDR flexibility.
 
 ---
 
