@@ -7,7 +7,7 @@
 
 Um formato de imagem moderno baseado em chunks, inspirado em PNG, com suporte a compressão ZSTD, filtros preditivos avançados (16 tipos), paleta indexada, metadados estruturados (EXIF, JSON, ICC, XMP) e entrelaçamento progressivo.
 
-**Versão**: 1.2.0  
+**Versão**: 1.2.1  
 **Status**: ✅ Completo, auditado, e com aceleração SIMD  
 **Compatibilidade**: Rust 2021+
 
@@ -194,13 +194,13 @@ cafe-decode --help
 - **Imagem colorida**: Melhor em dados com padrões (gradientes, linhas)
 - **Imagem com ruído**: Similar a PNG (pouco ganho de filtro)
 
-### Velocidade de Encoding (Benchmarked v1.2)
-| Configuração | Tempo (512×512 RGB) | Speedup vs v1.1 | Notas |
-|---|---|---|---|
-| **Nível 1** (mais rápido) | ~8 ms | 1.5x | Sem filtros, SIMD pack acelerado |
-| **Nível 9** (balanceado) | ~15 ms | 1.7x | Recomendado para maioria dos casos |
-| **Nível 19** (padrão) | ~28 ms | 1.6x | Compressão alta, SIMD acelerado |
-| **Nível 22** (máximo) | ~75 ms | 1.6x | Não recomendado para aplicações real-time |
+### Velocidade de Encoding (v1.2.1)
+| Configuração | Tempo (512×512 RGB) | Notas |
+|---|---|---|
+| **Nível 1** (mais rápido) | ~8 ms | Sem filtros, SIMD pack acelerado |
+| **Nível 9** (balanceado) | ~15 ms | Recomendado para maioria dos casos |
+| **Nível 19** (padrão) | ~28 ms | Compressão alta, SIMD acelerado |
+| **Nível 22** (máximo) | ~75 ms | Não recomendado para aplicações real-time |
 
 ### Velocidade de Decoding
 - **Decodificar RGBA** (512×512): ~3 ms (com SIMD)
@@ -277,7 +277,8 @@ Contribuições são bem-vindas! Áreas com potencial:
 |--------|----------|--------|
 | **v1.0** | Chunks críticos, ZSTD, 14 filtros, metadados (EXIF/JSON/ICC/XMP/HDR), zDIC, sample_format float/half, segurança | ✅ Completo |
 | **v1.1** | Filtros 14-15: TR-Directional (WebP Predictor 10) e Weighted adaptativo (inspirado no JPEG-XL) — 16 preditores no total; heurística MSAD; tiling 2D real (iDIM) com round-trip end-to-end; byte-shuffle encode/decode; **otimização AVX2 SIMD (Filtros 1-3)**; HDR tone-mapping | ✅ Completo |
-| **v1.2** | **Aceleração SIMD Agressiva (AVX2 x86_64)**: Pack/Unpack 1/2/4-bit (8-16x), Expansão/redução de amostras (4-6x), Byte-shuffle com blocking (10-20%), Filter 3 melhorado (4-6x); **203 testes** (197 unit + 6 integration); **Zero TODOs/FIXMEs**; Benchmarks Criterion; Feature-gated SIMD com detecção de CPU | ✅ Completo |
+| **v1.2** | **Aceleração SIMD Agressiva (AVX2 x86_64)**: Pack/Unpack 1/2/4-bit (8-16x), Expansão/redução de amostras (4-6x), Byte-shuffle com blocking (10-20%), Filter 3 melhorado (4-6x); **252 testes** (197 unit + 6 integration roundtrip + 49 SIMD); **Zero TODOs/FIXMEs**; Benchmarks Criterion; Feature-gated SIMD com detecção de CPU | ✅ Completo |
+| **v1.2.1** | Refinamentos e despachante de operador para seleção de tone-mapping | ✅ Completo |
 | **Futuro** | NEON SIMD (ARM), compressores adicionais, operador de tone-mapping selecionável via CLI | 🔮 Planejado |
 
 ---
@@ -310,5 +311,5 @@ Arquitetura, especificação, implementação de referência em Rust (v1.1)
 
 ---
 
-**Última atualização**: 2026-08-10 (v1.2.0: SIMD agressivo com pack/unpack/sample-conversion, 203 testes, zero TODOs)  
+**Última atualização**: 2026-08-11 (v1.2.1: SIMD totalmente integrado, despachante de operador tone-mapping, 252 testes)  
 **Próxima revisão de segurança**: 2027-08-04

@@ -1,5 +1,5 @@
 # CAFE — Compression Adaptative Filtering Experiment
-## Especificação de Formato de Imagem (v1.2)
+## Especificação de Formato de Imagem (v1.2.1)
 
 **Autor:** Daniel Secco<br/>
 **Copyright** © 2026 Daniel Secco. Licenciado sob [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/) — ver seção 12.
@@ -10,7 +10,7 @@
 
 CAFE é um formato de imagem baseado em chunks (inspirado no PNG), usando **ZSTD** como algoritmo de compressão de bloco, com espaço reservado no formato para suporte a algoritmos adicionais no futuro. O encoder aplica fallback automático para dados brutos quando a compressão não é vantajosa. Suporta canal alfa por padrão, paleta indexada com empacotamento real de índices sub-byte, um conjunto amplo de filtros preditivos por bloco (tile), exibição entrelaçada, decodificação em streaming e metadados de aplicação (EXIF, JSON, ICC, XMP). Suporta HDR ao nível de formato (`Sample format` float/half no `IHDR` + chunk `cHDR`, seção 7), com caminho de extensão para pipeline de cores HDR completo sem quebra de compatibilidade.
 
-Esta versão (v1.2) continua com aceleração SIMD agressiva para x86_64 (AVX2), adicionando pack/unpack vetorizado para amostras 1/2/4-bit (speedup 8-16x), expansão/redução de amostras 8→16/32 float (4-6x), byte-shuffle com blocking (melhoria de cache 10-20%), e Filter 3 melhorado (speedup 4-6x). Os 16 filtros preditivos da v1.1 permanecem; a implementação de referência agora inclui 203 testes abrangentes (197 unit + 6 integration roundtrip), zero TODOs/FIXMEs, SIMD feature-gated com detecção automática de CPU e fallback escalar, e benchmarking Criterion.
+Esta versão (v1.2.1) continua com aceleração SIMD agressiva para x86_64 (AVX2), adicionando pack/unpack vetorizado para amostras 1/2/4-bit (speedup 8-16x), expansão/redução de amostras 8→16/32 float (4-6x), byte-shuffle com blocking (melhoria de cache 10-20%), e Filter 3 melhorado (speedup 4-6x). Os 16 filtros preditivos da v1.1 permanecem; a implementação de referência agora inclui 252 testes abrangentes (197 unit + 6 integration roundtrip + 49 SIMD-específicos), zero TODOs/FIXMEs, SIMD feature-gated com detecção automática de CPU e fallback escalar, benchmarking Criterion, e despachante de operador tone-mapping para maior flexibilidade HDR.
 
 ---
 
