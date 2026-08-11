@@ -875,3 +875,113 @@ mod tests {
         }
     }
 }
+
+// ============================================================================
+// Public Runtime-Dispatched Wrappers (works on all CPU architectures)
+// ============================================================================
+
+/// Pack 1-bit samples with runtime AVX2 detection.
+/// Uses SIMD on CPUs that support AVX2, falls back to scalar otherwise.
+pub fn pack_1bit_samples(samples: &[u8], width: usize) -> Result<Vec<u8>> {
+    #[cfg(target_feature = "avx2")]
+    {
+        pack_1bit_samples_avx2(samples, width)
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        if width == 0 {
+            return Ok(Vec::new());
+        }
+        let expected_packed_len = (width + 7) / 8;
+        let mut packed = vec![0u8; expected_packed_len];
+        pack_1bit_samples_scalar(samples, width, &mut packed)?;
+        Ok(packed)
+    }
+}
+
+/// Pack 2-bit samples with runtime AVX2 detection.
+pub fn pack_2bit_samples(samples: &[u8], width: usize) -> Result<Vec<u8>> {
+    #[cfg(target_feature = "avx2")]
+    {
+        pack_2bit_samples_avx2(samples, width)
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        if width == 0 {
+            return Ok(Vec::new());
+        }
+        let expected_packed_len = (width * 2 + 7) / 8;
+        let mut packed = vec![0u8; expected_packed_len];
+        pack_2bit_samples_scalar(samples, width, &mut packed)?;
+        Ok(packed)
+    }
+}
+
+/// Pack 4-bit samples with runtime AVX2 detection.
+pub fn pack_4bit_samples(samples: &[u8], width: usize) -> Result<Vec<u8>> {
+    #[cfg(target_feature = "avx2")]
+    {
+        pack_4bit_samples_avx2(samples, width)
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        if width == 0 {
+            return Ok(Vec::new());
+        }
+        let expected_packed_len = (width * 4 + 7) / 8;
+        let mut packed = vec![0u8; expected_packed_len];
+        pack_4bit_samples_scalar(samples, width, &mut packed)?;
+        Ok(packed)
+    }
+}
+
+/// Unpack 1-bit samples with runtime AVX2 detection.
+pub fn unpack_1bit_samples(packed: &[u8], width: usize) -> Result<Vec<u8>> {
+    #[cfg(target_feature = "avx2")]
+    {
+        unpack_1bit_samples_avx2(packed, width)
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        if width == 0 {
+            return Ok(Vec::new());
+        }
+        let mut unpacked = vec![0u8; width];
+        unpack_1bit_samples_scalar(packed, width, &mut unpacked)?;
+        Ok(unpacked)
+    }
+}
+
+/// Unpack 2-bit samples with runtime AVX2 detection.
+pub fn unpack_2bit_samples(packed: &[u8], width: usize) -> Result<Vec<u8>> {
+    #[cfg(target_feature = "avx2")]
+    {
+        unpack_2bit_samples_avx2(packed, width)
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        if width == 0 {
+            return Ok(Vec::new());
+        }
+        let mut unpacked = vec![0u8; width];
+        unpack_2bit_samples_scalar(packed, width, &mut unpacked)?;
+        Ok(unpacked)
+    }
+}
+
+/// Unpack 4-bit samples with runtime AVX2 detection.
+pub fn unpack_4bit_samples(packed: &[u8], width: usize) -> Result<Vec<u8>> {
+    #[cfg(target_feature = "avx2")]
+    {
+        unpack_4bit_samples_avx2(packed, width)
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        if width == 0 {
+            return Ok(Vec::new());
+        }
+        let mut unpacked = vec![0u8; width];
+        unpack_4bit_samples_scalar(packed, width, &mut unpacked)?;
+        Ok(unpacked)
+    }
+}
