@@ -429,6 +429,7 @@ pub(crate) fn apply_tone_mapping_to_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn test_pq_eotf_linear_range() {
@@ -629,15 +630,33 @@ mod tests {
     #[test]
     fn test_tonemap_operator_from_str() {
         // Test case-insensitive parsing
-        assert_eq!(ToneMapOperator::from_str("reinhard").unwrap(), ToneMapOperator::Reinhard);
-        assert_eq!(ToneMapOperator::from_str("REINHARD").unwrap(), ToneMapOperator::Reinhard);
-        assert_eq!(ToneMapOperator::from_str("Reinhard").unwrap(), ToneMapOperator::Reinhard);
-        
+        assert_eq!(
+            ToneMapOperator::from_str("reinhard").unwrap(),
+            ToneMapOperator::Reinhard
+        );
+        assert_eq!(
+            ToneMapOperator::from_str("REINHARD").unwrap(),
+            ToneMapOperator::Reinhard
+        );
+        assert_eq!(
+            ToneMapOperator::from_str("Reinhard").unwrap(),
+            ToneMapOperator::Reinhard
+        );
+
         // Filmic and ACES are aliases
-        assert_eq!(ToneMapOperator::from_str("filmic").unwrap(), ToneMapOperator::Filmic);
-        assert_eq!(ToneMapOperator::from_str("aces").unwrap(), ToneMapOperator::Filmic);
-        assert_eq!(ToneMapOperator::from_str("FILMIC").unwrap(), ToneMapOperator::Filmic);
-        
+        assert_eq!(
+            ToneMapOperator::from_str("filmic").unwrap(),
+            ToneMapOperator::Filmic
+        );
+        assert_eq!(
+            ToneMapOperator::from_str("aces").unwrap(),
+            ToneMapOperator::Filmic
+        );
+        assert_eq!(
+            ToneMapOperator::from_str("FILMIC").unwrap(),
+            ToneMapOperator::Filmic
+        );
+
         // Invalid operators should error
         assert!(ToneMapOperator::from_str("invalid").is_err());
         assert!(ToneMapOperator::from_str("").is_err());
@@ -646,8 +665,14 @@ mod tests {
     #[test]
     fn test_tonemap_operator_fromstr_trait() {
         // Test the FromStr trait implementation
-        assert_eq!(ToneMapOperator::from_str("reinhard").unwrap(), ToneMapOperator::Reinhard);
-        assert_eq!(ToneMapOperator::from_str("filmic").unwrap(), ToneMapOperator::Filmic);
+        assert_eq!(
+            ToneMapOperator::from_str("reinhard").unwrap(),
+            ToneMapOperator::Reinhard
+        );
+        assert_eq!(
+            ToneMapOperator::from_str("filmic").unwrap(),
+            ToneMapOperator::Filmic
+        );
         assert!(ToneMapOperator::from_str("unknown").is_err());
     }
 }
