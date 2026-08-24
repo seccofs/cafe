@@ -481,7 +481,7 @@ fn choose_best_block_filter_quick_prune(
 
     for (ftype, _, filtered) in top_candidates {
         let entropy = filtered
-            .chunks_exact(bytes_per_row)
+            .chunks(bytes_per_row)
             .map(shannon_entropy)
             .sum::<f64>();
 
@@ -620,7 +620,7 @@ fn choose_best_block_filter_adaptive(
     for &ftype in &candidates_to_test {
         let filtered = filter_block(tile_raw, tile_height, bytes_per_row, bpp, ftype);
         let entropy = filtered
-            .chunks_exact(bytes_per_row)
+            .chunks(bytes_per_row)
             .map(shannon_entropy)
             .sum::<f64>();
 
@@ -704,10 +704,7 @@ fn choose_best_block_filter(
         let filtered = filter_block(tile_raw, tile_height, bytes_per_row, bpp, ftype);
         let score = match heuristic {
             // Shannon entropy summed row by row (bits) — the lower, the better.
-            FilterHeuristic::Entropy => filtered
-                .chunks_exact(bytes_per_row)
-                .map(shannon_entropy)
-                .sum(),
+            FilterHeuristic::Entropy => filtered.chunks(bytes_per_row).map(shannon_entropy).sum(),
             // MSAD: sum of the absolute values of the residuals (the PNG classic).
             // Each filtered byte is a residual in [0, 255]; summing the bytes is the
             // unsigned version of SAD — the lower, the better.

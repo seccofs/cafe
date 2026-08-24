@@ -254,7 +254,7 @@ pub(crate) fn convert_rgba_to_color_type(
             if target_bit_depth <= 8 {
                 // Sub-byte (1,2,4) and 8-bit: process as 8-bit values, then pack if needed
                 let mut all_samples = Vec::new();
-                for chunk in rgba.chunks_exact(4) {
+                for chunk in rgba.as_chunks::<4>().0 {
                     let r = chunk[0] as u32;
                     let g = chunk[1] as u32;
                     let b = chunk[2] as u32;
@@ -286,7 +286,7 @@ pub(crate) fn convert_rgba_to_color_type(
                 }
             } else {
                 // Multi-byte (10,12,16,32): expands 8-bit values to N-bit big-endian
-                for chunk in rgba.chunks_exact(4) {
+                for chunk in rgba.as_chunks::<4>().0 {
                     let r = chunk[0] as u32;
                     let g = chunk[1] as u32;
                     let b = chunk[2] as u32;
@@ -319,14 +319,14 @@ pub(crate) fn convert_rgba_to_color_type(
 
             if target_bit_depth == 8 {
                 // RGB 8-bit: no expansion
-                for chunk in rgba.chunks_exact(4) {
+                for chunk in rgba.as_chunks::<4>().0 {
                     out.push(chunk[0]); // R
                     out.push(chunk[1]); // G
                     out.push(chunk[2]); // B
                 }
             } else {
                 // RGB multi-byte (10,12,16,32): expands each channel
-                for chunk in rgba.chunks_exact(4) {
+                for chunk in rgba.as_chunks::<4>().0 {
                     let r = chunk[0];
                     let g = chunk[1];
                     let b = chunk[2];
@@ -367,7 +367,7 @@ pub(crate) fn convert_rgba_to_color_type(
             if target_bit_depth <= 8 {
                 // Sub-byte (1,2,4) and 8-bit: process as 8-bit values, then pack if needed
                 let mut all_samples = Vec::new();
-                for chunk in rgba.chunks_exact(4) {
+                for chunk in rgba.as_chunks::<4>().0 {
                     let r = chunk[0] as u32;
                     let g = chunk[1] as u32;
                     let b = chunk[2] as u32;
@@ -402,7 +402,7 @@ pub(crate) fn convert_rgba_to_color_type(
                 }
             } else {
                 // Multi-byte (10,12,16,32): expands each sample
-                for chunk in rgba.chunks_exact(4) {
+                for chunk in rgba.as_chunks::<4>().0 {
                     let r = chunk[0] as u32;
                     let g = chunk[1] as u32;
                     let b = chunk[2] as u32;
@@ -443,7 +443,7 @@ pub(crate) fn convert_rgba_to_color_type(
                 out.extend_from_slice(rgba);
             } else {
                 // RGBA multi-byte (10,12,16,32): expands each channel
-                for chunk in rgba.chunks_exact(4) {
+                for chunk in rgba.as_chunks::<4>().0 {
                     let r = chunk[0];
                     let g = chunk[1];
                     let b = chunk[2];
@@ -814,7 +814,7 @@ pub(crate) fn convert_color_type_to_rgba(
         }
         COLOR_TYPE_RGB => {
             // RGB → RGBA (adds alpha = 0xFF)
-            for chunk in unpacked_data.chunks_exact(3) {
+            for chunk in unpacked_data.as_chunks::<3>().0 {
                 out.push(chunk[0]); // R
                 out.push(chunk[1]); // G
                 out.push(chunk[2]); // B
@@ -824,7 +824,7 @@ pub(crate) fn convert_color_type_to_rgba(
         }
         COLOR_TYPE_GRAY_ALPHA => {
             // Gray+Alpha → RGBA (replicates gray to RGB, keeps alpha)
-            for chunk in unpacked_data.chunks_exact(2) {
+            for chunk in unpacked_data.as_chunks::<2>().0 {
                 let gray = chunk[0];
                 let alpha = chunk[1];
                 out.push(gray); // R

@@ -27,8 +27,8 @@ mod simd_integration_tests {
         let height = 256u32;
         let mut img = ImageBuffer::new(width, height);
 
-        for (x, y, pixel) in img.enumerate_pixels_mut() {
-            let val = (x as u32 * 255 / width) as u8;
+        for (x, _y, pixel) in img.enumerate_pixels_mut() {
+            let val = (x * 255 / width) as u8;
             *pixel = image::Rgba([val, val, val, 255]);
         }
 
@@ -153,7 +153,7 @@ mod simd_integration_tests {
         // Create a larger grayscale image
         let mut img = ImageBuffer::new(512u32, 512u32);
         for (x, y, pixel) in img.enumerate_pixels_mut() {
-            let val = (((x + y) as u32 * 255) / 1024) as u8;
+            let val = (((x + y) * 255) / 1024) as u8;
             *pixel = image::Rgba([val, val, val, 255]);
         }
         img.save(temp_dir.path().join("large.png")).unwrap();

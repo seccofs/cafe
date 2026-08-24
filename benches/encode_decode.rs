@@ -66,6 +66,7 @@ fn benchmark_encode_small_image(c: &mut Criterion) {
                     palette_algorithm: cafe::PaletteAlgorithm::NearestNeighbor,
                     tile_rows: 8,
                     xmp_metadata: None,
+                    tonemap_operator: cafe::ToneMapOperator::Filmic,
                 };
                 let _ = cafe::encode(
                     black_box(&test_png),

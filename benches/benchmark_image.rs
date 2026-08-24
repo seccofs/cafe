@@ -56,7 +56,7 @@ impl BenchmarkImage {
             state = state
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            pixel_data[0] = (state >> 0) as u8; // R
+            pixel_data[0] = state as u8; // R
             pixel_data[1] = (state >> 8) as u8; // G
             pixel_data[2] = (state >> 16) as u8; // B
             pixel_data[3] = (state >> 24) as u8; // A
@@ -76,7 +76,7 @@ impl BenchmarkImage {
         for y in 0..height {
             for x in 0..width {
                 let idx = ((y as usize) * (width as usize) + (x as usize)) * 4;
-                let is_white = ((x / square_size) + (y / square_size)) % 2 == 0;
+                let is_white = ((x / square_size) + (y / square_size)).is_multiple_of(2);
 
                 if is_white {
                     image.pixels[idx] = 255;
@@ -167,7 +167,7 @@ mod tests {
         assert_eq!(img.width, 64);
         assert_eq!(img.height, 64);
         // Verify some pixels are white (255) and some are black (0)
-        assert!(img.pixels.iter().any(|&p| p == 255));
-        assert!(img.pixels.iter().any(|&p| p == 0));
+        assert!(img.pixels.contains(&255));
+        assert!(img.pixels.contains(&0));
     }
 }

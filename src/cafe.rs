@@ -2003,7 +2003,7 @@ fn quantize_nearest_neighbor(rgba: &[u8], max_colors: u32) -> (Vec<u8>, Palette)
     };
     let mut indices = Vec::new();
 
-    for chunk in rgba.chunks_exact(4) {
+    for chunk in rgba.as_chunks::<4>().0 {
         let r = chunk[0];
         let g = chunk[1];
         let b = chunk[2];
@@ -2048,7 +2048,7 @@ fn quantize_median_cut_wrapper(rgba: &[u8], max_colors: u32) -> (Vec<u8>, Palett
         Ok(palette) => {
             // Now map original RGBA pixels to palette indices using nearest-neighbor
             let mut indices = Vec::new();
-            for chunk in rgba.chunks_exact(4) {
+            for chunk in rgba.as_chunks::<4>().0 {
                 let r = chunk[0];
                 let g = chunk[1];
                 let b = chunk[2];

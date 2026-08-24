@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn test_byte_shuffle_invalid_bpp() {
-        let result = apply_byte_shuffle_simd(&vec![0u8; 9], 3, 3, 1);
+        let result = apply_byte_shuffle_simd(&[0u8; 9], 3, 3, 1);
         assert!(result.is_err(), "unsupported BPP should error");
     }
 }

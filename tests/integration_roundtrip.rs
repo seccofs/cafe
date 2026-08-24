@@ -77,11 +77,13 @@ fn test_roundtrip_256x256_rgba_checkerboard() {
         .expect("Failed to save input PNG");
 
     // Encode to CAFE
-    let mut opts = EncodeOptions::default();
-    opts.use_filter = true;
-    opts.level = 12;
-    opts.adaptive_analysis = true;
-    opts.target_color_type = 6; // RGBA
+    let opts = EncodeOptions {
+        use_filter: true,
+        level: 12,
+        adaptive_analysis: true,
+        target_color_type: 6, // RGBA
+        ..Default::default()
+    };
 
     encode(&input_png, &output_cafe, &opts).expect("Encode failed");
 
@@ -122,11 +124,13 @@ fn test_roundtrip_512x512_rgba_gradient() {
         .save(&input_png)
         .expect("Failed to save input PNG");
 
-    let mut opts = EncodeOptions::default();
-    opts.use_filter = true;
-    opts.level = 18;
-    opts.adaptive_analysis = true;
-    opts.target_color_type = 6;
+    let opts = EncodeOptions {
+        use_filter: true,
+        level: 18,
+        adaptive_analysis: true,
+        target_color_type: 6,
+        ..Default::default()
+    };
 
     encode(&input_png, &output_cafe, &opts).expect("Encode failed");
     assert!(Path::new(&output_cafe).exists());
@@ -162,11 +166,13 @@ fn test_roundtrip_1024x768_rgba_random() {
         .save(&input_png)
         .expect("Failed to save input PNG");
 
-    let mut opts = EncodeOptions::default();
-    opts.use_filter = true;
-    opts.level = 19;
-    opts.adaptive_analysis = true;
-    opts.target_color_type = 6;
+    let opts = EncodeOptions {
+        use_filter: true,
+        level: 19,
+        adaptive_analysis: true,
+        target_color_type: 6,
+        ..Default::default()
+    };
 
     encode(&input_png, &output_cafe, &opts).expect("Encode failed");
     assert!(Path::new(&output_cafe).exists());
@@ -203,11 +209,13 @@ fn test_roundtrip_small_image_4x4() {
         .save(&input_png)
         .expect("Failed to save input PNG");
 
-    let mut opts = EncodeOptions::default();
-    opts.use_filter = true;
-    opts.level = 22;
-    opts.adaptive_analysis = false;
-    opts.target_color_type = 6;
+    let opts = EncodeOptions {
+        use_filter: true,
+        level: 22,
+        adaptive_analysis: false,
+        target_color_type: 6,
+        ..Default::default()
+    };
 
     encode(&input_png, &output_cafe, &opts).expect("Encode failed");
     assert!(Path::new(&output_cafe).exists());
@@ -240,11 +248,13 @@ fn test_roundtrip_wide_image_2048x256() {
         .save(&input_png)
         .expect("Failed to save input PNG");
 
-    let mut opts = EncodeOptions::default();
-    opts.use_filter = true;
-    opts.level = 19;
-    opts.adaptive_analysis = true;
-    opts.target_color_type = 6;
+    let opts = EncodeOptions {
+        use_filter: true,
+        level: 19,
+        adaptive_analysis: true,
+        target_color_type: 6,
+        ..Default::default()
+    };
 
     encode(&input_png, &output_cafe, &opts).expect("Encode failed");
     assert!(Path::new(&output_cafe).exists());
@@ -278,11 +288,13 @@ fn test_roundtrip_tall_image_256x2048() {
         .save(&input_png)
         .expect("Failed to save input PNG");
 
-    let mut opts = EncodeOptions::default();
-    opts.use_filter = true;
-    opts.level = 19;
-    opts.adaptive_analysis = true;
-    opts.target_color_type = 6;
+    let opts = EncodeOptions {
+        use_filter: true,
+        level: 19,
+        adaptive_analysis: true,
+        target_color_type: 6,
+        ..Default::default()
+    };
 
     encode(&input_png, &output_cafe, &opts).expect("Encode failed");
     assert!(Path::new(&output_cafe).exists());
