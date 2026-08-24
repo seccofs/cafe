@@ -9,8 +9,13 @@
 //! - Pack 4-bit: 5-7x vs scalar
 //! - Unpack operations: Similar ratios
 //!
-//! # Feature Requirement
-//! Requires AVX2 support. When AVX2 is not available, scalar fallback is used.
+//! # Dispatch
+//! The public `pack_*`/`unpack_*` functions in this module detect AVX2
+//! support **at runtime** via `is_x86_feature_detected!("avx2")` and
+//! transparently fall back to scalar implementations on CPUs without it.
+//! No special build flags (`RUSTFLAGS`, `-C target-feature`) are required;
+//! a single binary works correctly (just slower) on any x86_64 CPU, and on
+//! non-x86_64 architectures the scalar path is used unconditionally.
 //!
 //! # Architecture
 //! - x86_64 with AVX2: 256-bit (32 bytes) per iteration
@@ -18,10 +23,10 @@
 //! - Scalar tail handling for remaining bytes
 //!
 //! # Safety
-//! All unsafe blocks are bounded-checked before use. No assumptions about
+//! All unsafe blocks are bounds-checked before use. No assumptions about
 //! pointer alignment (uses unaligned load/store).
 
-#[cfg(target_feature = "avx2")]
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
 use crate::error::{CafeError, Result};
@@ -30,7 +35,8 @@ use crate::error::{CafeError, Result};
 // Pack Operations (byte stream → packed bits)
 // ============================================================================
 
-/// Packs an array of 1-bit samples using AVX2 if available.
+/// Packs an array of 1-bit samples using AVX2 if the running CPU supports it,
+/// otherwise scalar.
 ///
 /// # Arguments
 /// - `samples`: Array of bytes where each byte is 0 or 1 (1-bit value)
@@ -38,83 +44,26 @@ use crate::error::{CafeError, Result};
 ///
 /// # Returns
 /// Vector of packed bytes (8 pixels per byte)
-///
-/// # Example
-/// ```ignore
-/// // Input: [0, 1, 1, 0, 1, 1, 1, 0, ...] (8 pixels, stored as bytes)
-/// // Output: [0b01101110, ...] (1 byte packed)
-/// let packed = pack_1bit_samples_avx2(&samples, width)?;
-/// ```
-#[cfg(target_feature = "avx2")]
-pub fn pack_1bit_samples_avx2(samples: &[u8], width: usize) -> Result<Vec<u8>> {
+pub fn pack_1bit_samples(samples: &[u8], width: usize) -> Result<Vec<u8>> {
     if width == 0 {
         return Ok(Vec::new());
     }
-
-    let expected_packed_len = (width + 7) / 8;
+    let expected_packed_len = width.div_ceil(8);
     let mut packed = vec![0u8; expected_packed_len];
 
-    if width <= 32 {
-        // Too small for SIMD, use scalar
-        pack_1bit_samples_scalar(samples, width, &mut packed)?;
-        return Ok(packed);
-    }
-
-    unsafe {
-        let mut i = 0;
-        let simd_width = 32; // AVX2 processes 32 pixels per iteration
-
-        // SIMD loop: Process 32 pixels → 4 bytes
-        while i + simd_width <= width {
-            let start = i;
-            let end = i + simd_width;
-
-            // Validate bounds
-            if end > samples.len() {
-                return Err(CafeError::TruncatedFile(
-                    "pack_1bit_samples_avx2: insufficient samples data".into(),
-                ));
-            }
-
-            // Load 32 bytes (32 pixels, each 0 or 1)
-            let pixels = _mm256_loadu_si256(samples.as_ptr().add(start) as *const __m256i);
-
-            // Extract bits: For each byte, extract LSB and shift to final position
-            // Strategy: Use bit extraction and OR operations
-            // Result: 4 bytes packed (8 pixels per byte)
-
-            // Unpack to 8 × 32-bit lanes, shift, and pack down
-            let byte0 = _mm256_castsi256_si128(pixels);
-            let byte1 = _mm256_extracti128_si256(pixels, 1);
-
-            // Compress 16 pixels into 2 bytes (each pixel → 1 bit)
-            let packed_low = compress_1bit_lane_avx2(byte0);
-            let packed_high = compress_1bit_lane_avx2(byte1);
-
-            let packed_out = _mm_unpacklo_epi8(packed_low, packed_high);
-            let out_idx = i / 8;
-
-            if out_idx + 4 > expected_packed_len {
-                return Err(CafeError::TruncatedFile(
-                    "pack_1bit_samples_avx2: packed buffer overflow".into(),
-                ));
-            }
-
-            _mm_storeu_si128(packed.as_mut_ptr().add(out_idx) as *mut __m128i, packed_out);
-            i += simd_width;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && width > 32 {
+            return unsafe { pack_1bit_samples_avx2_impl(samples, width, expected_packed_len) };
         }
     }
 
-    // Scalar tail: remaining pixels
-    let tail_start = (i / 32) * 32;
-    if tail_start < width {
-        pack_1bit_samples_scalar(samples, width, &mut packed)?;
-    }
-
+    pack_1bit_samples_scalar(samples, width, &mut packed)?;
     Ok(packed)
 }
 
-/// Packs an array of 2-bit samples using AVX2 if available.
+/// Packs an array of 2-bit samples using AVX2 if the running CPU supports it,
+/// otherwise scalar.
 ///
 /// # Arguments
 /// - `samples`: Array of bytes where each byte is 0-3 (2-bit value)
@@ -122,63 +71,26 @@ pub fn pack_1bit_samples_avx2(samples: &[u8], width: usize) -> Result<Vec<u8>> {
 ///
 /// # Returns
 /// Vector of packed bytes (4 pixels per byte)
-#[cfg(target_feature = "avx2")]
-pub fn pack_2bit_samples_avx2(samples: &[u8], width: usize) -> Result<Vec<u8>> {
+pub fn pack_2bit_samples(samples: &[u8], width: usize) -> Result<Vec<u8>> {
     if width == 0 {
         return Ok(Vec::new());
     }
-
-    let expected_packed_len = (width * 2 + 7) / 8;
+    let expected_packed_len = (width * 2).div_ceil(8);
     let mut packed = vec![0u8; expected_packed_len];
 
-    if width <= 16 {
-        pack_2bit_samples_scalar(samples, width, &mut packed)?;
-        return Ok(packed);
-    }
-
-    unsafe {
-        let mut i = 0;
-        let simd_width = 16; // AVX2 processes 16 pixels per iteration
-
-        while i + simd_width <= width {
-            let start = i;
-            let end = i + simd_width;
-
-            if end > samples.len() {
-                return Err(CafeError::TruncatedFile(
-                    "pack_2bit_samples_avx2: insufficient samples data".into(),
-                ));
-            }
-
-            // Load 16 bytes (16 pixels, each 0-3)
-            let pixels_full = _mm256_loadu_si256(samples.as_ptr().add(start) as *const __m256i);
-            let pixels = _mm256_castsi256_si128(pixels_full); // Use lower 128 bits
-
-            // Pack 16 pixels (2-bit each) → 4 bytes
-            let packed_out = compress_2bit_lane_avx2(pixels);
-
-            let out_idx = (i * 2) / 8;
-            if out_idx + 2 > expected_packed_len {
-                return Err(CafeError::TruncatedFile(
-                    "pack_2bit_samples_avx2: packed buffer overflow".into(),
-                ));
-            }
-
-            // Store 4 bytes
-            *(packed.as_mut_ptr().add(out_idx) as *mut u32) = _mm_cvtsi128_si32(packed_out) as u32;
-            i += simd_width;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && width > 16 {
+            return unsafe { pack_2bit_samples_avx2_impl(samples, width, expected_packed_len) };
         }
     }
 
-    // Scalar tail
-    if i < width {
-        pack_2bit_samples_scalar(samples, width, &mut packed)?;
-    }
-
+    pack_2bit_samples_scalar(samples, width, &mut packed)?;
     Ok(packed)
 }
 
-/// Packs an array of 4-bit samples using AVX2 if available.
+/// Packs an array of 4-bit samples using AVX2 if the running CPU supports it,
+/// otherwise scalar.
 ///
 /// # Arguments
 /// - `samples`: Array of bytes where each byte is 0-15 (4-bit value)
@@ -186,66 +98,21 @@ pub fn pack_2bit_samples_avx2(samples: &[u8], width: usize) -> Result<Vec<u8>> {
 ///
 /// # Returns
 /// Vector of packed bytes (2 pixels per byte)
-#[cfg(target_feature = "avx2")]
-pub fn pack_4bit_samples_avx2(samples: &[u8], width: usize) -> Result<Vec<u8>> {
+pub fn pack_4bit_samples(samples: &[u8], width: usize) -> Result<Vec<u8>> {
     if width == 0 {
         return Ok(Vec::new());
     }
-
-    let expected_packed_len = (width + 1) / 2;
+    let expected_packed_len = width.div_ceil(2);
     let mut packed = vec![0u8; expected_packed_len];
 
-    if width <= 8 {
-        pack_4bit_samples_scalar(samples, width, &mut packed)?;
-        return Ok(packed);
-    }
-
-    unsafe {
-        let mut i = 0;
-        let simd_width = 8; // AVX2 processes 8 pixels per iteration
-
-        while i + simd_width <= width {
-            let start = i;
-            let end = i + simd_width;
-
-            if end > samples.len() {
-                return Err(CafeError::TruncatedFile(
-                    "pack_4bit_samples_avx2: insufficient samples data".into(),
-                ));
-            }
-
-            // Load 8 bytes (8 pixels, each 0-15)
-            let pixels = _mm_loadu_si64(samples.as_ptr().add(start) as *const i64);
-
-            // Pack 8 pixels (4-bit each) → 4 bytes
-            let packed_out = compress_4bit_lane_avx2(pixels);
-
-            let out_idx = (i * 4) / 8;
-            if out_idx + 1 > expected_packed_len {
-                return Err(CafeError::TruncatedFile(
-                    "pack_4bit_samples_avx2: packed buffer overflow".into(),
-                ));
-            }
-
-            // Store result
-            let packed_val = _mm_cvtsi128_si32(packed_out) as u32;
-            if out_idx + 4 <= packed.len() {
-                *(packed.as_mut_ptr().add(out_idx) as *mut u32) = packed_val;
-            } else {
-                // Handle partial write
-                for j in 0..((expected_packed_len - out_idx).min(4)) {
-                    packed[out_idx + j] = ((packed_val >> (j * 8)) & 0xFF) as u8;
-                }
-            }
-            i += simd_width;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && width > 8 {
+            return unsafe { pack_4bit_samples_avx2_impl(samples, width, expected_packed_len) };
         }
     }
 
-    // Scalar tail
-    if i < width {
-        pack_4bit_samples_scalar(samples, width, &mut packed)?;
-    }
-
+    pack_4bit_samples_scalar(samples, width, &mut packed)?;
     Ok(packed)
 }
 
@@ -253,268 +120,323 @@ pub fn pack_4bit_samples_avx2(samples: &[u8], width: usize) -> Result<Vec<u8>> {
 // Unpack Operations (packed bits → byte stream)
 // ============================================================================
 
-/// Unpacks a byte array of 1-bit samples using AVX2 if available.
-///
-/// # Arguments
-/// - `packed`: Array of packed bytes (8 pixels per byte)
-/// - `width`: Number of pixels to unpack
-///
-/// # Returns
-/// Vector of unpacked bytes (1 byte per pixel, value 0 or 1)
-#[cfg(target_feature = "avx2")]
-pub fn unpack_1bit_samples_avx2(packed: &[u8], width: usize) -> Result<Vec<u8>> {
+/// Unpacks a byte array of 1-bit samples using AVX2 if the running CPU
+/// supports it, otherwise scalar.
+pub fn unpack_1bit_samples(packed: &[u8], width: usize) -> Result<Vec<u8>> {
     if width == 0 {
         return Ok(Vec::new());
     }
+    let mut unpacked = vec![0u8; width];
 
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { unpack_1bit_samples_avx2_impl(packed, width) };
+        }
+    }
+
+    unpack_1bit_samples_scalar(packed, width, &mut unpacked)?;
+    Ok(unpacked)
+}
+
+/// Unpacks a byte array of 2-bit samples using AVX2 if the running CPU
+/// supports it, otherwise scalar.
+pub fn unpack_2bit_samples(packed: &[u8], width: usize) -> Result<Vec<u8>> {
+    if width == 0 {
+        return Ok(Vec::new());
+    }
+    let mut unpacked = vec![0u8; width];
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { unpack_2bit_samples_avx2_impl(packed, width) };
+        }
+    }
+
+    unpack_2bit_samples_scalar(packed, width, &mut unpacked)?;
+    Ok(unpacked)
+}
+
+/// Unpacks a byte array of 4-bit samples using AVX2 if the running CPU
+/// supports it, otherwise scalar.
+pub fn unpack_4bit_samples(packed: &[u8], width: usize) -> Result<Vec<u8>> {
+    if width == 0 {
+        return Ok(Vec::new());
+    }
+    let mut unpacked = vec![0u8; width];
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { unpack_4bit_samples_avx2_impl(packed, width) };
+        }
+    }
+
+    unpack_4bit_samples_scalar(packed, width, &mut unpacked)?;
+    Ok(unpacked)
+}
+
+// ============================================================================
+// AVX2 Implementations (require caller to have checked is_x86_feature_detected)
+// ============================================================================
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn pack_1bit_samples_avx2_impl(
+    samples: &[u8],
+    width: usize,
+    expected_packed_len: usize,
+) -> Result<Vec<u8>> {
+    let mut packed = vec![0u8; expected_packed_len];
+    let mut i = 0;
+    const SIMD_PIXELS: usize = 32; // AVX2 processes 32 pixels (1 vector load) per iteration
+
+    while i + SIMD_PIXELS <= width {
+        let end = i + SIMD_PIXELS;
+        if end > samples.len() {
+            return Err(CafeError::TruncatedFile(
+                "pack_1bit_samples_avx2: insufficient samples data".into(),
+            ));
+        }
+
+        let pixels = _mm256_loadu_si256(samples.as_ptr().add(i) as *const __m256i);
+
+        let out_idx = i / 8;
+        if out_idx + 4 > expected_packed_len {
+            return Err(CafeError::TruncatedFile(
+                "pack_1bit_samples_avx2: packed buffer overflow".into(),
+            ));
+        }
+
+        // `_mm256_movemask_epi8` gathers the MSB of each of the 32 byte
+        // lanes into a 32-bit mask (bit k = MSB of lane k). Each input
+        // sample is 0 or 1 (LSB), so we compare against zero to promote a
+        // nonzero sample into a lane with the MSB set (0xFF vs 0x00), which
+        // movemask can then read directly.
+        let is_nonzero = _mm256_cmpgt_epi8(pixels, _mm256_setzero_si256());
+        let mask = _mm256_movemask_epi8(is_nonzero) as u32;
+
+        // `mask` bit k (0-indexed from LSB) corresponds to pixel (i+k).
+        // Output packs pixel (i+k) into byte (k/8), bit position (7 - k%8),
+        // MSB-first. Build the 4 output bytes by reversing bit order within
+        // each 8-bit group of `mask`.
+        for byte_group in 0..4 {
+            let byte_bits = ((mask >> (byte_group * 8)) & 0xFF) as u8;
+            packed[out_idx + byte_group] = byte_bits.reverse_bits();
+        }
+
+        i += SIMD_PIXELS;
+    }
+
+    if i < width {
+        pack_1bit_samples_scalar_from(samples, width, &mut packed, i)?;
+    }
+
+    Ok(packed)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn pack_2bit_samples_avx2_impl(
+    samples: &[u8],
+    width: usize,
+    expected_packed_len: usize,
+) -> Result<Vec<u8>> {
+    // The bit-manipulation gain for 2-bit packing is dominated by scalar
+    // extraction anyway (no direct AVX2 bit-pack instruction), so we vectorize
+    // the load but pack with clear, verifiably-correct scalar logic.
+    let mut packed = vec![0u8; expected_packed_len];
+    let mut i = 0;
+    const SIMD_PIXELS: usize = 16;
+
+    while i + SIMD_PIXELS <= width {
+        let end = i + SIMD_PIXELS;
+        if end > samples.len() {
+            return Err(CafeError::TruncatedFile(
+                "pack_2bit_samples_avx2: insufficient samples data".into(),
+            ));
+        }
+        let pixels_full = _mm256_loadu_si256(samples.as_ptr().add(i) as *const __m256i);
+        let pixels = _mm256_castsi256_si128(pixels_full);
+        let mut vals = [0u8; 16];
+        _mm_storeu_si128(vals.as_mut_ptr() as *mut __m128i, pixels);
+
+        let out_idx = (i * 2) / 8;
+        if out_idx + 4 > expected_packed_len {
+            return Err(CafeError::TruncatedFile(
+                "pack_2bit_samples_avx2: packed buffer overflow".into(),
+            ));
+        }
+        for k in 0..4 {
+            let base = k * 4;
+            packed[out_idx + k] = ((vals[base] & 3) << 6)
+                | ((vals[base + 1] & 3) << 4)
+                | ((vals[base + 2] & 3) << 2)
+                | (vals[base + 3] & 3);
+        }
+        i += SIMD_PIXELS;
+    }
+
+    if i < width {
+        pack_2bit_samples_scalar_from(samples, width, &mut packed, i)?;
+    }
+
+    Ok(packed)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn pack_4bit_samples_avx2_impl(
+    samples: &[u8],
+    width: usize,
+    expected_packed_len: usize,
+) -> Result<Vec<u8>> {
+    let mut packed = vec![0u8; expected_packed_len];
+    let mut i = 0;
+    const SIMD_PIXELS: usize = 8;
+
+    while i + SIMD_PIXELS <= width {
+        let end = i + SIMD_PIXELS;
+        if end > samples.len() {
+            return Err(CafeError::TruncatedFile(
+                "pack_4bit_samples_avx2: insufficient samples data".into(),
+            ));
+        }
+        let mut vals = [0u8; 8];
+        vals.copy_from_slice(&samples[i..end]);
+
+        let out_idx = i / 2;
+        if out_idx + 4 > expected_packed_len {
+            return Err(CafeError::TruncatedFile(
+                "pack_4bit_samples_avx2: packed buffer overflow".into(),
+            ));
+        }
+        for k in 0..4 {
+            let base = k * 2;
+            packed[out_idx + k] = ((vals[base] & 15) << 4) | (vals[base + 1] & 15);
+        }
+        i += SIMD_PIXELS;
+    }
+
+    if i < width {
+        pack_4bit_samples_scalar_from(samples, width, &mut packed, i)?;
+    }
+
+    Ok(packed)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_1bit_samples_avx2_impl(packed: &[u8], width: usize) -> Result<Vec<u8>> {
     let mut unpacked = vec![0u8; width];
     let mut i = 0;
-    const SIMD_WIDTH: usize = 32; // Process 32 bytes (256 pixels × 1-bit) per iteration
+    const SIMD_WIDTH: usize = 32; // Process 32 packed bytes (256 pixels) per iteration
 
-    // SIMD fast path: process 32 packed bytes → 256 unpacked bytes
     while i + (SIMD_WIDTH * 8) <= width {
         let packed_idx = i / 8;
-
-        // Load 32 bytes
-        if packed_idx + SIMD_WIDTH <= packed.len() {
-            let packed_ptr = packed.as_ptr().add(packed_idx) as *const u8;
-            for j in 0..SIMD_WIDTH {
-                let byte = unsafe { *packed_ptr.add(j) };
-                let base_idx = i + j * 8;
-
-                // Unpack this byte into 8 pixels
-                for bit in 0..8 {
-                    unpacked[base_idx + bit] = if (byte >> (7 - bit)) & 1 != 0 { 1 } else { 0 };
-                }
-            }
-            i += SIMD_WIDTH * 8;
-        } else {
+        if packed_idx + SIMD_WIDTH > packed.len() {
             break;
         }
+        for j in 0..SIMD_WIDTH {
+            let byte = *packed.as_ptr().add(packed_idx + j);
+            let base_idx = i + j * 8;
+            for bit in 0..8 {
+                unpacked[base_idx + bit] = (byte >> (7 - bit)) & 1;
+            }
+        }
+        i += SIMD_WIDTH * 8;
     }
 
-    // Scalar tail
     if i < width {
-        unpack_1bit_samples_scalar(packed, width, &mut unpacked)?;
+        unpack_1bit_samples_scalar_from(packed, width, &mut unpacked, i)?;
     }
 
     Ok(unpacked)
 }
 
-/// Unpacks a byte array of 2-bit samples using AVX2 if available.
-#[cfg(target_feature = "avx2")]
-pub fn unpack_2bit_samples_avx2(packed: &[u8], width: usize) -> Result<Vec<u8>> {
-    if width == 0 {
-        return Ok(Vec::new());
-    }
-
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_2bit_samples_avx2_impl(packed: &[u8], width: usize) -> Result<Vec<u8>> {
     let mut unpacked = vec![0u8; width];
     let mut i = 0;
-    const SIMD_WIDTH: usize = 32; // Process 32 bytes (128 pixels × 2-bit) per iteration
+    const SIMD_WIDTH: usize = 32; // Process 32 packed bytes (128 pixels) per iteration
 
-    // SIMD fast path: process 32 packed bytes → 128 unpacked bytes
     while i + (SIMD_WIDTH * 4) <= width {
-        let packed_idx = (i * 2) / 8; // Convert pixel index to byte index
-
-        if packed_idx + SIMD_WIDTH <= packed.len() {
-            let packed_ptr = packed.as_ptr().add(packed_idx) as *const u8;
-            for j in 0..SIMD_WIDTH {
-                let byte = unsafe { *packed_ptr.add(j) };
-                let base_idx = i + j * 4;
-
-                // Unpack this byte into 4 pixels
-                unpacked[base_idx] = (byte >> 6) & 3;
-                unpacked[base_idx + 1] = (byte >> 4) & 3;
-                unpacked[base_idx + 2] = (byte >> 2) & 3;
-                unpacked[base_idx + 3] = byte & 3;
-            }
-            i += SIMD_WIDTH * 4;
-        } else {
+        let packed_idx = (i * 2) / 8;
+        if packed_idx + SIMD_WIDTH > packed.len() {
             break;
         }
+        for j in 0..SIMD_WIDTH {
+            let byte = *packed.as_ptr().add(packed_idx + j);
+            let base_idx = i + j * 4;
+            unpacked[base_idx] = (byte >> 6) & 3;
+            unpacked[base_idx + 1] = (byte >> 4) & 3;
+            unpacked[base_idx + 2] = (byte >> 2) & 3;
+            unpacked[base_idx + 3] = byte & 3;
+        }
+        i += SIMD_WIDTH * 4;
     }
 
-    // Scalar tail
     if i < width {
-        unpack_2bit_samples_scalar(packed, width, &mut unpacked)?;
+        unpack_2bit_samples_scalar_from(packed, width, &mut unpacked, i)?;
     }
 
     Ok(unpacked)
 }
 
-/// Unpacks a byte array of 4-bit samples using AVX2 if available.
-#[cfg(target_feature = "avx2")]
-pub fn unpack_4bit_samples_avx2(packed: &[u8], width: usize) -> Result<Vec<u8>> {
-    if width == 0 {
-        return Ok(Vec::new());
-    }
-
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_4bit_samples_avx2_impl(packed: &[u8], width: usize) -> Result<Vec<u8>> {
     let mut unpacked = vec![0u8; width];
     let mut i = 0;
-    const SIMD_WIDTH: usize = 32; // Process 32 bytes (64 pixels × 4-bit) per iteration
+    const SIMD_WIDTH: usize = 32; // Process 32 packed bytes (64 pixels) per iteration
 
-    // SIMD fast path: process 32 packed bytes → 64 unpacked bytes
     while i + (SIMD_WIDTH * 2) <= width {
-        let packed_idx = i / 2; // Convert pixel index to byte index
-
-        if packed_idx + SIMD_WIDTH <= packed.len() {
-            let packed_ptr = packed.as_ptr().add(packed_idx) as *const u8;
-            for j in 0..SIMD_WIDTH {
-                let byte = unsafe { *packed_ptr.add(j) };
-                let base_idx = i + j * 2;
-
-                // Unpack this byte into 2 pixels
-                unpacked[base_idx] = (byte >> 4) & 15;
-                unpacked[base_idx + 1] = byte & 15;
-            }
-            i += SIMD_WIDTH * 2;
-        } else {
+        let packed_idx = i / 2;
+        if packed_idx + SIMD_WIDTH > packed.len() {
             break;
         }
+        for j in 0..SIMD_WIDTH {
+            let byte = *packed.as_ptr().add(packed_idx + j);
+            let base_idx = i + j * 2;
+            unpacked[base_idx] = (byte >> 4) & 15;
+            unpacked[base_idx + 1] = byte & 15;
+        }
+        i += SIMD_WIDTH * 2;
     }
 
-    // Scalar tail
     if i < width {
-        unpack_4bit_samples_scalar(packed, width, &mut unpacked)?;
+        unpack_4bit_samples_scalar_from(packed, width, &mut unpacked, i)?;
     }
 
     Ok(unpacked)
-}
-
-// ============================================================================
-// Helper: Bit compression intrinsics (AVX2-specific)
-// ============================================================================
-
-/// Compresses 16 × 8-bit values (1-bit each) into 2 bytes using AVX2.
-/// Strategy: Extract LSB from each byte and pack into 2 bytes.
-/// Input:  [b0, b1, ..., b15] where each b_i is 0 or 1 (stored in LSB)
-/// Output: [packed_low, packed_high] where each packed byte contains 8 bits
-#[cfg(target_feature = "avx2")]
-#[inline]
-unsafe fn compress_1bit_lane_avx2(lane: __m128i) -> __m128i {
-    // Extract the low 8 bytes and high 8 bytes
-    let low_8 = _mm_castsi128_si64(lane);
-    let high_8 = _mm_extract_epi64(lane, 1);
-
-    // Compress each group of 8 bytes into 1 byte
-    let byte_low = compress_8x1bit_to_byte(low_8 as u64);
-    let byte_high = compress_8x1bit_to_byte(high_8 as u64);
-
-    // Combine into single 128-bit: [byte_low, byte_high, 0, 0, ...]
-    let result_u32 = ((byte_high as u32) << 8) | (byte_low as u32);
-    _mm_insert_epi32(_mm_setzero_si128(), result_u32 as i32, 0)
-}
-
-/// Helper: Compress 8 × 1-bit values (stored in low 8 bits of u64) into 1 byte
-#[cfg(target_feature = "avx2")]
-#[inline]
-fn compress_8x1bit_to_byte(bits: u64) -> u8 {
-    let mut result = 0u8;
-    for i in 0..8 {
-        if (bits >> (i * 8)) & 1 != 0 {
-            result |= 1u8 << (7 - i);
-        }
-    }
-    result
-}
-
-/// Compresses 16 × 8-bit values (2-bit each) into 4 bytes using AVX2.
-/// Input:  [b0, b1, ..., b15] where each b_i is 0-3 (2-bit value)
-/// Output: [packed_0, packed_1, packed_2, packed_3]
-#[cfg(target_feature = "avx2")]
-#[inline]
-unsafe fn compress_2bit_lane_avx2(lane: __m128i) -> __m128i {
-    // Process 4 pixels per iteration (each pixel = 2 bits)
-    // 16 pixels × 2 bits = 32 bits = 4 bytes
-
-    let vals = [
-        _mm_extract_epi8(lane, 0) as u8,
-        _mm_extract_epi8(lane, 1) as u8,
-        _mm_extract_epi8(lane, 2) as u8,
-        _mm_extract_epi8(lane, 3) as u8,
-        _mm_extract_epi8(lane, 4) as u8,
-        _mm_extract_epi8(lane, 5) as u8,
-        _mm_extract_epi8(lane, 6) as u8,
-        _mm_extract_epi8(lane, 7) as u8,
-        _mm_extract_epi8(lane, 8) as u8,
-        _mm_extract_epi8(lane, 9) as u8,
-        _mm_extract_epi8(lane, 10) as u8,
-        _mm_extract_epi8(lane, 11) as u8,
-        _mm_extract_epi8(lane, 12) as u8,
-        _mm_extract_epi8(lane, 13) as u8,
-        _mm_extract_epi8(lane, 14) as u8,
-        _mm_extract_epi8(lane, 15) as u8,
-    ];
-
-    // Pack 4 pixels (2-bit each) → 1 byte
-    let mut packed = [0u8; 4];
-    for i in 0..4 {
-        let idx = i * 4;
-        packed[i] = ((vals[idx] & 3) << 6)
-            | ((vals[idx + 1] & 3) << 4)
-            | ((vals[idx + 2] & 3) << 2)
-            | (vals[idx + 3] & 3);
-    }
-
-    _mm_insert_epi32(
-        _mm_insert_epi32(_mm_setzero_si128(), packed[0] as i32, 0),
-        (packed[1] as i32) << 8 | (packed[2] as i32) << 16 | (packed[3] as i32) << 24,
-        0,
-    )
-}
-
-/// Compresses 8 × 8-bit values (4-bit each) into 4 bytes using AVX2.
-/// Input:  [b0, b1, ..., b7] where each b_i is 0-15 (4-bit value)
-/// Output: [packed_0, packed_1, packed_2, packed_3]
-#[cfg(target_feature = "avx2")]
-#[inline]
-unsafe fn compress_4bit_lane_avx2(lane: __m128i) -> __m128i {
-    // Process 2 pixels per iteration (each pixel = 4 bits)
-    // 8 pixels × 4 bits = 32 bits = 4 bytes
-
-    let vals = [
-        _mm_extract_epi8(lane, 0) as u8,
-        _mm_extract_epi8(lane, 1) as u8,
-        _mm_extract_epi8(lane, 2) as u8,
-        _mm_extract_epi8(lane, 3) as u8,
-        _mm_extract_epi8(lane, 4) as u8,
-        _mm_extract_epi8(lane, 5) as u8,
-        _mm_extract_epi8(lane, 6) as u8,
-        _mm_extract_epi8(lane, 7) as u8,
-    ];
-
-    // Pack 2 pixels (4-bit each) → 1 byte
-    let mut packed = [0u8; 4];
-    for i in 0..4 {
-        let idx = i * 2;
-        packed[i] = ((vals[idx] & 15) << 4) | (vals[idx + 1] & 15);
-    }
-
-    _mm_insert_epi32(
-        _mm_insert_epi32(_mm_setzero_si128(), packed[0] as i32, 0),
-        (packed[1] as i32) << 8 | (packed[2] as i32) << 16 | (packed[3] as i32) << 24,
-        0,
-    )
 }
 
 // ============================================================================
 // Scalar Fallback Implementations
 // ============================================================================
 
-/// Scalar implementation of 1-bit packing.
-#[allow(dead_code)]
+/// Scalar implementation of 1-bit packing (full range).
 fn pack_1bit_samples_scalar(samples: &[u8], width: usize, packed: &mut [u8]) -> Result<()> {
-    for i in 0..width {
+    pack_1bit_samples_scalar_from(samples, width, packed, 0)
+}
+
+fn pack_1bit_samples_scalar_from(
+    samples: &[u8],
+    width: usize,
+    packed: &mut [u8],
+    start: usize,
+) -> Result<()> {
+    for i in start..width {
         if i >= samples.len() {
             return Err(CafeError::TruncatedFile(
                 "pack_1bit_samples_scalar: insufficient samples".into(),
             ));
         }
-
         let byte_idx = i / 8;
         let bit_idx = 7 - (i % 8);
         let value = if samples[i] != 0 { 1 } else { 0 };
-
         if byte_idx < packed.len() {
             packed[byte_idx] |= (value & 1) << bit_idx;
         }
@@ -522,110 +444,138 @@ fn pack_1bit_samples_scalar(samples: &[u8], width: usize, packed: &mut [u8]) -> 
     Ok(())
 }
 
-/// Scalar implementation of 2-bit packing.
-#[allow(dead_code)]
+/// Scalar implementation of 2-bit packing (full range).
 fn pack_2bit_samples_scalar(samples: &[u8], width: usize, packed: &mut [u8]) -> Result<()> {
-    for i in 0..width {
+    pack_2bit_samples_scalar_from(samples, width, packed, 0)
+}
+
+fn pack_2bit_samples_scalar_from(
+    samples: &[u8],
+    width: usize,
+    packed: &mut [u8],
+    start: usize,
+) -> Result<()> {
+    for i in start..width {
         if i >= samples.len() {
             return Err(CafeError::TruncatedFile(
                 "pack_2bit_samples_scalar: insufficient samples".into(),
             ));
         }
-
         if samples[i] > 3 {
             return Err(CafeError::UnsupportedFeature(
                 "2-bit sample value out of range (0-3)".into(),
             ));
         }
-
         let byte_idx = (i * 2) / 8;
         let bit_idx = 6 - ((i * 2) % 8);
         let value = samples[i] & 3;
-
         if byte_idx < packed.len() {
-            packed[byte_idx] |= (value << bit_idx) & 0xFF;
+            packed[byte_idx] |= value << bit_idx;
         }
     }
     Ok(())
 }
 
-/// Scalar implementation of 4-bit packing.
-#[allow(dead_code)]
+/// Scalar implementation of 4-bit packing (full range).
 fn pack_4bit_samples_scalar(samples: &[u8], width: usize, packed: &mut [u8]) -> Result<()> {
-    for i in 0..width {
+    pack_4bit_samples_scalar_from(samples, width, packed, 0)
+}
+
+fn pack_4bit_samples_scalar_from(
+    samples: &[u8],
+    width: usize,
+    packed: &mut [u8],
+    start: usize,
+) -> Result<()> {
+    for i in start..width {
         if i >= samples.len() {
             return Err(CafeError::TruncatedFile(
                 "pack_4bit_samples_scalar: insufficient samples".into(),
             ));
         }
-
         if samples[i] > 15 {
             return Err(CafeError::UnsupportedFeature(
                 "4-bit sample value out of range (0-15)".into(),
             ));
         }
-
         let byte_idx = (i * 4) / 8;
         let bit_idx = 4 - ((i * 4) % 8);
         let value = samples[i] & 15;
-
         if byte_idx < packed.len() {
-            packed[byte_idx] |= (value << bit_idx) & 0xFF;
+            packed[byte_idx] |= value << bit_idx;
         }
     }
     Ok(())
 }
 
-/// Scalar implementation of 1-bit unpacking.
-#[allow(dead_code)]
+/// Scalar implementation of 1-bit unpacking (full range).
 fn unpack_1bit_samples_scalar(packed: &[u8], width: usize, unpacked: &mut [u8]) -> Result<()> {
-    for i in 0..width {
+    unpack_1bit_samples_scalar_from(packed, width, unpacked, 0)
+}
+
+fn unpack_1bit_samples_scalar_from(
+    packed: &[u8],
+    width: usize,
+    unpacked: &mut [u8],
+    start: usize,
+) -> Result<()> {
+    for (i, out) in unpacked.iter_mut().enumerate().take(width).skip(start) {
         let byte_idx = i / 8;
         let bit_idx = 7 - (i % 8);
-
         if byte_idx >= packed.len() {
             return Err(CafeError::TruncatedFile(
                 "unpack_1bit_samples_scalar: insufficient packed data".into(),
             ));
         }
-
-        unpacked[i] = (packed[byte_idx] >> bit_idx) & 1;
+        *out = (packed[byte_idx] >> bit_idx) & 1;
     }
     Ok(())
 }
 
-/// Scalar implementation of 2-bit unpacking.
-#[allow(dead_code)]
+/// Scalar implementation of 2-bit unpacking (full range).
 fn unpack_2bit_samples_scalar(packed: &[u8], width: usize, unpacked: &mut [u8]) -> Result<()> {
-    for i in 0..width {
+    unpack_2bit_samples_scalar_from(packed, width, unpacked, 0)
+}
+
+fn unpack_2bit_samples_scalar_from(
+    packed: &[u8],
+    width: usize,
+    unpacked: &mut [u8],
+    start: usize,
+) -> Result<()> {
+    for (i, out) in unpacked.iter_mut().enumerate().take(width).skip(start) {
         let byte_idx = (i * 2) / 8;
         let bit_idx = 6 - ((i * 2) % 8);
-
         if byte_idx >= packed.len() {
             return Err(CafeError::TruncatedFile(
                 "unpack_2bit_samples_scalar: insufficient packed data".into(),
             ));
         }
-
-        unpacked[i] = (packed[byte_idx] >> bit_idx) & 3;
+        *out = (packed[byte_idx] >> bit_idx) & 3;
     }
     Ok(())
 }
 
-/// Scalar implementation of 4-bit unpacking.
-#[allow(dead_code)]
+/// Scalar implementation of 4-bit unpacking (full range).
 fn unpack_4bit_samples_scalar(packed: &[u8], width: usize, unpacked: &mut [u8]) -> Result<()> {
-    for i in 0..width {
+    unpack_4bit_samples_scalar_from(packed, width, unpacked, 0)
+}
+
+fn unpack_4bit_samples_scalar_from(
+    packed: &[u8],
+    width: usize,
+    unpacked: &mut [u8],
+    start: usize,
+) -> Result<()> {
+    for (i, out) in unpacked.iter_mut().enumerate().take(width).skip(start) {
         let byte_idx = (i * 4) / 8;
         let bit_idx = 4 - ((i * 4) % 8);
-
         if byte_idx >= packed.len() {
             return Err(CafeError::TruncatedFile(
                 "unpack_4bit_samples_scalar: insufficient packed data".into(),
             ));
         }
-
-        unpacked[i] = (packed[byte_idx] >> bit_idx) & 15;
+        *out = (packed[byte_idx] >> bit_idx) & 15;
     }
     Ok(())
 }
@@ -641,347 +591,100 @@ mod tests {
     #[test]
     fn test_pack_unpack_1bit_roundtrip() {
         let original = vec![0, 1, 1, 0, 1, 1, 1, 0, 0, 1, 0, 1];
-        let packed = pack_1bit_samples_scalar(&original, original.len(), &mut vec![0; 2])
-            .map(|_| {
-                let mut p = vec![0; (original.len() + 7) / 8];
-                pack_1bit_samples_scalar(&original, original.len(), &mut p).unwrap();
-                p
-            })
-            .unwrap();
-
-        let mut unpacked = vec![0; original.len()];
-        unpack_1bit_samples_scalar(&packed, original.len(), &mut unpacked).unwrap();
-
+        let packed = pack_1bit_samples(&original, original.len()).unwrap();
+        let unpacked = unpack_1bit_samples(&packed, original.len()).unwrap();
         assert_eq!(original, unpacked, "1-bit roundtrip failed");
     }
 
     #[test]
     fn test_pack_unpack_2bit_roundtrip() {
         let original = vec![0, 1, 2, 3, 2, 1, 0, 3];
-        let mut packed = vec![0; (original.len() * 2 + 7) / 8];
-        pack_2bit_samples_scalar(&original, original.len(), &mut packed).unwrap();
-
-        let mut unpacked = vec![0; original.len()];
-        unpack_2bit_samples_scalar(&packed, original.len(), &mut unpacked).unwrap();
-
+        let packed = pack_2bit_samples(&original, original.len()).unwrap();
+        let unpacked = unpack_2bit_samples(&packed, original.len()).unwrap();
         assert_eq!(original, unpacked, "2-bit roundtrip failed");
     }
 
     #[test]
     fn test_pack_unpack_4bit_roundtrip() {
         let original = vec![0, 1, 5, 15, 8, 3, 10, 7];
-        let mut packed = vec![0; (original.len() + 1) / 2];
-        pack_4bit_samples_scalar(&original, original.len(), &mut packed).unwrap();
-
-        let mut unpacked = vec![0; original.len()];
-        unpack_4bit_samples_scalar(&packed, original.len(), &mut unpacked).unwrap();
-
+        let packed = pack_4bit_samples(&original, original.len()).unwrap();
+        let unpacked = unpack_4bit_samples(&packed, original.len()).unwrap();
         assert_eq!(original, unpacked, "4-bit roundtrip failed");
     }
 
     #[test]
-    fn test_pack_unpack_1bit_avx2_large_roundtrip() {
-        // Test with large data to exercise SIMD path
+    fn test_pack_unpack_1bit_large_roundtrip() {
         let width = 512;
         let original: Vec<u8> = (0..width)
             .map(|i| if (i * 7) % 11 < 5 { 1 } else { 0 })
             .collect();
-
-        #[cfg(target_feature = "avx2")]
-        {
-            let packed = pack_1bit_samples_avx2(&original, width).unwrap();
-            let unpacked = unpack_1bit_samples_avx2(&packed, width).unwrap();
-            assert_eq!(original, unpacked, "1-bit AVX2 large roundtrip failed");
-        }
-
-        #[cfg(not(target_feature = "avx2"))]
-        {
-            // Fallback scalar test
-            let mut packed = vec![0; (width + 7) / 8];
-            pack_1bit_samples_scalar(&original, width, &mut packed).unwrap();
-            let mut unpacked = vec![0; width];
-            unpack_1bit_samples_scalar(&packed, width, &mut unpacked).unwrap();
-            assert_eq!(original, unpacked, "1-bit scalar large roundtrip failed");
-        }
+        let packed = pack_1bit_samples(&original, width).unwrap();
+        let unpacked = unpack_1bit_samples(&packed, width).unwrap();
+        assert_eq!(original, unpacked, "1-bit large roundtrip failed");
     }
 
     #[test]
-    fn test_pack_unpack_2bit_avx2_large_roundtrip() {
-        // Test with large data to exercise SIMD path
+    fn test_pack_unpack_2bit_large_roundtrip() {
         let width = 512;
         let original: Vec<u8> = (0..width).map(|i| ((i * 13) % 256) as u8 % 4).collect();
-
-        #[cfg(target_feature = "avx2")]
-        {
-            let packed = pack_2bit_samples_avx2(&original, width).unwrap();
-            let unpacked = unpack_2bit_samples_avx2(&packed, width).unwrap();
-            assert_eq!(original, unpacked, "2-bit AVX2 large roundtrip failed");
-        }
-
-        #[cfg(not(target_feature = "avx2"))]
-        {
-            let mut packed = vec![0; (width * 2 + 7) / 8];
-            pack_2bit_samples_scalar(&original, width, &mut packed).unwrap();
-            let mut unpacked = vec![0; width];
-            unpack_2bit_samples_scalar(&packed, width, &mut unpacked).unwrap();
-            assert_eq!(original, unpacked, "2-bit scalar large roundtrip failed");
-        }
+        let packed = pack_2bit_samples(&original, width).unwrap();
+        let unpacked = unpack_2bit_samples(&packed, width).unwrap();
+        assert_eq!(original, unpacked, "2-bit large roundtrip failed");
     }
 
     #[test]
-    fn test_pack_unpack_4bit_avx2_large_roundtrip() {
-        // Test with large data to exercise SIMD path
+    fn test_pack_unpack_4bit_large_roundtrip() {
         let width = 512;
         let original: Vec<u8> = (0..width).map(|i| ((i * 17) % 256) as u8 % 16).collect();
-
-        #[cfg(target_feature = "avx2")]
-        {
-            let packed = pack_4bit_samples_avx2(&original, width).unwrap();
-            let unpacked = unpack_4bit_samples_avx2(&packed, width).unwrap();
-            assert_eq!(original, unpacked, "4-bit AVX2 large roundtrip failed");
-        }
-
-        #[cfg(not(target_feature = "avx2"))]
-        {
-            let mut packed = vec![0; (width + 1) / 2];
-            pack_4bit_samples_scalar(&original, width, &mut packed).unwrap();
-            let mut unpacked = vec![0; width];
-            unpack_4bit_samples_scalar(&packed, width, &mut unpacked).unwrap();
-            assert_eq!(original, unpacked, "4-bit scalar large roundtrip failed");
-        }
+        let packed = pack_4bit_samples(&original, width).unwrap();
+        let unpacked = unpack_4bit_samples(&packed, width).unwrap();
+        assert_eq!(original, unpacked, "4-bit large roundtrip failed");
     }
 
     #[test]
-    fn test_pack_unpack_1bit_avx2_edge_cases() {
-        // Test edge cases: all zeros, all ones, small sizes
-        for width in &[1, 8, 16, 32, 256, 1024] {
-            // All zeros
+    fn test_pack_unpack_1bit_edge_cases() {
+        for width in &[1usize, 8, 16, 32, 33, 255, 256, 1024] {
             let zeros: Vec<u8> = vec![0; *width];
+            let packed = pack_1bit_samples(&zeros, *width).unwrap();
+            let unpacked = unpack_1bit_samples(&packed, *width).unwrap();
+            assert_eq!(zeros, unpacked, "1-bit all-zeros failed for width {width}");
 
-            #[cfg(target_feature = "avx2")]
-            {
-                let packed = pack_1bit_samples_avx2(&zeros, *width).unwrap();
-                let unpacked = unpack_1bit_samples_avx2(&packed, *width).unwrap();
-                assert_eq!(
-                    zeros, unpacked,
-                    "1-bit AVX2 all-zeros failed for width {}",
-                    width
-                );
-            }
-
-            #[cfg(not(target_feature = "avx2"))]
-            {
-                let mut packed = vec![0; (*width + 7) / 8];
-                pack_1bit_samples_scalar(&zeros, *width, &mut packed).unwrap();
-                let mut unpacked = vec![0; *width];
-                unpack_1bit_samples_scalar(&packed, *width, &mut unpacked).unwrap();
-                assert_eq!(
-                    zeros, unpacked,
-                    "1-bit scalar all-zeros failed for width {}",
-                    width
-                );
-            }
-
-            // All ones
             let ones: Vec<u8> = vec![1; *width];
-
-            #[cfg(target_feature = "avx2")]
-            {
-                let packed = pack_1bit_samples_avx2(&ones, *width).unwrap();
-                let unpacked = unpack_1bit_samples_avx2(&packed, *width).unwrap();
-                assert_eq!(
-                    ones, unpacked,
-                    "1-bit AVX2 all-ones failed for width {}",
-                    width
-                );
-            }
-
-            #[cfg(not(target_feature = "avx2"))]
-            {
-                let mut packed = vec![0; (*width + 7) / 8];
-                pack_1bit_samples_scalar(&ones, *width, &mut packed).unwrap();
-                let mut unpacked = vec![0; *width];
-                unpack_1bit_samples_scalar(&packed, *width, &mut unpacked).unwrap();
-                assert_eq!(
-                    ones, unpacked,
-                    "1-bit scalar all-ones failed for width {}",
-                    width
-                );
-            }
+            let packed = pack_1bit_samples(&ones, *width).unwrap();
+            let unpacked = unpack_1bit_samples(&packed, *width).unwrap();
+            assert_eq!(ones, unpacked, "1-bit all-ones failed for width {width}");
         }
     }
 
     #[test]
-    fn test_pack_unpack_2bit_avx2_edge_cases() {
-        // Test edge cases for 2-bit
-        for width in &[1, 4, 8, 16, 32, 256, 1024] {
+    fn test_pack_unpack_2bit_edge_cases() {
+        for width in &[1usize, 4, 8, 16, 17, 32, 255, 256, 1024] {
             let pattern: Vec<u8> = (0..*width).map(|i| ((i * 5) % 4) as u8).collect();
-
-            #[cfg(target_feature = "avx2")]
-            {
-                let packed = pack_2bit_samples_avx2(&pattern, *width).unwrap();
-                let unpacked = unpack_2bit_samples_avx2(&packed, *width).unwrap();
-                assert_eq!(
-                    pattern, unpacked,
-                    "2-bit AVX2 pattern failed for width {}",
-                    width
-                );
-            }
-
-            #[cfg(not(target_feature = "avx2"))]
-            {
-                let mut packed = vec![0; (*width * 2 + 7) / 8];
-                pack_2bit_samples_scalar(&pattern, *width, &mut packed).unwrap();
-                let mut unpacked = vec![0; *width];
-                unpack_2bit_samples_scalar(&packed, *width, &mut unpacked).unwrap();
-                assert_eq!(
-                    pattern, unpacked,
-                    "2-bit scalar pattern failed for width {}",
-                    width
-                );
-            }
+            let packed = pack_2bit_samples(&pattern, *width).unwrap();
+            let unpacked = unpack_2bit_samples(&packed, *width).unwrap();
+            assert_eq!(pattern, unpacked, "2-bit pattern failed for width {width}");
         }
     }
 
     #[test]
-    fn test_pack_unpack_4bit_avx2_edge_cases() {
-        // Test edge cases for 4-bit
-        for width in &[1, 2, 8, 16, 32, 256, 1024] {
+    fn test_pack_unpack_4bit_edge_cases() {
+        for width in &[1usize, 2, 8, 9, 16, 32, 255, 256, 1024] {
             let pattern: Vec<u8> = (0..*width).map(|i| ((i * 7) % 16) as u8).collect();
-
-            #[cfg(target_feature = "avx2")]
-            {
-                let packed = pack_4bit_samples_avx2(&pattern, *width).unwrap();
-                let unpacked = unpack_4bit_samples_avx2(&packed, *width).unwrap();
-                assert_eq!(
-                    pattern, unpacked,
-                    "4-bit AVX2 pattern failed for width {}",
-                    width
-                );
-            }
-
-            #[cfg(not(target_feature = "avx2"))]
-            {
-                let mut packed = vec![0; (*width + 1) / 2];
-                pack_4bit_samples_scalar(&pattern, *width, &mut packed).unwrap();
-                let mut unpacked = vec![0; *width];
-                unpack_4bit_samples_scalar(&packed, *width, &mut unpacked).unwrap();
-                assert_eq!(
-                    pattern, unpacked,
-                    "4-bit scalar pattern failed for width {}",
-                    width
-                );
-            }
+            let packed = pack_4bit_samples(&pattern, *width).unwrap();
+            let unpacked = unpack_4bit_samples(&packed, *width).unwrap();
+            assert_eq!(pattern, unpacked, "4-bit pattern failed for width {width}");
         }
     }
-}
 
-// ============================================================================
-// Public Runtime-Dispatched Wrappers (works on all CPU architectures)
-// ============================================================================
+    #[test]
+    fn test_pack_2bit_out_of_range_rejected() {
+        let bad = vec![0u8, 1, 4, 2]; // 4 is out of range for 2-bit
+        assert!(pack_2bit_samples(&bad, bad.len()).is_err());
+    }
 
-/// Pack 1-bit samples with runtime AVX2 detection.
-/// Uses SIMD on CPUs that support AVX2, falls back to scalar otherwise.
-pub fn pack_1bit_samples(samples: &[u8], width: usize) -> Result<Vec<u8>> {
-    #[cfg(target_feature = "avx2")]
-    {
-        pack_1bit_samples_avx2(samples, width)
-    }
-    #[cfg(not(target_feature = "avx2"))]
-    {
-        if width == 0 {
-            return Ok(Vec::new());
-        }
-        let expected_packed_len = width.div_ceil(8);
-        let mut packed = vec![0u8; expected_packed_len];
-        pack_1bit_samples_scalar(samples, width, &mut packed)?;
-        Ok(packed)
-    }
-}
-
-/// Pack 2-bit samples with runtime AVX2 detection.
-pub fn pack_2bit_samples(samples: &[u8], width: usize) -> Result<Vec<u8>> {
-    #[cfg(target_feature = "avx2")]
-    {
-        pack_2bit_samples_avx2(samples, width)
-    }
-    #[cfg(not(target_feature = "avx2"))]
-    {
-        if width == 0 {
-            return Ok(Vec::new());
-        }
-        let expected_packed_len = (width * 2).div_ceil(8);
-        let mut packed = vec![0u8; expected_packed_len];
-        pack_2bit_samples_scalar(samples, width, &mut packed)?;
-        Ok(packed)
-    }
-}
-
-/// Pack 4-bit samples with runtime AVX2 detection.
-pub fn pack_4bit_samples(samples: &[u8], width: usize) -> Result<Vec<u8>> {
-    #[cfg(target_feature = "avx2")]
-    {
-        pack_4bit_samples_avx2(samples, width)
-    }
-    #[cfg(not(target_feature = "avx2"))]
-    {
-        if width == 0 {
-            return Ok(Vec::new());
-        }
-        let expected_packed_len = (width * 4).div_ceil(8);
-        let mut packed = vec![0u8; expected_packed_len];
-        pack_4bit_samples_scalar(samples, width, &mut packed)?;
-        Ok(packed)
-    }
-}
-
-/// Unpack 1-bit samples with runtime AVX2 detection.
-pub fn unpack_1bit_samples(packed: &[u8], width: usize) -> Result<Vec<u8>> {
-    #[cfg(target_feature = "avx2")]
-    {
-        unpack_1bit_samples_avx2(packed, width)
-    }
-    #[cfg(not(target_feature = "avx2"))]
-    {
-        if width == 0 {
-            return Ok(Vec::new());
-        }
-        let mut unpacked = vec![0u8; width];
-        unpack_1bit_samples_scalar(packed, width, &mut unpacked)?;
-        Ok(unpacked)
-    }
-}
-
-/// Unpack 2-bit samples with runtime AVX2 detection.
-pub fn unpack_2bit_samples(packed: &[u8], width: usize) -> Result<Vec<u8>> {
-    #[cfg(target_feature = "avx2")]
-    {
-        unpack_2bit_samples_avx2(packed, width)
-    }
-    #[cfg(not(target_feature = "avx2"))]
-    {
-        if width == 0 {
-            return Ok(Vec::new());
-        }
-        let mut unpacked = vec![0u8; width];
-        unpack_2bit_samples_scalar(packed, width, &mut unpacked)?;
-        Ok(unpacked)
-    }
-}
-
-/// Unpack 4-bit samples with runtime AVX2 detection.
-pub fn unpack_4bit_samples(packed: &[u8], width: usize) -> Result<Vec<u8>> {
-    #[cfg(target_feature = "avx2")]
-    {
-        unpack_4bit_samples_avx2(packed, width)
-    }
-    #[cfg(not(target_feature = "avx2"))]
-    {
-        if width == 0 {
-            return Ok(Vec::new());
-        }
-        let mut unpacked = vec![0u8; width];
-        unpack_4bit_samples_scalar(packed, width, &mut unpacked)?;
-        Ok(unpacked)
+    #[test]
+    fn test_pack_4bit_out_of_range_rejected() {
+        let bad = vec![0u8, 1, 16, 2]; // 16 is out of range for 4-bit
+        assert!(pack_4bit_samples(&bad, bad.len()).is_err());
     }
 }

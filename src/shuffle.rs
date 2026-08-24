@@ -8,22 +8,22 @@
 //!       →  [b0_p0, b0_p1, b0_p2, ..., b1_p0, b1_p1, ...]
 //!
 //! # SIMD Optimization (v1.2.1+)
-//! On AVX2-capable x86_64 systems, byte-shuffle automatically dispatches to
-//! vectorized implementation in `simd_shuffle.rs` for 2-3x speedup.
-//! Falls back gracefully to scalar+blocking on non-AVX2 CPUs.
+//! On x86_64, byte-shuffle automatically dispatches to a vectorized
+//! implementation in `simd_shuffle.rs` at **runtime** when the running CPU
+//! supports AVX2 (`is_x86_feature_detected!("avx2")`), for 2-3x speedup.
+//! Falls back gracefully to scalar+blocking on CPUs without AVX2 and on
+//! non-x86_64 architectures. No special build flags are required.
 
 use crate::error::{CafeError, Result};
 
-#[cfg(target_feature = "avx2")]
-use std::arch::x86_64::*;
-
-#[cfg(all(feature = "simd", target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
 use crate::simd_shuffle;
 
 /// Applies byte-shuffle for better compression of multi-byte samples.
 ///
-/// Dispatches to SIMD implementation on AVX2-capable x86_64 CPUs for 2-3x speedup.
-/// Falls back to scalar+blocking on other architectures.
+/// Dispatches to the SIMD implementation on AVX2-capable x86_64 CPUs
+/// (detected at runtime) for 2-3x speedup. Falls back to scalar+blocking
+/// otherwise.
 ///
 /// # Parameters
 /// - `raw`: original pixel data in natural layout (R, G, B, A alternating bytes)
@@ -35,10 +35,6 @@ use crate::simd_shuffle;
 /// - Validates `bpp ∈ {2, 4, 8, 16}` (rejects 1, 3, 5, 6, 7, etc.)
 /// - Overflow-protected: `width × height × bpp`
 /// - Bounds-checked on copy
-///
-/// # SIMD Dispatch (v1.2.1+)
-/// - **AVX2 + feature="simd"**: Uses `simd_shuffle::apply_byte_shuffle_simd()` (2-3x faster)
-/// - **Other cases**: Falls back to scalar+blocking (10-20% cache benefit)
 pub(crate) fn apply_byte_shuffle(
     raw: &[u8],
     bpp: usize,
@@ -73,18 +69,14 @@ pub(crate) fn apply_byte_shuffle(
         )));
     }
 
-    // Dispatch to SIMD or scalar implementation
-    #[cfg(all(feature = "simd", target_arch = "x86_64", target_feature = "avx2"))]
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
-        // Try SIMD first (AVX2 x86_64)
-        return simd_shuffle::apply_byte_shuffle_simd(raw, bpp, width, height);
+        if is_x86_feature_detected!("avx2") {
+            return simd_shuffle::apply_byte_shuffle_simd(raw, bpp, width, height);
+        }
     }
 
-    #[cfg(not(all(feature = "simd", target_arch = "x86_64", target_feature = "avx2")))]
-    {
-        // Fall back to scalar implementation
-        apply_byte_shuffle_scalar(raw, bpp, pixels)
-    }
+    apply_byte_shuffle_scalar(raw, bpp, pixels)
 }
 
 /// Scalar byte-shuffle implementation (fallback or when SIMD not available).
@@ -107,8 +99,8 @@ fn apply_byte_shuffle_scalar(raw: &[u8], bpp: usize, pixels: usize) -> Result<Ve
 
 /// Undoes byte-shuffle: converts the reordered layout back to the original.
 ///
-/// Dispatches to SIMD implementation on AVX2-capable x86_64 CPUs for 2-3x speedup.
-/// Falls back to scalar on other architectures.
+/// Dispatches to the SIMD implementation on AVX2-capable x86_64 CPUs
+/// (detected at runtime) for 2-3x speedup. Falls back to scalar otherwise.
 ///
 /// # Parameters
 /// - `shuffled`: reordered data (output of `apply_byte_shuffle`)
@@ -118,10 +110,6 @@ fn apply_byte_shuffle_scalar(raw: &[u8], bpp: usize, pixels: usize) -> Result<Ve
 /// # Safety
 /// - Validations identical to `apply_byte_shuffle`
 /// - Returns an error if the buffer is truncated or bpp is invalid
-///
-/// # SIMD Dispatch (v1.2.1+)
-/// - **AVX2 + feature="simd"**: Uses `simd_shuffle::undo_byte_shuffle_simd()` (2-3x faster)
-/// - **Other cases**: Falls back to scalar
 pub(crate) fn undo_byte_shuffle(
     shuffled: &[u8],
     bpp: usize,
@@ -153,18 +141,14 @@ pub(crate) fn undo_byte_shuffle(
         )));
     }
 
-    // Dispatch to SIMD or scalar implementation
-    #[cfg(all(feature = "simd", target_arch = "x86_64", target_feature = "avx2"))]
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
-        // Try SIMD first (AVX2 x86_64)
-        return simd_shuffle::undo_byte_shuffle_simd(shuffled, bpp, width, height);
+        if is_x86_feature_detected!("avx2") {
+            return simd_shuffle::undo_byte_shuffle_simd(shuffled, bpp, width, height);
+        }
     }
 
-    #[cfg(not(all(feature = "simd", target_arch = "x86_64", target_feature = "avx2")))]
-    {
-        // Fall back to scalar implementation
-        undo_byte_shuffle_scalar(shuffled, bpp, pixels)
-    }
+    undo_byte_shuffle_scalar(shuffled, bpp, pixels)
 }
 
 /// Scalar byte-unshuffle implementation (fallback or when SIMD not available).
@@ -183,18 +167,6 @@ fn undo_byte_shuffle_scalar(shuffled: &[u8], bpp: usize, pixels: usize) -> Resul
     }
     Ok(unshuffled)
 }
-
-// ============================================================================
-// SIMD Dispatch (v1.2.1+)
-// ============================================================================
-//
-// The dispatcher in apply_byte_shuffle() and undo_byte_shuffle() above
-// routes to simd_shuffle.rs on AVX2-capable CPUs for 2-3x speedup.
-//
-// Fallback to scalar if:
-// - SIMD feature not enabled (`--no-default-features`)
-// - Running on non-AVX2 CPU (detected at compile-time via target-feature)
-// - Running on non-x86_64 architecture
 
 #[cfg(test)]
 mod tests {
@@ -282,46 +254,34 @@ mod tests {
 
         let shuffled = apply_byte_shuffle(&original, 4, width, height).unwrap();
         let unshuffled = undo_byte_shuffle(&shuffled, 4, width, height).unwrap();
-        assert_eq!(original, unshuffled, "Large 4-byte dispatcher roundtrip failed");
+        assert_eq!(
+            original, unshuffled,
+            "Large 4-byte dispatcher roundtrip failed"
+        );
     }
 
     #[test]
-    fn test_shuffle_avx2_consistency() {
-        // Test that AVX2 produces identical output to scalar
-        #[cfg(target_feature = "avx2")]
-        {
-            let width = 128u32;
-            let height = 64u32;
-            let total_pixels = (width as usize) * (height as usize);
-            let original: Vec<u8> = (0..(total_pixels * 4))
+    fn test_shuffle_scalar_matches_dispatcher() {
+        // Verify the scalar path always agrees with whatever the dispatcher
+        // picks (SIMD or scalar), for every supported bpp.
+        let width = 128u32;
+        let height = 64u32;
+        let total_pixels = (width as usize) * (height as usize);
+
+        for bpp in [2usize, 4, 8, 16] {
+            let original: Vec<u8> = (0..(total_pixels * bpp))
                 .map(|i| ((i as u64 * 17) % 256) as u8)
                 .collect();
 
-            // Scalar
-            let shuffled_scalar = apply_byte_shuffle(&original, 4, width, height).unwrap();
-
-            // AVX2
-            let shuffled_avx2 = apply_byte_shuffle_avx2(&original, 4, width, height).unwrap();
-
+            let dispatched = apply_byte_shuffle(&original, bpp, width, height).unwrap();
+            let scalar = apply_byte_shuffle_scalar(&original, bpp, total_pixels).unwrap();
             assert_eq!(
-                shuffled_scalar, shuffled_avx2,
-                "Scalar and AVX2 shuffle produce different results"
+                dispatched, scalar,
+                "SIMD and scalar byte-shuffle diverge for bpp={bpp}"
             );
-        }
 
-        #[cfg(not(target_feature = "avx2"))]
-        {
-            // Just test scalar roundtrip on non-AVX2
-            let width = 128u32;
-            let height = 64u32;
-            let total_pixels = (width as usize) * (height as usize);
-            let original: Vec<u8> = (0..(total_pixels * 4))
-                .map(|i| ((i as u64 * 17) % 256) as u8)
-                .collect();
-
-            let shuffled = apply_byte_shuffle(&original, 4, width, height).unwrap();
-            let unshuffled = undo_byte_shuffle(&shuffled, 4, width, height).unwrap();
-            assert_eq!(original, unshuffled, "Scalar shuffle roundtrip failed");
+            let unshuffled = undo_byte_shuffle(&dispatched, bpp, width, height).unwrap();
+            assert_eq!(original, unshuffled, "roundtrip failed for bpp={bpp}");
         }
     }
 }

@@ -1,4 +1,4 @@
-//! SIMD (AVX2/AVX-512/NEON) optimizations for predictive filters (v1.1+).
+//! SIMD (AVX2) optimizations for predictive filters (v1.1+).
 //!
 //! Vectorized implementations of the most common and compute-intensive filters:
 //! - Filter 0 (None): Direct copy
@@ -12,8 +12,28 @@
 //! # Architecture
 //!
 //! - **x86_64 with AVX2 (256-bit)**: Process 32 bytes per iteration
-//! - **Other architectures**: Scalar fallback (automatic, no feature required)
-//! - **Target feature**: `#[cfg(target_feature = "avx2")]` — activates SIMD code
+//! - **Other architectures / CPUs without AVX2**: Scalar fallback (automatic)
+//! - **Dispatch**: Runtime, via `is_x86_feature_detected!("avx2")`. The AVX2
+//!   code is always compiled into the binary on `target_arch = "x86_64"` (no
+//!   special `RUSTFLAGS` or `-C target-feature` needed at build time) and is
+//!   only executed if the running CPU actually supports AVX2; otherwise the
+//!   scalar fallback runs. This makes a single binary portable across CPUs.
+//!
+//! # Encode vs. Decode Vectorization
+//!
+//! Applying a filter (encode) only reads from the original, already-known
+//! pixel data (`row`, `prev_row`), so it has no dependency on other output
+//! bytes and can always be safely vectorized.
+//!
+//! Reversing a filter (decode) reconstructs `out[x]` from `out[x - bpp]`
+//! (the *already reconstructed* left neighbor). When `bpp` is smaller than
+//! the SIMD width (32 bytes) — which is the common case (bpp is usually
+//! 1-16) — a naive vectorized reconstruction would read `out[x - bpp]`
+//! values that have not been written yet within the same SIMD chunk,
+//! silently corrupting the image. For that reason, `unfilter_sub` and
+//! `unfilter_average` (which both depend on the left neighbor) are
+//! intentionally scalar-only. `unfilter_up` has no such dependency (it only
+//! reads the *previous row*, which is fully known) and is safely vectorized.
 //!
 //! # Bytes Per Pixel (bpp) Coverage
 //!
@@ -24,344 +44,27 @@
 //! - **bpp = 3**: Scalar fallback (RGB, non-aligned)
 //! - **bpp > 8**: Scalar fallback
 
-#[cfg(target_feature = "avx2")]
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-/// Applies Filter 1 (Sub) using AVX2 if available, otherwise scalar.
-/// Filter 1: residual[x] = pixel[x] - pixel[x - bpp]
-///
-/// # Arguments
-/// - `row`: The pixel row to filter
-/// - `bpp`: Bytes per pixel (predictor depends on this for left neighbor)
-///
-/// # Returns
-/// Vector of residuals (filtered data)
-#[cfg(target_feature = "avx2")]
-pub(crate) fn filter_sub_avx2(row: &[u8], bpp: usize) -> Vec<u8> {
-    let len = row.len();
-    let mut filtered = vec![0u8; len];
-
-    // First `bpp` bytes have no left neighbor
-    filtered[0..bpp].copy_from_slice(&row[0..bpp]);
-
-    if len <= bpp + 32 {
-        // Remaining bytes are too few for AVX2, use scalar
-        for i in bpp..len {
-            filtered[i] = row[i].wrapping_sub(row[i - bpp]);
-        }
-        return filtered;
-    }
-
-    unsafe {
-        // SIMD loop: process 32 bytes at a time
-        let mut i = bpp;
-        let simd_end = len - (len - bpp) % 32;
-
-        while i < simd_end {
-            let pixels = _mm256_loadu_si256(row.as_ptr().add(i) as *const __m256i);
-            let left = _mm256_loadu_si256(row.as_ptr().add(i - bpp) as *const __m256i);
-            let residual = _mm256_sub_epi8(pixels, left);
-            _mm256_storeu_si256(filtered.as_mut_ptr().add(i) as *mut __m256i, residual);
-            i += 32;
-        }
-    }
-
-    // Tail: remaining bytes (< 32)
-    for i in ((len / 32) * 32).max(bpp)..len {
-        filtered[i] = row[i].wrapping_sub(row[i - bpp]);
-    }
-
-    filtered
-}
-
-/// Reverses Filter 1 (Sub) using AVX2 if available, otherwise scalar.
-/// reconstruction[x] = residual[x] + reconstruction[x - bpp]
-///
-/// # Arguments
-/// - `filtered`: The residual data
-/// - `bpp`: Bytes per pixel
-///
-/// # Returns
-/// Vector of reconstructed original data
-#[cfg(target_feature = "avx2")]
-pub(crate) fn unfilter_sub_avx2(filtered: &[u8], bpp: usize) -> Vec<u8> {
-    let len = filtered.len();
-    let mut out = vec![0u8; len];
-
-    // First `bpp` bytes are copied as-is
-    out[0..bpp].copy_from_slice(&filtered[0..bpp]);
-
-    if len <= bpp + 32 {
-        // Remaining bytes too few, use scalar
-        for i in bpp..len {
-            out[i] = filtered[i].wrapping_add(out[i - bpp]);
-        }
-        return out;
-    }
-
-    // For Filter 1, we can't fully vectorize because each output depends on the previous output.
-    // Use scalar to maintain causality and ensure correctness.
-    for i in bpp..len {
-        out[i] = filtered[i].wrapping_add(out[i - bpp]);
-    }
-
-    out
-}
-
-/// Applies Filter 2 (Up) using AVX2 if available, otherwise scalar.
-/// Filter 2: residual[x] = pixel[x] - pixel_above[x]
-///
-/// # Arguments
-/// - `row`: The current pixel row
-/// - `prev_row`: The previous row (can be None if this is the first row)
-///
-/// # Returns
-/// Vector of residuals
-#[cfg(target_feature = "avx2")]
-pub(crate) fn filter_up_avx2(row: &[u8], prev_row: Option<&[u8]>) -> Vec<u8> {
-    let len = row.len();
-    let mut filtered = vec![0u8; len];
-
-    if let Some(prev) = prev_row {
-        if len <= 32 {
-            // Small row, use scalar
-            for i in 0..len {
-                filtered[i] = row[i].wrapping_sub(prev[i]);
-            }
-            return filtered;
-        }
-
-        unsafe {
-            let mut i = 0;
-            let simd_end = len - len % 32;
-
-            while i < simd_end {
-                let pixels = _mm256_loadu_si256(row.as_ptr().add(i) as *const __m256i);
-                let above = _mm256_loadu_si256(prev.as_ptr().add(i) as *const __m256i);
-                let residual = _mm256_sub_epi8(pixels, above);
-                _mm256_storeu_si256(filtered.as_mut_ptr().add(i) as *mut __m256i, residual);
-                i += 32;
-            }
-        }
-
-        // Tail
-        for i in (len / 32) * 32..len {
-            filtered[i] = row[i].wrapping_sub(prev[i]);
-        }
-    } else {
-        // No previous row, residual = original
-        filtered.copy_from_slice(row);
-    }
-
-    filtered
-}
-
-/// Reverses Filter 2 (Up) using AVX2 if available, otherwise scalar.
-/// reconstruction[x] = residual[x] + reconstruction_above[x]
-///
-/// # Arguments
-/// - `filtered`: The residual data
-/// - `prev_row`: The previous reconstructed row
-///
-/// # Returns
-/// Vector of reconstructed data
-#[cfg(target_feature = "avx2")]
-pub(crate) fn unfilter_up_avx2(filtered: &[u8], prev_row: Option<&[u8]>) -> Vec<u8> {
-    let len = filtered.len();
-    let mut out = vec![0u8; len];
-
-    if let Some(prev) = prev_row {
-        if len <= 32 {
-            for i in 0..len {
-                out[i] = filtered[i].wrapping_add(prev[i]);
-            }
-            return out;
-        }
-
-        unsafe {
-            let mut i = 0;
-            let simd_end = len - len % 32;
-
-            while i < simd_end {
-                let residuals = _mm256_loadu_si256(filtered.as_ptr().add(i) as *const __m256i);
-                let above = _mm256_loadu_si256(prev.as_ptr().add(i) as *const __m256i);
-                let reconstructed = _mm256_add_epi8(residuals, above);
-                _mm256_storeu_si256(out.as_mut_ptr().add(i) as *mut __m256i, reconstructed);
-                i += 32;
-            }
-        }
-
-        // Tail
-        for i in (len / 32) * 32..len {
-            out[i] = filtered[i].wrapping_add(prev[i]);
-        }
-    } else {
-        // No previous row
-        out.copy_from_slice(filtered);
-    }
-
-    out
-}
-
-/// Applies Filter 3 (Average) using AVX2 if available, otherwise scalar.
-/// Filter 3: residual[x] = pixel[x] - (left + above) / 2
-///
-/// # Arguments
-/// - `row`: Current pixel row
-/// - `prev_row`: Previous row (optional)
-/// - `bpp`: Bytes per pixel
-///
-/// # Returns
-/// Vector of residuals
-#[cfg(target_feature = "avx2")]
-pub(crate) fn filter_average_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
-    let len = row.len();
-    let mut filtered = vec![0u8; len];
-
-    // First `bpp` bytes have no left neighbor
-    if let Some(prev) = prev_row {
-        for i in 0..bpp {
-            let pred = (prev[i] as u16) >> 1;
-            filtered[i] = row[i].wrapping_sub(pred as u8);
-        }
-    } else {
-        filtered[0..bpp].copy_from_slice(&row[0..bpp]);
-    }
-
-    if len <= bpp + 32 || prev_row.is_none() {
-        // Tail or no prev_row, use scalar
-        for i in bpp..len {
-            let a = row[i - bpp];
-            let b = prev_row.map(|p| p[i]).unwrap_or(0);
-            let pred = ((a as u16 + b as u16) >> 1) as u8;
-            filtered[i] = row[i].wrapping_sub(pred);
-        }
-        return filtered;
-    }
-
-    let prev = prev_row.unwrap();
-
-    // Vectorized average using bit manipulation:
-    // (a + b) >> 1 = ((a >> 1) + (b >> 1) + ((a & b) & 1))
-    // This avoids u16 overflow and works well with SIMD.
-    //
-    // AVX2 strategy:
-    // 1. Load 32 left bytes and 32 above bytes
-    // 2. Shift each right by 1: left_shr = left >> 1, above_shr = above >> 1
-    // 3. Extract low bits: left_low = left & 1, above_low = above & 1
-    // 4. AND to get carry: carry = left_low & above_low
-    // 5. Add: pred = left_shr + above_shr + carry
-    // 6. Subtract from pixel: residual = pixel - pred
-
-    if len > bpp + 32 {
-        unsafe {
-            let mut i = bpp;
-            while i + 32 <= len {
-                // Load 32 bytes from left and above
-                let left = _mm256_loadu_si256(row.as_ptr().add(i - bpp) as *const __m256i);
-                let above = _mm256_loadu_si256(prev.as_ptr().add(i) as *const __m256i);
-                let pixels = _mm256_loadu_si256(row.as_ptr().add(i) as *const __m256i);
-
-                // Compute (left >> 1) + (above >> 1) + ((left & above) & 1)
-                let left_shr = _mm256_srli_epi16(_mm256_cvtepu8_epi16(left), 1);
-                let above_shr = _mm256_srli_epi16(_mm256_cvtepu8_epi16(above), 1);
-                let left_and = _mm256_and_si256(left, _mm256_set1_epi8(1));
-                let above_and = _mm256_and_si256(above, _mm256_set1_epi8(1));
-                let carry = _mm256_and_si256(left_and, above_and);
-
-                // Actually, for simplicity, use the standard approach:
-                // (a + b) >> 1 via add + shift (AVX2 can handle u8 add with saturation)
-                let sum = _mm256_add_epi8(left, above); // sum = left + above (mod 256)
-                let pred = _mm256_srli_epi16(sum, 1); // logical shift right by 1
-
-                let residuals = _mm256_sub_epi8(pixels, pred);
-                _mm256_storeu_si256(filtered.as_mut_ptr().add(i) as *mut __m256i, residuals);
-                i += 32;
-            }
-        }
-    }
-
-    // Tail: remaining bytes
-    for i in ((len / 32) * 32).max(bpp)..len {
-        let a = row[i - bpp];
-        let b = prev[i];
-        let pred = ((a as u16 + b as u16) >> 1) as u8;
-        filtered[i] = row[i].wrapping_sub(pred);
-    }
-
-    filtered
-}
-
-/// Reverses Filter 3 (Average) using AVX2 if available, otherwise scalar.
-///
-/// # Arguments
-/// - `filtered`: Residual data
-/// - `prev_row`: Previous reconstructed row (optional)
-/// - `bpp`: Bytes per pixel
-///
-/// # Returns
-/// Vector of reconstructed data
-#[cfg(target_feature = "avx2")]
-pub(crate) fn unfilter_average_avx2(
-    filtered: &[u8],
-    prev_row: Option<&[u8]>,
-    bpp: usize,
-) -> Vec<u8> {
-    let len = filtered.len();
-    let mut out = vec![0u8; len];
-
-    // First `bpp` bytes have no left neighbor
-    if let Some(prev) = prev_row {
-        for i in 0..bpp {
-            let pred = (prev[i] as u16) >> 1;
-            out[i] = filtered[i].wrapping_add(pred as u8);
-        }
-    } else {
-        out[0..bpp].copy_from_slice(&filtered[0..bpp]);
-    }
-
-    // Vectorized reconstruction using AVX2 (similar to encode)
-    if let Some(prev) = prev_row {
-        if len > bpp + 32 {
-            unsafe {
-                let mut i = bpp;
-                while i + 32 <= len {
-                    // Load residuals, reconstructed left, and prev
-                    let residuals = _mm256_loadu_si256(filtered.as_ptr().add(i) as *const __m256i);
-                    let left = _mm256_loadu_si256(out.as_ptr().add(i - bpp) as *const __m256i);
-                    let above = _mm256_loadu_si256(prev.as_ptr().add(i) as *const __m256i);
-
-                    // Compute pred = (left + above) >> 1
-                    let sum = _mm256_add_epi8(left, above);
-                    let pred = _mm256_srli_epi16(sum, 1);
-
-                    // Reconstruct: out[i] = residual + pred
-                    let reconstructed = _mm256_add_epi8(residuals, pred);
-                    _mm256_storeu_si256(out.as_mut_ptr().add(i) as *mut __m256i, reconstructed);
-                    i += 32;
-                }
-            }
-        }
-
-        // Tail: remaining bytes
-        for i in ((len / 32) * 32).max(bpp)..len {
-            let a = out[i - bpp];
-            let b = prev[i];
-            let pred = ((a as u16 + b as u16) >> 1) as u8;
-            out[i] = filtered[i].wrapping_add(pred);
-        }
-    }
-
-    out
-}
+const SIMD_WIDTH: usize = 32;
 
 // ============================================================================
-// Scalar Fallback (for non-AVX2, or for functions not yet SIMD-optimized)
+// Filter 1 (Sub): residual[x] = pixel[x] - pixel[x - bpp]
 // ============================================================================
 
-/// Scalar-only version of Filter 1 (Sub).
-#[cfg(not(target_feature = "avx2"))]
+/// Applies Filter 1 (Sub) using AVX2 if the running CPU supports it, otherwise scalar.
 pub(crate) fn filter_sub_avx2(row: &[u8], bpp: usize) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { filter_sub_avx2_impl(row, bpp) };
+        }
+    }
+    filter_sub_scalar(row, bpp)
+}
+
+fn filter_sub_scalar(row: &[u8], bpp: usize) -> Vec<u8> {
     let mut filtered = vec![0u8; row.len()];
     filtered[0..bpp].copy_from_slice(&row[0..bpp]);
     for i in bpp..row.len() {
@@ -370,8 +73,32 @@ pub(crate) fn filter_sub_avx2(row: &[u8], bpp: usize) -> Vec<u8> {
     filtered
 }
 
-/// Scalar-only version of unfilter Sub.
-#[cfg(not(target_feature = "avx2"))]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_sub_avx2_impl(row: &[u8], bpp: usize) -> Vec<u8> {
+    let len = row.len();
+    let mut filtered = vec![0u8; len];
+    filtered[0..bpp].copy_from_slice(&row[0..bpp]);
+
+    let mut i = bpp;
+    while i + SIMD_WIDTH <= len {
+        let pixels = _mm256_loadu_si256(row.as_ptr().add(i) as *const __m256i);
+        let left = _mm256_loadu_si256(row.as_ptr().add(i - bpp) as *const __m256i);
+        let residual = _mm256_sub_epi8(pixels, left);
+        _mm256_storeu_si256(filtered.as_mut_ptr().add(i) as *mut __m256i, residual);
+        i += SIMD_WIDTH;
+    }
+
+    for j in i..len {
+        filtered[j] = row[j].wrapping_sub(row[j - bpp]);
+    }
+
+    filtered
+}
+
+/// Reverses Filter 1 (Sub). Always scalar: `out[x]` depends on the
+/// just-reconstructed `out[x - bpp]`, which prevents safe vectorization
+/// when `bpp` is smaller than the SIMD width (see module docs).
 pub(crate) fn unfilter_sub_avx2(filtered: &[u8], bpp: usize) -> Vec<u8> {
     let mut out = vec![0u8; filtered.len()];
     out[0..bpp].copy_from_slice(&filtered[0..bpp]);
@@ -381,9 +108,22 @@ pub(crate) fn unfilter_sub_avx2(filtered: &[u8], bpp: usize) -> Vec<u8> {
     out
 }
 
-/// Scalar-only version of Filter 2 (Up).
-#[cfg(not(target_feature = "avx2"))]
+// ============================================================================
+// Filter 2 (Up): residual[x] = pixel[x] - pixel_above[x]
+// ============================================================================
+
+/// Applies Filter 2 (Up) using AVX2 if the running CPU supports it, otherwise scalar.
 pub(crate) fn filter_up_avx2(row: &[u8], prev_row: Option<&[u8]>) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { filter_up_avx2_impl(row, prev_row) };
+        }
+    }
+    filter_up_scalar(row, prev_row)
+}
+
+fn filter_up_scalar(row: &[u8], prev_row: Option<&[u8]>) -> Vec<u8> {
     let mut filtered = vec![0u8; row.len()];
     if let Some(prev) = prev_row {
         for i in 0..row.len() {
@@ -395,9 +135,47 @@ pub(crate) fn filter_up_avx2(row: &[u8], prev_row: Option<&[u8]>) -> Vec<u8> {
     filtered
 }
 
-/// Scalar-only version of unfilter Up.
-#[cfg(not(target_feature = "avx2"))]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_up_avx2_impl(row: &[u8], prev_row: Option<&[u8]>) -> Vec<u8> {
+    let len = row.len();
+    let mut filtered = vec![0u8; len];
+
+    let Some(prev) = prev_row else {
+        filtered.copy_from_slice(row);
+        return filtered;
+    };
+
+    let mut i = 0;
+    while i + SIMD_WIDTH <= len {
+        let pixels = _mm256_loadu_si256(row.as_ptr().add(i) as *const __m256i);
+        let above = _mm256_loadu_si256(prev.as_ptr().add(i) as *const __m256i);
+        let residual = _mm256_sub_epi8(pixels, above);
+        _mm256_storeu_si256(filtered.as_mut_ptr().add(i) as *mut __m256i, residual);
+        i += SIMD_WIDTH;
+    }
+
+    for j in i..len {
+        filtered[j] = row[j].wrapping_sub(prev[j]);
+    }
+
+    filtered
+}
+
+/// Reverses Filter 2 (Up) using AVX2 if the running CPU supports it, otherwise
+/// scalar. Safe to vectorize: `out[x]` only depends on `prev_row[x]`, which is
+/// fully known ahead of time (not on other bytes of `out`).
 pub(crate) fn unfilter_up_avx2(filtered: &[u8], prev_row: Option<&[u8]>) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { unfilter_up_avx2_impl(filtered, prev_row) };
+        }
+    }
+    unfilter_up_scalar(filtered, prev_row)
+}
+
+fn unfilter_up_scalar(filtered: &[u8], prev_row: Option<&[u8]>) -> Vec<u8> {
     let mut out = vec![0u8; filtered.len()];
     if let Some(prev) = prev_row {
         for i in 0..filtered.len() {
@@ -409,9 +187,51 @@ pub(crate) fn unfilter_up_avx2(filtered: &[u8], prev_row: Option<&[u8]>) -> Vec<
     out
 }
 
-/// Scalar-only version of Filter 3 (Average).
-#[cfg(not(target_feature = "avx2"))]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn unfilter_up_avx2_impl(filtered: &[u8], prev_row: Option<&[u8]>) -> Vec<u8> {
+    let len = filtered.len();
+    let mut out = vec![0u8; len];
+
+    let Some(prev) = prev_row else {
+        out.copy_from_slice(filtered);
+        return out;
+    };
+
+    let mut i = 0;
+    while i + SIMD_WIDTH <= len {
+        let residuals = _mm256_loadu_si256(filtered.as_ptr().add(i) as *const __m256i);
+        let above = _mm256_loadu_si256(prev.as_ptr().add(i) as *const __m256i);
+        let reconstructed = _mm256_add_epi8(residuals, above);
+        _mm256_storeu_si256(out.as_mut_ptr().add(i) as *mut __m256i, reconstructed);
+        i += SIMD_WIDTH;
+    }
+
+    for j in i..len {
+        out[j] = filtered[j].wrapping_add(prev[j]);
+    }
+
+    out
+}
+
+// ============================================================================
+// Filter 3 (Average): residual[x] = pixel[x] - (left + above) / 2
+// ============================================================================
+
+/// Applies Filter 3 (Average) using AVX2 if the running CPU supports it,
+/// otherwise scalar. Safe to vectorize: both operands (`row`, `prev_row`) are
+/// the original, already-known pixel data.
 pub(crate) fn filter_average_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { filter_average_avx2_impl(row, prev_row, bpp) };
+        }
+    }
+    filter_average_scalar(row, prev_row, bpp)
+}
+
+fn filter_average_scalar(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
     let mut filtered = vec![0u8; row.len()];
     for i in 0..row.len() {
         let a = if i >= bpp { row[i - bpp] } else { 0 };
@@ -422,8 +242,91 @@ pub(crate) fn filter_average_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usiz
     filtered
 }
 
-/// Scalar-only version of unfilter Average.
-#[cfg(not(target_feature = "avx2"))]
+/// AVX2 implementation. Uses 16-bit widening (`_mm256_cvtepu8_epi16` on each
+/// 128-bit half) so the `left + above` sum keeps the 9th (carry) bit before
+/// shifting right — computing `(left + above) >> 1` directly in 8-bit lanes
+/// would silently drop that bit and produce a wrong result whenever
+/// `left + above >= 256`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_average_avx2_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    let len = row.len();
+    let mut filtered = vec![0u8; len];
+
+    let Some(prev) = prev_row else {
+        // No previous row: pred = left >> 1 (b = 0), first `bpp` bytes pred = 0.
+        filtered[0..bpp.min(len)].copy_from_slice(&row[0..bpp.min(len)]);
+        for i in bpp..len {
+            let pred = (row[i - bpp] as u16) >> 1;
+            filtered[i] = row[i].wrapping_sub(pred as u8);
+        }
+        return filtered;
+    };
+
+    // First `bpp` bytes have no left neighbor: pred = above >> 1 (a = 0).
+    for i in 0..bpp.min(len) {
+        let pred = (prev[i] as u16) >> 1;
+        filtered[i] = row[i].wrapping_sub(pred as u8);
+    }
+
+    let mut i = bpp;
+    while i + SIMD_WIDTH <= len {
+        let pixels = _mm256_loadu_si256(row.as_ptr().add(i) as *const __m256i);
+        let left = _mm256_loadu_si256(row.as_ptr().add(i - bpp) as *const __m256i);
+        let above = _mm256_loadu_si256(prev.as_ptr().add(i) as *const __m256i);
+
+        let pred = average_epu8_32(left, above);
+        let residuals = _mm256_sub_epi8(pixels, pred);
+        _mm256_storeu_si256(filtered.as_mut_ptr().add(i) as *mut __m256i, residuals);
+
+        i += SIMD_WIDTH;
+    }
+
+    for j in i..len {
+        let a = row[j - bpp];
+        let b = prev[j];
+        let pred = ((a as u16 + b as u16) >> 1) as u8;
+        filtered[j] = row[j].wrapping_sub(pred);
+    }
+
+    filtered
+}
+
+/// Computes `(a[i] + b[i]) >> 1` for 32 packed `u8` lanes without losing the
+/// carry bit, by widening each 128-bit half to 16-bit lanes, adding, shifting,
+/// and narrowing back down with `_mm_packus_epi16` (safe because all
+/// intermediate values fit in `[0, 255]`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn average_epu8_32(a: __m256i, b: __m256i) -> __m256i {
+    let a_lo = _mm256_castsi256_si128(a);
+    let a_hi = _mm256_extracti128_si256(a, 1);
+    let b_lo = _mm256_castsi256_si128(b);
+    let b_hi = _mm256_extracti128_si256(b, 1);
+
+    let sum_lo16 = _mm256_add_epi16(_mm256_cvtepu8_epi16(a_lo), _mm256_cvtepu8_epi16(b_lo));
+    let sum_hi16 = _mm256_add_epi16(_mm256_cvtepu8_epi16(a_hi), _mm256_cvtepu8_epi16(b_hi));
+
+    let pred_lo16 = _mm256_srli_epi16(sum_lo16, 1);
+    let pred_hi16 = _mm256_srli_epi16(sum_hi16, 1);
+
+    // Each pred_*16 spans 16 x u16 across a 256-bit register; split back into
+    // its two 128-bit halves (8 x u16 each) and pack down to u8 in order.
+    let pred_lo_bytes = _mm_packus_epi16(
+        _mm256_castsi256_si128(pred_lo16),
+        _mm256_extracti128_si256(pred_lo16, 1),
+    );
+    let pred_hi_bytes = _mm_packus_epi16(
+        _mm256_castsi256_si128(pred_hi16),
+        _mm256_extracti128_si256(pred_hi16, 1),
+    );
+
+    _mm256_set_m128i(pred_hi_bytes, pred_lo_bytes)
+}
+
+/// Reverses Filter 3 (Average). Always scalar: `out[x]` depends on the
+/// just-reconstructed `out[x - bpp]`, which prevents safe vectorization
+/// when `bpp` is smaller than the SIMD width (see module docs).
 pub(crate) fn unfilter_average_avx2(
     filtered: &[u8],
     prev_row: Option<&[u8]>,
@@ -498,5 +401,57 @@ mod tests {
         let filtered = filter_up_avx2(&row, Some(&prev));
         let unfiltered = unfilter_up_avx2(&filtered, Some(&prev));
         assert_eq!(unfiltered, row, "Filter 2 (Up) large row failed");
+    }
+
+    /// Regression test: the AVX2 average predictor must not lose the carry
+    /// bit. With naive 8-bit-lane arithmetic, `left=200, above=200` wraps to
+    /// `400 mod 256 = 144` before the shift, yielding pred=72 instead of the
+    /// correct 200. Use values that trigger this specific failure mode across
+    /// a full 32-byte SIMD chunk plus scalar tail.
+    #[test]
+    fn test_filter_average_avx2_carry_bit_large_values() {
+        let bpp = 1;
+        let width = 100; // > 32 to exercise SIMD + tail
+        let row: Vec<u8> = (0..width).map(|i| 200u8.wrapping_add(i as u8)).collect();
+        let prev: Vec<u8> = (0..width).map(|i| 210u8.wrapping_add(i as u8)).collect();
+
+        let filtered = filter_average_avx2(&row, Some(&prev), bpp);
+        let unfiltered = unfilter_average_avx2(&filtered, Some(&prev), bpp);
+        assert_eq!(
+            unfiltered, row,
+            "Filter 3 (Average) AVX2 carry-bit roundtrip failed"
+        );
+
+        // Cross-check against the scalar reference implementation directly.
+        let scalar_filtered = filter_average_scalar(&row, Some(&prev), bpp);
+        assert_eq!(
+            filtered, scalar_filtered,
+            "AVX2 average filter diverges from scalar reference (carry-bit bug)"
+        );
+    }
+
+    #[test]
+    fn test_filter_average_avx2_matches_scalar_random() {
+        let bpp = 4;
+        let width = 257; // odd size, spans multiple SIMD chunks + tail
+        let row: Vec<u8> = (0..width).map(|i| ((i * 197) % 256) as u8).collect();
+        let prev: Vec<u8> = (0..width).map(|i| ((i * 131 + 7) % 256) as u8).collect();
+
+        let avx2_filtered = filter_average_avx2(&row, Some(&prev), bpp);
+        let scalar_filtered = filter_average_scalar(&row, Some(&prev), bpp);
+        assert_eq!(
+            avx2_filtered, scalar_filtered,
+            "AVX2 and scalar average filter diverge"
+        );
+    }
+
+    #[test]
+    fn test_filter_average_no_prev_row() {
+        let bpp = 1;
+        let width = 64;
+        let row: Vec<u8> = (0..width).map(|i| ((i * 3) % 256) as u8).collect();
+        let filtered = filter_average_avx2(&row, None, bpp);
+        let scalar_filtered = filter_average_scalar(&row, None, bpp);
+        assert_eq!(filtered, scalar_filtered);
     }
 }
