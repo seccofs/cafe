@@ -600,15 +600,14 @@ cargo deny check                     # Security and license audit (requires: car
 
 **Building with SIMD:**
 ```bash
-# Default (SIMD enabled on x86_64)
+# Default (SIMD enabled on x86_64, AVX2 detected at runtime)
 cargo build --release
 
 # Disable SIMD for portability
 cargo build --release --no-default-features
-
-# Force SIMD on compatible CPU
-RUSTFLAGS="-C target-feature=+avx2" cargo build --release
 ```
+
+**Runtime dispatch:** AVX2 detection happens via `is_x86_feature_detected!("avx2")` at runtime, so the same binary automatically uses AVX2 on capable CPUs and falls back to scalar code otherwise. No `RUSTFLAGS` or special build flags are needed to enable AVX2 — it works out of the box with the default `cargo build --release`.
 
 **How to Verify SIMD is Working:**
 - On AVX2 systems: 2.8-3.5x overall speedup on typical mixed workloads

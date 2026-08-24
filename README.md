@@ -143,7 +143,7 @@ cargo build --release --no-default-features
 ./target/release/cafe-decode output.cafe decoded.png
 ```
 
-**Note on SIMD:** The `simd` feature is enabled by default. It uses AVX2 intrinsics for Filters 1, 2, and 3, automatically falling back to scalar code on CPUs without AVX2 or when SIMD is disabled.
+**Note on SIMD:** The `simd` feature is enabled by default. AVX2 support is detected at runtime via `is_x86_feature_detected!("avx2")`, so the same binary automatically uses AVX2 intrinsics for Filters 1, 2, and 3 on capable CPUs and falls back to scalar code otherwise. No special `RUSTFLAGS` or build flags are needed — it works out of the box with `cargo build --release`.
 
 ### Library API
 

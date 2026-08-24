@@ -145,7 +145,7 @@ cargo build --release --no-default-features
 ./target/release/cafe-decode output.cafe decoded.png
 ```
 
-**Nota sobre SIMD:** A feature `simd` está ativada por padrão. Ela usa intrínsecos AVX2 para os Filtros 1, 2 e 3, fazendo fallback automático para código escalar em CPUs sem AVX2 ou quando SIMD é desativado.
+**Nota sobre SIMD:** A feature `simd` está ativada por padrão. O suporte a AVX2 é detectado em runtime via `is_x86_feature_detected!("avx2")`, então o mesmo binário usa automaticamente os intrínsecos AVX2 para os Filtros 1, 2 e 3 em CPUs compatíveis, fazendo fallback para código escalar nas demais. Não é necessário nenhum `RUSTFLAGS` ou flag de build especial — funciona out-of-the-box com `cargo build --release`.
 
 ### API de Biblioteca
 
