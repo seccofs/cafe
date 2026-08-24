@@ -40,7 +40,7 @@ fn main() -> ExitCode {
 
 fn run_decode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::error::Error>> {
     let extract_metadata = args.iter().any(|a| a == "--extract-metadata");
-    
+
     // Parse tone-map operator option
     let tonemap_operator = if let Some(idx) = args.iter().position(|a| a == "--tonemap-operator") {
         if idx + 1 < args.len() {

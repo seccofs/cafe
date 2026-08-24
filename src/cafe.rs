@@ -40,11 +40,11 @@ mod tonemap;
 
 // Public re-exports for convenience
 pub use error::{CafeError, Result};
+pub use tonemap::ToneMapOperator;
 pub use types::{
     cHDR, iDim, DecodeResult, EncodeOptions, FilterHeuristic, Palette, PaletteAlgorithm,
     PaletteEntry,
 };
-pub use tonemap::ToneMapOperator;
 
 use crate::constants::*;
 
@@ -643,17 +643,17 @@ fn reconstruct_final_pixels(pixel_rows: Vec<u8>, params: &ReconstructParams) -> 
                 "Color type=3 found without PLTE chunk".into(),
             ))
         }
-     } else if params.sample_format == SAMPLE_FORMAT_FLOAT && params.chdr.is_some() {
-         // v1.1: HDR tone-mapping — converts linear HDR float → SDR sRGB 8-bit
-         let target = 0u8; // 0=sRGB, 1=Rec.709, 2=DCI-P3, 3=Linear
-         tonemap::apply_tone_mapping_to_image(
-             &pixel_rows,
-             params.width,
-             params.height,
-             params.chdr.unwrap(),
-             target,
-             params.tonemap_operator,
-         )
+    } else if params.sample_format == SAMPLE_FORMAT_FLOAT && params.chdr.is_some() {
+        // v1.1: HDR tone-mapping — converts linear HDR float → SDR sRGB 8-bit
+        let target = 0u8; // 0=sRGB, 1=Rec.709, 2=DCI-P3, 3=Linear
+        tonemap::apply_tone_mapping_to_image(
+            &pixel_rows,
+            params.width,
+            params.height,
+            params.chdr.unwrap(),
+            target,
+            params.tonemap_operator,
+        )
     } else if params.sample_format == SAMPLE_FORMAT_FLOAT
         || params.sample_format == SAMPLE_FORMAT_HALF
     {
@@ -687,7 +687,7 @@ fn reconstruct_final_pixels(pixel_rows: Vec<u8>, params: &ReconstructParams) -> 
 
 /// Decodes a CAFE buffer (bytes) and returns pixels + metadata.
 /// This is the core decode implementation without file I/O.
-/// 
+///
 /// Uses default tone-map operator (Filmic). For custom operator selection, use decode_bytes_with_opts().
 pub fn decode_bytes(buf: &[u8]) -> Result<(Vec<u8>, DecodeResult)> {
     decode_bytes_with_opts(buf, &EncodeOptions::default())
@@ -695,7 +695,10 @@ pub fn decode_bytes(buf: &[u8]) -> Result<(Vec<u8>, DecodeResult)> {
 
 /// Decodes a CAFE buffer with custom decode options (tone-map operator selection, etc.)
 /// This is the core decode implementation without file I/O, with customizable options.
-fn decode_bytes_internal(buf: &[u8], tonemap_operator: tonemap::ToneMapOperator) -> Result<(Vec<u8>, DecodeResult)> {
+fn decode_bytes_internal(
+    buf: &[u8],
+    tonemap_operator: tonemap::ToneMapOperator,
+) -> Result<(Vec<u8>, DecodeResult)> {
     if buf.len() < 9 || buf[0..9] != SIGNATURE {
         return Err(CafeError::InvalidSignature);
     }
@@ -1473,7 +1476,7 @@ fn decode_bytes_internal(buf: &[u8], tonemap_operator: tonemap::ToneMapOperator)
 }
 
 /// Decodes a CAFE buffer with custom decode options (tone-map operator selection, etc.)
-/// 
+///
 /// # Arguments
 /// * `buf` - Buffer containing CAFE-encoded data
 /// * `opts` - Decode options (tone-map operator, etc.)
@@ -1483,12 +1486,16 @@ pub fn decode_bytes_with_opts(buf: &[u8], opts: &EncodeOptions) -> Result<(Vec<u
 
 /// Decodes a CAFE file to RGBA image on disk.
 /// Decodes a CAFE file with custom options (tone-map operator selection, etc.)
-/// 
+///
 /// # Arguments
 /// * `input_path` - Path to input .cafe file
 /// * `output_path` - Path to output image file
 /// * `opts` - Decode options (primarily for tone-map operator selection)
-pub fn decode_with_opts(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Result<DecodeResult> {
+pub fn decode_with_opts(
+    input_path: &str,
+    output_path: &str,
+    opts: &EncodeOptions,
+) -> Result<DecodeResult> {
     let buf = std::fs::read(input_path)?;
     let (final_pixels, result) = decode_bytes_with_opts(&buf, opts)?;
 
