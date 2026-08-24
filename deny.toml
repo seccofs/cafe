@@ -2,30 +2,24 @@
 # See: https://embarkstudios.github.io/cargo-deny/checks/index.html
 
 [advisories]
-# The lint level for crates with security vulnerabilities
+version = 2
 vulnerability = "deny"
-# The lint level for unmaintained crates
 unmaintained = "warn"
-# The lint level for crates that have been yanked from crates.io
 yanked = "warn"
-# The lint level for crates with security notices
 notice = "warn"
 
-# Allow specific advisories/warnings that are acceptable for this project
-# The paste crate is unmaintained but:
-# 1. It's a transitive dependency (used by pulp for SIMD code generation)
-# 2. The functionality is well-established and stable
-# 3. No active vulnerabilities, only unmaintained status
-# 4. Replacing it would require updating pulp to a version that uses pastey
-# 5. This is a known issue in the Rust ecosystem and will be resolved when image crate fully migrates
-allow = [
-    # RUSTSEC-2024-0436: paste is unmaintained but stable
-    # Used by: pulp -> exr -> image -> rav1e
-    # Alternative: pastey (drop-in replacement, but not yet widely adopted in image ecosystem)
-    { name = "paste", version = "1.0" },
-]
-
 [licenses]
+version = 2
 unlicensed = "deny"
 copyleft = "deny"
-allow-dual-licensing = false
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 OR MIT",
+    "MIT",
+    "MIT OR Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+]
+confidence-threshold = 0.8
