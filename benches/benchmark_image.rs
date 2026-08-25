@@ -62,7 +62,7 @@ impl BenchmarkImage {
             pixel_data[3] = (state >> 24) as u8; // A
         }
 
-        BenchmarkImage {
+        Self {
             width,
             height,
             pixels,
@@ -118,12 +118,12 @@ impl BenchmarkImage {
     }
 
     /// Returns image size in bytes.
-    pub fn size_bytes(&self) -> usize {
+    pub const fn size_bytes(&self) -> usize {
         self.pixels.len()
     }
 
     /// Returns number of pixels.
-    pub fn num_pixels(&self) -> u64 {
+    pub const fn num_pixels(&self) -> u64 {
         (self.width as u64) * (self.height as u64)
     }
 

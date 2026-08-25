@@ -30,7 +30,7 @@ fn gray_value(r: u8, g: u8, b: u8) -> u8 {
 /// Builds the expected RGBA after a round-trip that reduces the color type.
 fn expected_for(color_type: u8) -> Vec<u8> {
     let src = make_test_image().into_raw();
-    let mut expected = src.clone();
+    let mut expected = src;
     for px in expected.chunks_exact_mut(4) {
         let (r, g, b) = (px[0], px[1], px[2]);
         match color_type {
@@ -390,11 +390,11 @@ fn roundtrip_metadata_chunks() {
     let dict = vec![0x5Au8; 256];
 
     let opts = EncodeOptions {
-        json_metadata: json.clone(),
-        exif: Some(exif.clone()),
-        icc_profile: Some(icc.clone()),
-        xmp_metadata: Some(xmp.clone()),
-        zstd_dictionary: Some(dict.clone()),
+        json_metadata: json,
+        exif: Some(exif),
+        icc_profile: Some(icc),
+        xmp_metadata: Some(xmp),
+        zstd_dictionary: Some(dict),
         ..EncodeOptions::default()
     };
 
@@ -408,25 +408,28 @@ fn roundtrip_metadata_chunks() {
     let result =
         decode(cafe_path.to_str().unwrap(), out_path.to_str().unwrap()).expect("decode failed");
 
-    assert_eq!(result.json_metadata, json, "jSON metadata diverged");
+    assert_eq!(
+        result.json_metadata, opts.json_metadata,
+        "jSON metadata diverged"
+    );
     assert_eq!(
         result.exif.as_deref(),
-        Some(exif.as_slice()),
+        opts.exif.as_deref(),
         "eXIF diverged"
     );
     assert_eq!(
         result.icc_profile.as_deref(),
-        Some(icc.as_slice()),
+        opts.icc_profile.as_deref(),
         "iCCP diverged"
     );
     assert_eq!(
         result.xmp_metadata.as_deref(),
-        Some(xmp.as_str()),
+        opts.xmp_metadata.as_deref(),
         "xMPd diverged"
     );
     assert_eq!(
         result.zstd_dictionary.as_deref(),
-        Some(dict.as_slice()),
+        opts.zstd_dictionary.as_deref(),
         "zDIC diverged"
     );
 }

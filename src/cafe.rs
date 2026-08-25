@@ -413,7 +413,7 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
 
         train_zstd_dictionary(&samples)
     } else {
-        opts.zstd_dictionary.clone()
+        opts.zstd_dictionary.as_ref().cloned()
     };
 
     // --- zDIC (optional, single instance, section 4.9) ---
@@ -2961,8 +2961,8 @@ mod tests {
         assert_eq!(order_z.len(), 16);
 
         // All tiles appear in both (just different order)
-        let mut row_set = order_row.clone();
-        let mut z_set = order_z.clone();
+        let mut row_set = order_row.to_vec();
+        let mut z_set = order_z.to_vec();
         row_set.sort();
         z_set.sort();
         assert_eq!(row_set, z_set);
@@ -3623,9 +3623,11 @@ mod tests {
             .to_string();
 
         // Save and reload
-        let img = image::RgbaImage::from_raw(width, height, img_data.clone())
-            .expect("failed to create image");
-        img.save(&test_path).expect("failed to save");
+        {
+            let img = image::RgbaImage::from_raw(width, height, img_data.clone())
+                .expect("failed to create image");
+            img.save(&test_path).expect("failed to save");
+        }
 
         let loaded = image::open(&test_path)
             .expect("failed to open")
@@ -3702,7 +3704,7 @@ mod tests {
         }
 
         // Create original PNG image
-        let img = image::RgbaImage::from_raw(width, height, img_data.clone())
+        let img = image::RgbaImage::from_raw(width, height, img_data)
             .expect("failed to create RGBA image");
 
         let temp_dir = std::env::temp_dir();
@@ -3794,8 +3796,8 @@ mod tests {
             *cell = ((i / 4) % 256) as u8;
         }
 
-        let img = image::RgbaImage::from_raw(width, height, img_data.clone())
-            .expect("failed ao criar imagem");
+        let img =
+            image::RgbaImage::from_raw(width, height, img_data).expect("failed ao criar imagem");
 
         let temp_dir = std::env::temp_dir();
         let input_path = temp_dir

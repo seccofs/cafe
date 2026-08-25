@@ -33,19 +33,19 @@ pub enum CafeError {
 impl fmt::Display for CafeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CafeError::InvalidSignature => write!(f, "Invalid CAFE signature - file corrupted or not a .cafe file"),
-            CafeError::CrcMismatch { chunk_type, expected, actual } => write!(
+            Self::InvalidSignature => write!(f, "Invalid CAFE signature - file corrupted or not a .cafe file"),
+            Self::CrcMismatch { chunk_type, expected, actual } => write!(
                 f,
                 "Invalid CRC in chunk {chunk_type:?}: expected {expected:#010x}, got {actual:#010x}"
             ),
-            CafeError::UnsupportedFeature(msg) => write!(f, "Feature not supported by this v1.0+ decoder: {msg}"),
-            CafeError::MissingIhdr => write!(f, "File does not contain IHDR"),
-            CafeError::Io(e) => write!(f, "I/O error: {e}"),
-            CafeError::Image(e) => write!(f, "Image error: {e}"),
-            CafeError::Zstd(e) => write!(f, "ZSTD error: {e}"),
-            CafeError::Json(e) => write!(f, "JSON error: {e}"),
-            CafeError::TruncatedFile(msg) => write!(f, "File truncated or corrupted: {msg}"),
-            CafeError::DecompressionLimitExceeded { limit } => write!(
+            Self::UnsupportedFeature(msg) => write!(f, "Feature not supported by this v1.0+ decoder: {msg}"),
+            Self::MissingIhdr => write!(f, "File does not contain IHDR"),
+            Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::Image(e) => write!(f, "Image error: {e}"),
+            Self::Zstd(e) => write!(f, "ZSTD error: {e}"),
+            Self::Json(e) => write!(f, "JSON error: {e}"),
+            Self::TruncatedFile(msg) => write!(f, "File truncated or corrupted: {msg}"),
+            Self::DecompressionLimitExceeded { limit } => write!(
                 f,
                 "Decompression exceeded maximum limit of {limit} bytes (possible decompression bomb)"
             ),
@@ -57,19 +57,19 @@ impl Error for CafeError {}
 
 impl From<std::io::Error> for CafeError {
     fn from(e: std::io::Error) -> Self {
-        CafeError::Io(e)
+        Self::Io(e)
     }
 }
 
 impl From<image::ImageError> for CafeError {
     fn from(e: image::ImageError) -> Self {
-        CafeError::Image(e)
+        Self::Image(e)
     }
 }
 
 impl From<serde_json::Error> for CafeError {
     fn from(e: serde_json::Error) -> Self {
-        CafeError::Json(e)
+        Self::Json(e)
     }
 }
 

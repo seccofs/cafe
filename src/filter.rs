@@ -493,11 +493,11 @@ fn choose_best_block_filter_quick_prune(
 
     // Return the winning filter and its filtered data
     let (_, _, filtered) = candidates
-        .iter()
+        .into_iter()
         .find(|(ft, _, _)| *ft == best_ftype)
         .unwrap();
 
-    (best_ftype, filtered.clone())
+    (best_ftype, filtered)
 }
 
 /// Analyzes block variance distribution to detect content type.

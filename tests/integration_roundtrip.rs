@@ -71,7 +71,7 @@ fn test_roundtrip_256x256_rgba_checkerboard() {
     let pixels = generate_test_image(width, height, "checkerboard");
 
     // Create test PNG (use image crate)
-    let image_buffer = image::RgbaImage::from_raw(width, height, pixels.clone()).unwrap();
+    let image_buffer = image::RgbaImage::from_raw(width, height, pixels).unwrap();
     image_buffer
         .save(&input_png)
         .expect("Failed to save input PNG");

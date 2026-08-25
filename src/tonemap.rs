@@ -92,7 +92,7 @@ impl ColorMatrix {
 // Color primaries conversion matrices (CIE 1931, D65 white).
 // Standard: RGB primaries → XYZ (matrices M_rgb_to_xyz).
 
-fn matrix_bt709_to_xyz() -> ColorMatrix {
+const fn matrix_bt709_to_xyz() -> ColorMatrix {
     // Rec.709 / sRGB primaries → XYZ
     ColorMatrix {
         m: [
@@ -103,7 +103,7 @@ fn matrix_bt709_to_xyz() -> ColorMatrix {
     }
 }
 
-fn matrix_bt2020_to_xyz() -> ColorMatrix {
+const fn matrix_bt2020_to_xyz() -> ColorMatrix {
     // Rec.2020 primaries → XYZ
     ColorMatrix {
         m: [
@@ -114,7 +114,7 @@ fn matrix_bt2020_to_xyz() -> ColorMatrix {
     }
 }
 
-fn matrix_dcip3_to_xyz() -> ColorMatrix {
+const fn matrix_dcip3_to_xyz() -> ColorMatrix {
     // DCI-P3 (D65) primaries → XYZ
     ColorMatrix {
         m: [
@@ -125,7 +125,7 @@ fn matrix_dcip3_to_xyz() -> ColorMatrix {
     }
 }
 
-fn matrix_xyz_to_bt709() -> ColorMatrix {
+const fn matrix_xyz_to_bt709() -> ColorMatrix {
     // XYZ → Rec.709 / sRGB primaries (inverse of the matrix above)
     ColorMatrix {
         m: [
@@ -136,7 +136,7 @@ fn matrix_xyz_to_bt709() -> ColorMatrix {
     }
 }
 
-fn matrix_xyz_to_bt2020() -> ColorMatrix {
+const fn matrix_xyz_to_bt2020() -> ColorMatrix {
     // XYZ → Rec.2020 primaries
     ColorMatrix {
         m: [
@@ -147,7 +147,7 @@ fn matrix_xyz_to_bt2020() -> ColorMatrix {
     }
 }
 
-fn matrix_xyz_to_dcip3() -> ColorMatrix {
+const fn matrix_xyz_to_dcip3() -> ColorMatrix {
     // XYZ → DCI-P3 (D65) primaries
     ColorMatrix {
         m: [
@@ -205,8 +205,8 @@ pub enum ToneMapOperator {
 impl ToneMapOperator {
     fn apply(&self, x: f32) -> f32 {
         let v = match self {
-            ToneMapOperator::Reinhard => x / (1.0 + x),
-            ToneMapOperator::Filmic => {
+            Self::Reinhard => x / (1.0 + x),
+            Self::Filmic => {
                 let a = 2.51 * x + 0.03;
                 let b = 2.43 * x + 0.59;
                 (x * a) / (x * b + 0.14)
@@ -220,8 +220,8 @@ impl ToneMapOperator {
     /// This is the implementation for the FromStr trait below.
     fn parse_from_str(s: &str) -> std::result::Result<Self, String> {
         match s.to_lowercase().as_str() {
-            "reinhard" => Ok(ToneMapOperator::Reinhard),
-            "filmic" | "aces" => Ok(ToneMapOperator::Filmic),
+            "reinhard" => Ok(Self::Reinhard),
+            "filmic" | "aces" => Ok(Self::Filmic),
             other => Err(format!(
                 "unknown tone-map operator '{}': use 'reinhard' or 'filmic'",
                 other
@@ -233,13 +233,13 @@ impl ToneMapOperator {
 impl std::str::FromStr for ToneMapOperator {
     type Err = String;
     fn from_str(s: &str) -> std::result::Result<Self, String> {
-        ToneMapOperator::parse_from_str(s)
+        Self::parse_from_str(s)
     }
 }
 
 /// Main tone-mapping function
 /// Converts HDR linear float → SDR 8-bit in target space
-pub(crate) fn tonemap_hdr(
+pub fn tonemap_hdr(
     rgb_linear: &[f32; 3],
     transfer_func: u8, // 0=linear, 1=PQ, 2=HLG, 3=sRGB
     color_src: u8,     // 0=BT.709, 1=BT.2020, 2=DCI-P3
@@ -343,7 +343,7 @@ pub(crate) fn tonemap_hdr(
 }
 
 /// Apply tone-mapping to an entire image (float → SDR 8-bit)
-pub(crate) fn apply_tone_mapping_to_image(
+pub fn apply_tone_mapping_to_image(
     pixels_float: &[u8], // RGBA float (each channel is f32, 4 channels = 16 bytes/pixel)
     width: u32,
     height: u32,
