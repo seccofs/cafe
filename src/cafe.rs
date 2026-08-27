@@ -174,6 +174,85 @@ fn build_idat_chunk(data: &[u8], level: i32, dict: Option<&[u8]>) -> Result<(Vec
     ))
 }
 
+/// Writes the iDIM chunk (section 4.2, tiling for progressive streaming) if
+/// present in `opts`. Shared between `encode()` and `encode_indexed()` — must
+/// appear immediately after IHDR in both (section 9, mandatory chunk order).
+/// Returns whether ZSTD was used for this chunk.
+fn append_idim_chunk_if_present(out: &mut Vec<u8>, opts: &EncodeOptions) -> Result<bool> {
+    if let Some(idim) = &opts.idim {
+        let chunk = write_idim_chunk(idim)?;
+        let used = chunk_uses_zstd(&chunk);
+        out.extend_from_slice(&chunk);
+        Ok(used)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Writes the eXIF, jSON, iCCP, and xMPd ancillary chunks shared between
+/// `encode()` and `encode_indexed()`, in spec order (sections 4.5-4.8).
+/// Deduplicates a block that was previously copy-pasted between the two
+/// encoders — a past divergence between the copies caused `encode_indexed()`
+/// to silently omit the zDIC chunk despite using the dictionary to compress
+/// IDATs (see `append_zdic_chunk_if_present`). Returns whether any chunk used
+/// ZSTD.
+fn append_common_metadata_chunks(out: &mut Vec<u8>, opts: &EncodeOptions) -> Result<bool> {
+    let mut uses_zstd = false;
+
+    // --- eXIF (optional, single instance, section 4.5) ---
+    if let Some(exif_bytes) = &opts.exif {
+        let (flag, data) = compress_with_fallback(exif_bytes, opts.level)?;
+        uses_zstd |= flag == FLAG_ZSTD;
+        out.extend_from_slice(&write_chunk(CHUNK_EXIF, flag, &data));
+    }
+
+    // --- jSON (optional, one per namespace, section 4.6) ---
+    for (namespace, obj) in &opts.json_metadata {
+        let chunk = write_json_chunk(namespace, obj, opts.level)?;
+        uses_zstd |= chunk_uses_zstd(&chunk);
+        out.extend_from_slice(&chunk);
+    }
+
+    // --- iCCP (optional, single instance, section 4.7) ---
+    if let Some(icc) = &opts.icc_profile {
+        let chunk = write_iccp_chunk(icc, opts.level)?;
+        uses_zstd |= chunk_uses_zstd(&chunk);
+        out.extend_from_slice(&chunk);
+    }
+
+    // --- xMPd (optional, single instance, section 4.8) ---
+    if let Some(xmp) = &opts.xmp_metadata {
+        let chunk = write_xmpd_chunk(xmp, opts.level)?;
+        uses_zstd |= chunk_uses_zstd(&chunk);
+        out.extend_from_slice(&chunk);
+    }
+
+    Ok(uses_zstd)
+}
+
+/// Writes the zDIC chunk (section 4.9) if `dict` is present. Shared between
+/// `encode()` (which may pass an auto-trained dictionary) and
+/// `encode_indexed()`. The dictionary is actually used when compressing the
+/// IDATs (`compress_with_fallback_dict`) — it is not merely informational, so
+/// this chunk must be written whenever a dictionary is used for IDATs, or the
+/// decoder cannot reconstruct the pixel data (see doc comment on
+/// `append_common_metadata_chunks`). Returns whether ZSTD was used for this
+/// chunk.
+fn append_zdic_chunk_if_present(
+    out: &mut Vec<u8>,
+    dict: Option<&[u8]>,
+    level: i32,
+) -> Result<bool> {
+    if let Some(dict) = dict {
+        let chunk = write_zdic_chunk(dict, level)?;
+        let used = chunk_uses_zstd(&chunk);
+        out.extend_from_slice(&chunk);
+        Ok(used)
+    } else {
+        Ok(false)
+    }
+}
+
 /// Encodes an image (any format the `image` crate can read) to `.cafe`.
 pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Result<()> {
     let img = image::open(input_path)?.to_rgba8();
@@ -348,47 +427,19 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
     // --- iDIM (optional, ancillary, section 4.2, v1.0) ---
     // iDIM defines the tile partitioning for progressive streaming.
     // Must appear immediately after IHDR (section 9, mandatory order).
-    if let Some(idim) = &opts.idim {
-        let chunk = write_idim_chunk(idim)?;
-        uses_zstd |= chunk_uses_zstd(&chunk);
-        out.extend_from_slice(&chunk);
-    }
+    uses_zstd |= append_idim_chunk_if_present(&mut out, opts)?;
 
     // --- cHDR (optional, single instance, section 4.4, v1.0) ---
-    // HDR metadata: transfer function, color space, luminance
+    // HDR metadata: transfer function, color space, luminance. Only emitted
+    // by encode() — encode_indexed() has no HDR path.
     if let Some(chdr) = &opts.chdr_metadata {
         let chunk = write_chdr_chunk(chdr, opts.level)?;
         uses_zstd |= chunk_uses_zstd(&chunk);
         out.extend_from_slice(&chunk);
     }
 
-    // --- eXIF (optional, single instance, section 4.5) ---
-    if let Some(exif_bytes) = &opts.exif {
-        let (flag, data) = compress_with_fallback(exif_bytes, opts.level)?;
-        uses_zstd |= flag == FLAG_ZSTD;
-        out.extend_from_slice(&write_chunk(CHUNK_EXIF, flag, &data));
-    }
-
-    // --- jSON (optional, one per namespace, section 4.6) ---
-    for (namespace, obj) in &opts.json_metadata {
-        let chunk = write_json_chunk(namespace, obj, opts.level)?;
-        uses_zstd |= chunk_uses_zstd(&chunk);
-        out.extend_from_slice(&chunk);
-    }
-
-    // --- iCCP (optional, single instance, v1.0) ---
-    if let Some(icc) = &opts.icc_profile {
-        let chunk = write_iccp_chunk(icc, opts.level)?;
-        uses_zstd |= chunk_uses_zstd(&chunk);
-        out.extend_from_slice(&chunk);
-    }
-
-    // --- xMPd (optional, single instance, v1.0) ---
-    if let Some(xmp) = &opts.xmp_metadata {
-        let chunk = write_xmpd_chunk(xmp, opts.level)?;
-        uses_zstd |= chunk_uses_zstd(&chunk);
-        out.extend_from_slice(&chunk);
-    }
+    // --- eXIF, jSON, iCCP, xMPd (optional, sections 4.5-4.8) ---
+    uses_zstd |= append_common_metadata_chunks(&mut out, opts)?;
 
     // --- Auto-dictionary training (v1.1, opt-in) ---
     // If auto_dictionary is enabled and no explicit dictionary provided,
@@ -433,13 +484,7 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
     };
 
     // --- zDIC (optional, single instance, section 4.9) ---
-    // zDIC is actually used when compressing the IDATs (compress_with_fallback_dict),
-    // it is not merely informational — see section 4.9 of the spec.
-    if let Some(dict) = &final_zstd_dict {
-        let chunk = write_zdic_chunk(dict, opts.level)?;
-        uses_zstd |= chunk_uses_zstd(&chunk);
-        out.extend_from_slice(&chunk);
-    }
+    uses_zstd |= append_zdic_chunk_if_present(&mut out, final_zstd_dict.as_deref(), opts.level)?;
 
     // --- IDAT (section 4.3) ---
     // New feature (v1.0): local complexity analysis per tile (extended section 4.3.1).
@@ -1632,50 +1677,20 @@ pub fn encode_indexed(input_path: &str, output_path: &str, opts: &EncodeOptions)
 
     // --- iDIM (ancillary, optional, v1.0 smart streaming) ---
     // Must appear immediately after IHDR (section 9, mandatory order).
-    if let Some(idim) = &opts.idim {
-        let chunk = write_idim_chunk(idim)?;
-        uses_zstd |= chunk_uses_zstd(&chunk);
-        out.extend_from_slice(&chunk);
-    }
+    uses_zstd |= append_idim_chunk_if_present(&mut out, opts)?;
 
-    // --- eXIF (optional) ---
-    if let Some(exif_bytes) = &opts.exif {
-        let (flag, data) = compress_with_fallback(exif_bytes, opts.level)?;
-        uses_zstd |= flag == FLAG_ZSTD;
-        out.extend_from_slice(&write_chunk(CHUNK_EXIF, flag, &data));
-    }
-
-    // --- jSON (optional) ---
-    for (namespace, obj) in &opts.json_metadata {
-        let chunk = write_json_chunk(namespace, obj, opts.level)?;
-        uses_zstd |= chunk_uses_zstd(&chunk);
-        out.extend_from_slice(&chunk);
-    }
-
-    // --- iCCP (optional, single instance, section 4.7) ---
-    if let Some(icc) = &opts.icc_profile {
-        let chunk = write_iccp_chunk(icc, opts.level)?;
-        uses_zstd |= chunk_uses_zstd(&chunk);
-        out.extend_from_slice(&chunk);
-    }
-
-    // --- xMPd (optional, single instance, section 4.8) ---
-    if let Some(xmp) = &opts.xmp_metadata {
-        let chunk = write_xmpd_chunk(xmp, opts.level)?;
-        uses_zstd |= chunk_uses_zstd(&chunk);
-        out.extend_from_slice(&chunk);
-    }
+    // --- eXIF, jSON, iCCP, xMPd (optional, sections 4.5-4.8) ---
+    uses_zstd |= append_common_metadata_chunks(&mut out, opts)?;
 
     // --- zDIC (optional, single instance, section 4.9) ---
-    // BUG FIXED: before this fix, encode_indexed() USED the dictionary
-    // to compress the IDATs (via compress_with_fallback_dict below) but never
-    // wrote the zDIC chunk — generating undecodable files (the decoder could
-    // not find the dictionary and failed with "Dictionary mismatch").
-    if let Some(dict) = &opts.zstd_dictionary {
-        let chunk = write_zdic_chunk(dict, opts.level)?;
-        uses_zstd |= chunk_uses_zstd(&chunk);
-        out.extend_from_slice(&chunk);
-    }
+    // BUG HISTORY: before this shared helper existed, encode_indexed() USED
+    // the dictionary to compress the IDATs (via compress_with_fallback_dict
+    // below) but never wrote the zDIC chunk here — generating undecodable
+    // files (the decoder could not find the dictionary and failed with
+    // "Dictionary mismatch"). Sharing `append_zdic_chunk_if_present` with
+    // encode() prevents this class of divergence from recurring.
+    uses_zstd |=
+        append_zdic_chunk_if_present(&mut out, opts.zstd_dictionary.as_deref(), opts.level)?;
 
     // --- PLTE (critical, required with Color type = 3 only) ---
     // v1.0/+5: If interlaced (color_type=6), do NOT write PLTE (not needed)
