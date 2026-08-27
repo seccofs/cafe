@@ -66,6 +66,36 @@ jobs:
           components: clippy
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  fuzz:
+    name: Fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        target: [decode_fuzz, chunk_roundtrip_fuzz]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+
+      - uses: taiki-e/install-action@cargo-fuzz
+
+      - name: Run ${{ matrix.target }} for 60s
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60
+        working-directory: fuzz
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+
   security-audit:
     name: Security Audit
     runs-on: ubuntu-latest

@@ -161,7 +161,7 @@ Complete security audit of CAFE v1.0 project revealed **excellent security pract
 
 ### Short Term
 - [ ] Merge security patches (applied)
-- [ ] Add fuzzing tests
+- [x] Add fuzzing tests (harnesses in `fuzz/`, run for 60s per target on every CI push/PR via `.github/workflows/ci.yml`)
 - [ ] Update SECURITY.md with disclosure policy
 - [x] Fix panic/DoS in interlace + cumulative IDAT bomb + scan_order validation
 
