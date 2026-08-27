@@ -43,6 +43,15 @@ fn generate_test_image(width: u32, height: u32, pattern: &str) -> Vec<u8> {
                     pixels[idx + 2] = 128;
                     pixels[idx + 3] = 255;
                 }
+                "diagonal" => {
+                    // Diagonal gradients (both \ and /) plus a diamond pattern,
+                    // designed to favor the diagonal-aware predictors (Filters
+                    // 6, 9-12, 14) so the block heuristic actually selects them.
+                    pixels[idx] = ((x as i64 * 3 + y as i64 * 5) % 256) as u8;
+                    pixels[idx + 1] = ((255 - (x as i64) + (y as i64) * 2) % 256) as u8;
+                    pixels[idx + 2] = ((x as i64 - y as i64).unsigned_abs() % 256) as u8;
+                    pixels[idx + 3] = 255;
+                }
                 _ => {
                     // Random-like pattern
                     let seed = ((x ^ y) * 31) as usize;
@@ -309,4 +318,62 @@ fn test_roundtrip_tall_image_256x2048() {
     let _ = fs::remove_file(&input_png);
     let _ = fs::remove_file(&output_cafe);
     let _ = fs::remove_file(&output_png);
+}
+
+/// Roundtrip on a diagonal-gradient pattern, designed to be favorable to the
+/// SIMD-accelerated diagonal predictors (Filter 6 Gradient, 9-12 4-way
+/// Directional, 14 TR-Directional), exercising both `FilterHeuristic::Entropy`
+/// (default) and `FilterHeuristic::AdaptiveEntropy` end-to-end through the
+/// public `encode`/`decode` API, with exact pixel-for-pixel comparison against
+/// the source image (not just "file exists").
+#[test]
+fn test_roundtrip_diagonal_pattern_pixel_exact() {
+    let temp_dir = temp_test_dir();
+    let width = 193u32; // not a multiple of the tile size, exercises block edges
+    let height = 137u32;
+    let pixels = generate_test_image(width, height, "diagonal");
+
+    for (heuristic_name, heuristic) in [
+        ("entropy", FilterHeuristic::Entropy),
+        ("adaptive", FilterHeuristic::AdaptiveEntropy),
+    ] {
+        let input_png = format!("{}/input_diagonal_{}.png", temp_dir, heuristic_name);
+        let output_cafe = format!("{}/output_diagonal_{}.cafe", temp_dir, heuristic_name);
+        let output_png = format!("{}/output_diagonal_{}.png", temp_dir, heuristic_name);
+
+        let image_buffer = image::RgbaImage::from_raw(width, height, pixels.clone()).unwrap();
+        image_buffer
+            .save(&input_png)
+            .expect("Failed to save input PNG");
+
+        let opts = EncodeOptions {
+            use_filter: true,
+            level: 12,
+            adaptive_analysis: true,
+            target_color_type: 6,
+            filter_heuristic: heuristic,
+            ..Default::default()
+        };
+
+        encode(&input_png, &output_cafe, &opts).expect("Encode failed");
+        let result = decode(&output_cafe, &output_png).expect("Decode failed");
+
+        assert_eq!(result.width, width);
+        assert_eq!(result.height, height);
+
+        let decoded_image = image::open(&output_png)
+            .expect("Failed to open decoded PNG")
+            .to_rgba8();
+        assert_eq!(decoded_image.width(), width);
+        assert_eq!(decoded_image.height(), height);
+        assert_eq!(
+            decoded_image.into_raw(),
+            pixels,
+            "pixel mismatch for heuristic {heuristic_name} (diagonal SIMD filters)"
+        );
+
+        let _ = fs::remove_file(&input_png);
+        let _ = fs::remove_file(&output_cafe);
+        let _ = fs::remove_file(&output_png);
+    }
 }

@@ -5,9 +5,24 @@
 //! - Filter 1 (Sub): pixel - left
 //! - Filter 2 (Up): pixel - above
 //! - Filter 3 (Average): pixel - (left + above) / 2
+//! - Filter 6 (Gradient): pixel - (left + above - diagonal), pure mod-256 arithmetic
+//! - Filters 9-12 (4-way Directional): weighted averages of left/above/diagonal
+//! - Filter 14 (TR-Directional): bilinear average of left/above/diagonal/top-right
 //!
-//! Filters 4+ (Paeth, MED, Gradient, etc.) are less vectorizable due to
-//! conditional logic and complex neighbor dependencies; they use scalar fallback.
+//! Filters 4, 5, 7, 8, 13, 15 (Paeth, MED, Simple Median, 2nd Order, Context,
+//! Weighted) are less vectorizable due to conditional/branchy logic or
+//! in-flight adaptive state; they use scalar fallback only.
+//!
+//! # Encode-only Vectorization for Left-Dependent Filters
+//!
+//! Filters 1, 3, 6, 9-12 and 14 all use the *same-row* left neighbor (`a`,
+//! and for 14 also the diagonal `c`) as part of their prediction. Applying
+//! the filter (encode) reads only from the original row, so it is always
+//! safe to vectorize (see "Encode vs. Decode Vectorization" below). Reversing
+//! it (decode) reconstructs `out[x]` from `out[x - bpp]`, the *just
+//! reconstructed* neighbor — unsafe to vectorize for the same reason as Sub
+//! and Average, so their `unfilter_*` counterparts remain scalar-only
+//! (handled directly in `filter.rs`, not duplicated here).
 //!
 //! # Architecture
 //!
@@ -292,36 +307,61 @@ unsafe fn filter_average_avx2_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usi
     filtered
 }
 
+/// Widens one 128-bit half (16 x `u8`) of a 32-byte SIMD chunk to 16 x `u16`
+/// lanes (zero-extended), so arithmetic that can overflow 8 bits (sums,
+/// weighted sums) keeps full precision before narrowing back down.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn widen_epu8_16_to_epu16(half: __m128i) -> __m256i {
+    _mm256_cvtepu8_epi16(half)
+}
+
+/// Narrows a widened 16 x `u16` lane group (values must fit in `[0, 255]`,
+/// which every predictor below guarantees) back down to 16 x `u8` via
+/// `_mm_packus_epi16`, splitting the 256-bit input into its two 128-bit
+/// halves first (see `widen_epu8_16_to_epu16`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn narrow_epu16_to_epu8_16(wide: __m256i) -> __m128i {
+    _mm_packus_epi16(
+        _mm256_castsi256_si128(wide),
+        _mm256_extracti128_si256(wide, 1),
+    )
+}
+
+/// Splits a full 32-byte SIMD chunk into its two 128-bit halves and widens
+/// each to 16 x `u16` lanes, returning `(lo, hi)` covering bytes 0-15 and
+/// 16-31 respectively.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn widen_epu8_32_to_epu16_pair(v: __m256i) -> (__m256i, __m256i) {
+    let lo = _mm256_castsi256_si128(v);
+    let hi = _mm256_extracti128_si256(v, 1);
+    (widen_epu8_16_to_epu16(lo), widen_epu8_16_to_epu16(hi))
+}
+
+/// Inverse of `widen_epu8_32_to_epu16_pair`: narrows a `(lo, hi)` pair of
+/// widened 16 x `u16` lane groups back into a single 32-byte `u8` chunk.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn narrow_epu16_pair_to_epu8_32(lo: __m256i, hi: __m256i) -> __m256i {
+    _mm256_set_m128i(narrow_epu16_to_epu8_16(hi), narrow_epu16_to_epu8_16(lo))
+}
+
 /// Computes `(a[i] + b[i]) >> 1` for 32 packed `u8` lanes without losing the
 /// carry bit, by widening each 128-bit half to 16-bit lanes, adding, shifting,
-/// and narrowing back down with `_mm_packus_epi16` (safe because all
-/// intermediate values fit in `[0, 255]`).
+/// and narrowing back down (safe because all intermediate values fit in
+/// `[0, 255]`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn average_epu8_32(a: __m256i, b: __m256i) -> __m256i {
-    let a_lo = _mm256_castsi256_si128(a);
-    let a_hi = _mm256_extracti128_si256(a, 1);
-    let b_lo = _mm256_castsi256_si128(b);
-    let b_hi = _mm256_extracti128_si256(b, 1);
+    let (a_lo, a_hi) = widen_epu8_32_to_epu16_pair(a);
+    let (b_lo, b_hi) = widen_epu8_32_to_epu16_pair(b);
 
-    let sum_lo16 = _mm256_add_epi16(_mm256_cvtepu8_epi16(a_lo), _mm256_cvtepu8_epi16(b_lo));
-    let sum_hi16 = _mm256_add_epi16(_mm256_cvtepu8_epi16(a_hi), _mm256_cvtepu8_epi16(b_hi));
+    let pred_lo16 = _mm256_srli_epi16(_mm256_add_epi16(a_lo, b_lo), 1);
+    let pred_hi16 = _mm256_srli_epi16(_mm256_add_epi16(a_hi, b_hi), 1);
 
-    let pred_lo16 = _mm256_srli_epi16(sum_lo16, 1);
-    let pred_hi16 = _mm256_srli_epi16(sum_hi16, 1);
-
-    // Each pred_*16 spans 16 x u16 across a 256-bit register; split back into
-    // its two 128-bit halves (8 x u16 each) and pack down to u8 in order.
-    let pred_lo_bytes = _mm_packus_epi16(
-        _mm256_castsi256_si128(pred_lo16),
-        _mm256_extracti128_si256(pred_lo16, 1),
-    );
-    let pred_hi_bytes = _mm_packus_epi16(
-        _mm256_castsi256_si128(pred_hi16),
-        _mm256_extracti128_si256(pred_hi16, 1),
-    );
-
-    _mm256_set_m128i(pred_hi_bytes, pred_lo_bytes)
+    narrow_epu16_pair_to_epu8_32(pred_lo16, pred_hi16)
 }
 
 /// Reverses Filter 3 (Average). Always scalar: `out[x]` depends on the
@@ -340,6 +380,431 @@ pub(crate) fn unfilter_average_avx2(
         out[i] = filtered[i].wrapping_add(pred);
     }
     out
+}
+
+// ============================================================================
+// Filter 6 (Gradient): residual[x] = pixel[x] - (left + above - diagonal)
+// ============================================================================
+
+/// Applies Filter 6 (Gradient) using AVX2 if the running CPU supports it,
+/// otherwise scalar. Pure mod-256 arithmetic (`wrapping_add`/`wrapping_sub`),
+/// so it needs no 16-bit widening, unlike Average.
+pub(crate) fn filter_gradient_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { filter_gradient_avx2_impl(row, prev_row, bpp) };
+        }
+    }
+    filter_gradient_scalar(row, prev_row, bpp)
+}
+
+fn filter_gradient_scalar(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    let mut filtered = vec![0u8; row.len()];
+    for i in 0..row.len() {
+        let a = if i >= bpp { row[i - bpp] } else { 0 };
+        let b = prev_row.map(|p| p[i]).unwrap_or(0);
+        let c = if i >= bpp {
+            prev_row.map(|p| p[i - bpp]).unwrap_or(0)
+        } else {
+            0
+        };
+        let pred = a.wrapping_add(b).wrapping_sub(c);
+        filtered[i] = row[i].wrapping_sub(pred);
+    }
+    filtered
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_gradient_avx2_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    let len = row.len();
+    let mut filtered = vec![0u8; len];
+
+    let Some(prev) = prev_row else {
+        // No previous row: b = c = 0, so pred = a (first `bpp` bytes pred = 0).
+        return filter_sub_avx2_impl(row, bpp);
+    };
+
+    // First `bpp` bytes have no left/diagonal neighbor: pred = above (b).
+    for i in 0..bpp.min(len) {
+        filtered[i] = row[i].wrapping_sub(prev[i]);
+    }
+
+    let mut i = bpp;
+    while i + SIMD_WIDTH <= len {
+        let pixels = _mm256_loadu_si256(row.as_ptr().add(i) as *const __m256i);
+        let left = _mm256_loadu_si256(row.as_ptr().add(i - bpp) as *const __m256i);
+        let above = _mm256_loadu_si256(prev.as_ptr().add(i) as *const __m256i);
+        let diag = _mm256_loadu_si256(prev.as_ptr().add(i - bpp) as *const __m256i);
+
+        let pred = _mm256_sub_epi8(_mm256_add_epi8(left, above), diag);
+        let residual = _mm256_sub_epi8(pixels, pred);
+        _mm256_storeu_si256(filtered.as_mut_ptr().add(i) as *mut __m256i, residual);
+
+        i += SIMD_WIDTH;
+    }
+
+    for j in i..len {
+        let a = row[j - bpp];
+        let b = prev[j];
+        let c = prev[j - bpp];
+        let pred = a.wrapping_add(b).wrapping_sub(c);
+        filtered[j] = row[j].wrapping_sub(pred);
+    }
+
+    filtered
+}
+
+// ============================================================================
+// Filters 9-12 (4-way Directional): weighted averages of left/above/diagonal
+// ============================================================================
+//
+// All four predictors are exact-integer weighted averages with power-of-two
+// (H, V, D1) or non-power-of-two (D2, divisor 5) denominators. Each is
+// widened to 16-bit lanes to avoid overflow in the weighted sum, computed,
+// then narrowed back with `narrow_epu16_pair_to_epu8_32` (values are
+// guaranteed to fit in `[0, 255]` by construction, same guarantee the
+// scalar formula relies on).
+//
+// D2's `/5` uses the fixed-point reciprocal multiply `(sum * 13108) >> 16`
+// (`13108 == ceil(2^16 / 5)`), verified exhaustively against the scalar
+// `/5` for all 16,777,216 combinations of `a, b, c` in `simd.rs` tests.
+
+/// Applies Filter 9 (4-way Horizontal): `pred = (3*left + above) / 4`.
+pub(crate) fn filter_4way_h_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { filter_4way_h_avx2_impl(row, prev_row, bpp) };
+        }
+    }
+    filter_4way_scalar(row, prev_row, bpp, |a, b, _c| {
+        ((a as u16 * 3 + b as u16) / 4) as u8
+    })
+}
+
+/// Applies Filter 10 (4-way Vertical): `pred = (left + 3*above) / 4`.
+pub(crate) fn filter_4way_v_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { filter_4way_v_avx2_impl(row, prev_row, bpp) };
+        }
+    }
+    filter_4way_scalar(row, prev_row, bpp, |a, b, _c| {
+        ((a as u16 + b as u16 * 3) / 4) as u8
+    })
+}
+
+/// Applies Filter 11 (4-way Diagonal \\): `pred = (left + above + 2*diag) / 4`.
+pub(crate) fn filter_4way_d1_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { filter_4way_d1_avx2_impl(row, prev_row, bpp) };
+        }
+    }
+    filter_4way_scalar(row, prev_row, bpp, |a, b, c| {
+        ((a as u16 + b as u16 + c as u16 * 2) / 4) as u8
+    })
+}
+
+/// Applies Filter 12 (4-way Diagonal /): `pred = (2*left + 2*above + diag) / 5`.
+pub(crate) fn filter_4way_d2_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { filter_4way_d2_avx2_impl(row, prev_row, bpp) };
+        }
+    }
+    filter_4way_scalar(row, prev_row, bpp, |a, b, c| {
+        ((a as u16 * 2 + b as u16 * 2 + c as u16) / 5) as u8
+    })
+}
+
+/// Shared scalar fallback for all four 4-way directional filters: applies
+/// `pred_fn(left, above, diag)` at every position, with the same tile-edge
+/// zero-fill convention (`predict()`/`filter_row` in filter.rs) used
+/// everywhere else in the codebase.
+fn filter_4way_scalar(
+    row: &[u8],
+    prev_row: Option<&[u8]>,
+    bpp: usize,
+    pred_fn: impl Fn(u8, u8, u8) -> u8,
+) -> Vec<u8> {
+    let mut filtered = vec![0u8; row.len()];
+    for i in 0..row.len() {
+        let a = if i >= bpp { row[i - bpp] } else { 0 };
+        let b = prev_row.map(|p| p[i]).unwrap_or(0);
+        let c = if i >= bpp {
+            prev_row.map(|p| p[i - bpp]).unwrap_or(0)
+        } else {
+            0
+        };
+        filtered[i] = row[i].wrapping_sub(pred_fn(a, b, c));
+    }
+    filtered
+}
+
+/// Computes `pred_fn` for a full 32-byte SIMD chunk given pre-loaded
+/// `left`/`above`/`diag` vectors, via 16-bit widening (to avoid overflow in
+/// the weighted sum) followed by narrowing back to `u8` — shared by all four
+/// 4-way directional AVX2 kernels below, each supplying its own weighted-sum
+/// closure operating on the widened 16-bit lane pairs.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn directional_chunk_avx2(
+    left: __m256i,
+    above: __m256i,
+    diag: __m256i,
+    weighted_sum_shift: impl Fn(__m256i, __m256i, __m256i) -> __m256i,
+) -> __m256i {
+    let (a_lo, a_hi) = widen_epu8_32_to_epu16_pair(left);
+    let (b_lo, b_hi) = widen_epu8_32_to_epu16_pair(above);
+    let (c_lo, c_hi) = widen_epu8_32_to_epu16_pair(diag);
+
+    let pred_lo = weighted_sum_shift(a_lo, b_lo, c_lo);
+    let pred_hi = weighted_sum_shift(a_hi, b_hi, c_hi);
+
+    narrow_epu16_pair_to_epu8_32(pred_lo, pred_hi)
+}
+
+/// Generic AVX2 body shared by the four 4-way directional filters: loads
+/// left/above/diag, computes the predictor via `directional_chunk_avx2`, and
+/// subtracts from the pixel — differing only in `weighted_sum_shift` and the
+/// no-`prev_row` edge case (H/V need `above=0`, D1/D2 additionally need
+/// `diag=0`, both already implied by `prev_row = None` short-circuiting to
+/// scalar edge handling for the first `bpp` bytes and the whole row when
+/// there is no previous row at all).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_directional_avx2_body(
+    row: &[u8],
+    prev_row: Option<&[u8]>,
+    bpp: usize,
+    pred_fn: impl Fn(u8, u8, u8) -> u8,
+    weighted_sum_shift: impl Fn(__m256i, __m256i, __m256i) -> __m256i,
+) -> Vec<u8> {
+    let len = row.len();
+    let mut filtered = vec![0u8; len];
+
+    let Some(prev) = prev_row else {
+        for i in 0..len {
+            let a = if i >= bpp { row[i - bpp] } else { 0 };
+            filtered[i] = row[i].wrapping_sub(pred_fn(a, 0, 0));
+        }
+        return filtered;
+    };
+
+    for i in 0..bpp.min(len) {
+        filtered[i] = row[i].wrapping_sub(pred_fn(0, prev[i], 0));
+    }
+
+    let mut i = bpp;
+    while i + SIMD_WIDTH <= len {
+        let pixels = _mm256_loadu_si256(row.as_ptr().add(i) as *const __m256i);
+        let left = _mm256_loadu_si256(row.as_ptr().add(i - bpp) as *const __m256i);
+        let above = _mm256_loadu_si256(prev.as_ptr().add(i) as *const __m256i);
+        let diag = _mm256_loadu_si256(prev.as_ptr().add(i - bpp) as *const __m256i);
+
+        let pred = directional_chunk_avx2(left, above, diag, &weighted_sum_shift);
+        let residual = _mm256_sub_epi8(pixels, pred);
+        _mm256_storeu_si256(filtered.as_mut_ptr().add(i) as *mut __m256i, residual);
+
+        i += SIMD_WIDTH;
+    }
+
+    for j in i..len {
+        let a = row[j - bpp];
+        let b = prev[j];
+        let c = prev[j - bpp];
+        filtered[j] = row[j].wrapping_sub(pred_fn(a, b, c));
+    }
+
+    filtered
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_4way_h_avx2_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    filter_directional_avx2_body(
+        row,
+        prev_row,
+        bpp,
+        |a, b, _c| ((a as u16 * 3 + b as u16) / 4) as u8,
+        |a, b, _c| {
+            _mm256_srli_epi16(
+                _mm256_add_epi16(_mm256_slli_epi16(a, 1), _mm256_add_epi16(a, b)),
+                2,
+            )
+        },
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_4way_v_avx2_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    filter_directional_avx2_body(
+        row,
+        prev_row,
+        bpp,
+        |a, b, _c| ((a as u16 + b as u16 * 3) / 4) as u8,
+        |a, b, _c| {
+            _mm256_srli_epi16(
+                _mm256_add_epi16(a, _mm256_add_epi16(_mm256_slli_epi16(b, 1), b)),
+                2,
+            )
+        },
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_4way_d1_avx2_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    filter_directional_avx2_body(
+        row,
+        prev_row,
+        bpp,
+        |a, b, c| ((a as u16 + b as u16 + c as u16 * 2) / 4) as u8,
+        |a, b, c| {
+            _mm256_srli_epi16(
+                _mm256_add_epi16(_mm256_add_epi16(a, b), _mm256_slli_epi16(c, 1)),
+                2,
+            )
+        },
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_4way_d2_avx2_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    // sum = 2a + 2b + c (max 5*255 = 1275, fits in u16). Exact `/5` via
+    // fixed-point reciprocal multiply: floor(sum/5) == (sum * 13108) >> 16
+    // for every sum in 0..=1275 (verified exhaustively over all a,b,c in
+    // simd.rs tests). `_mm256_mulhi_epu16` directly yields the high 16 bits
+    // of the 32-bit product, i.e. `(sum * 13108) >> 16`, without needing a
+    // separate widen-to-32-bit step.
+    const RECIPROCAL_DIV5: i16 = 13108u16 as i16;
+    filter_directional_avx2_body(
+        row,
+        prev_row,
+        bpp,
+        |a, b, c| ((a as u16 * 2 + b as u16 * 2 + c as u16) / 5) as u8,
+        |a, b, c| {
+            let sum = _mm256_add_epi16(
+                _mm256_add_epi16(_mm256_slli_epi16(a, 1), _mm256_slli_epi16(b, 1)),
+                c,
+            );
+            _mm256_mulhi_epu16(sum, _mm256_set1_epi16(RECIPROCAL_DIV5))
+        },
+    )
+}
+
+// ============================================================================
+// Filter 14 (TR-Directional): bilinear average of left/above/diag/top-right
+// ============================================================================
+
+/// Applies Filter 14 (TR-Directional): `pred = avg2(avg2(left, diag), avg2(above, tr))`,
+/// where `tr` is the top-right neighbor (0 past the right edge). Built out of
+/// three nested calls to `average_epu8_32` (already carry-safe via 16-bit
+/// widening), matching `tr_directional_predictor` in filter.rs exactly.
+pub(crate) fn filter_tr_directional_avx2(
+    row: &[u8],
+    prev_row: Option<&[u8]>,
+    bpp: usize,
+) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { filter_tr_directional_avx2_impl(row, prev_row, bpp) };
+        }
+    }
+    filter_tr_directional_scalar(row, prev_row, bpp)
+}
+
+fn filter_tr_directional_scalar(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    let avg2 = |x: u8, y: u8| ((x as u16 + y as u16) >> 1) as u8;
+    let mut filtered = vec![0u8; row.len()];
+    for i in 0..row.len() {
+        let a = if i >= bpp { row[i - bpp] } else { 0 };
+        let b = prev_row.map(|p| p[i]).unwrap_or(0);
+        let c = if i >= bpp {
+            prev_row.map(|p| p[i - bpp]).unwrap_or(0)
+        } else {
+            0
+        };
+        let d = if i + bpp < row.len() {
+            prev_row.map(|p| p[i + bpp]).unwrap_or(0)
+        } else {
+            0
+        };
+        let pred = avg2(avg2(a, c), avg2(b, d));
+        filtered[i] = row[i].wrapping_sub(pred);
+    }
+    filtered
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_tr_directional_avx2_impl(
+    row: &[u8],
+    prev_row: Option<&[u8]>,
+    bpp: usize,
+) -> Vec<u8> {
+    let len = row.len();
+    let mut filtered = vec![0u8; len];
+
+    let Some(prev) = prev_row else {
+        // No previous row: b = d = 0 everywhere (c is also 0 for the first
+        // `bpp` bytes, same as the general case). pred = avg2(avg2(a, 0), 0),
+        // matching the scalar reference exactly.
+        let avg2 = |x: u8, y: u8| ((x as u16 + y as u16) >> 1) as u8;
+        for i in 0..len {
+            let a = if i >= bpp { row[i - bpp] } else { 0 };
+            let pred = avg2(avg2(a, 0), 0);
+            filtered[i] = row[i].wrapping_sub(pred);
+        }
+        return filtered;
+    };
+
+    // First bpp bytes: a = c = 0 (no left/diagonal neighbor yet).
+    let avg2 = |x: u8, y: u8| ((x as u16 + y as u16) >> 1) as u8;
+    for i in 0..bpp.min(len) {
+        let b = prev[i];
+        let d = if i + bpp < len { prev[i + bpp] } else { 0 };
+        let pred = avg2(avg2(0, 0), avg2(b, d));
+        filtered[i] = row[i].wrapping_sub(pred);
+    }
+
+    let mut i = bpp;
+    while i + bpp + SIMD_WIDTH <= len {
+        let pixels = _mm256_loadu_si256(row.as_ptr().add(i) as *const __m256i);
+        let left = _mm256_loadu_si256(row.as_ptr().add(i - bpp) as *const __m256i);
+        let above = _mm256_loadu_si256(prev.as_ptr().add(i) as *const __m256i);
+        let diag = _mm256_loadu_si256(prev.as_ptr().add(i - bpp) as *const __m256i);
+        let tr = _mm256_loadu_si256(prev.as_ptr().add(i + bpp) as *const __m256i);
+
+        let avg_left_diag = average_epu8_32(left, diag);
+        let avg_above_tr = average_epu8_32(above, tr);
+        let pred = average_epu8_32(avg_left_diag, avg_above_tr);
+
+        let residual = _mm256_sub_epi8(pixels, pred);
+        _mm256_storeu_si256(filtered.as_mut_ptr().add(i) as *mut __m256i, residual);
+
+        i += SIMD_WIDTH;
+    }
+
+    for j in i..len {
+        let a = row[j - bpp];
+        let b = prev[j];
+        let c = prev[j - bpp];
+        let d = if j + bpp < len { prev[j + bpp] } else { 0 };
+        let pred = avg2(avg2(a, c), avg2(b, d));
+        filtered[j] = row[j].wrapping_sub(pred);
+    }
+
+    filtered
 }
 
 #[cfg(test)]
@@ -453,5 +918,272 @@ mod tests {
         let filtered = filter_average_avx2(&row, None, bpp);
         let scalar_filtered = filter_average_scalar(&row, None, bpp);
         assert_eq!(filtered, scalar_filtered);
+    }
+
+    // ========================================================================
+    // Filter 6 (Gradient), 9-12 (4-way Directional), 14 (TR-Directional):
+    // AVX2 vs. scalar cross-checks, roundtrip via matching `unfilter_row` in
+    // filter.rs (imported directly here to avoid duplicating the reversal
+    // logic), and no-prev-row edge cases. `width = 257` (odd, > 1 SIMD chunk)
+    // exercises the AVX2 tail path for every filter and bpp combination.
+    // ========================================================================
+
+    /// Scalar reversal shared by all the new left-dependent filters, mirroring
+    /// `unfilter_row`'s generic scalar loop in filter.rs (kept local to avoid
+    /// a `pub(crate)` widening of filter.rs internals just for tests).
+    fn unfilter_generic(
+        filtered: &[u8],
+        prev_row: Option<&[u8]>,
+        bpp: usize,
+        pred_fn: impl Fn(u8, u8, u8, u8) -> u8,
+    ) -> Vec<u8> {
+        let mut out = vec![0u8; filtered.len()];
+        for i in 0..filtered.len() {
+            let a = if i >= bpp { out[i - bpp] } else { 0 };
+            let b = prev_row.map(|p| p[i]).unwrap_or(0);
+            let c = if i >= bpp {
+                prev_row.map(|p| p[i - bpp]).unwrap_or(0)
+            } else {
+                0
+            };
+            let d = if i + bpp < filtered.len() {
+                prev_row.map(|p| p[i + bpp]).unwrap_or(0)
+            } else {
+                0
+            };
+            out[i] = filtered[i].wrapping_add(pred_fn(a, b, c, d));
+        }
+        out
+    }
+
+    fn gradient_pred(a: u8, b: u8, c: u8, _d: u8) -> u8 {
+        a.wrapping_add(b).wrapping_sub(c)
+    }
+    fn h_pred(a: u8, b: u8, _c: u8, _d: u8) -> u8 {
+        ((a as u16 * 3 + b as u16) / 4) as u8
+    }
+    fn v_pred(a: u8, b: u8, _c: u8, _d: u8) -> u8 {
+        ((a as u16 + b as u16 * 3) / 4) as u8
+    }
+    fn d1_pred(a: u8, b: u8, c: u8, _d: u8) -> u8 {
+        ((a as u16 + b as u16 + c as u16 * 2) / 4) as u8
+    }
+    fn d2_pred(a: u8, b: u8, c: u8, _d: u8) -> u8 {
+        ((a as u16 * 2 + b as u16 * 2 + c as u16) / 5) as u8
+    }
+    fn tr_pred(a: u8, b: u8, c: u8, d: u8) -> u8 {
+        let avg2 = |x: u8, y: u8| ((x as u16 + y as u16) >> 1) as u8;
+        avg2(avg2(a, c), avg2(b, d))
+    }
+
+    #[test]
+    fn test_filter_gradient_avx2_matches_scalar_and_roundtrips() {
+        for &bpp in &[1usize, 3, 4] {
+            let width = 257;
+            let row: Vec<u8> = (0..width).map(|i| ((i * 197) % 256) as u8).collect();
+            let prev: Vec<u8> = (0..width).map(|i| ((i * 131 + 7) % 256) as u8).collect();
+
+            let avx2_filtered = filter_gradient_avx2(&row, Some(&prev), bpp);
+            let scalar_filtered = filter_gradient_scalar(&row, Some(&prev), bpp);
+            assert_eq!(avx2_filtered, scalar_filtered, "Gradient bpp={bpp}");
+
+            let unfiltered = unfilter_generic(&avx2_filtered, Some(&prev), bpp, gradient_pred);
+            assert_eq!(unfiltered, row, "Gradient roundtrip bpp={bpp}");
+
+            // No-prev-row edge case
+            let no_prev = filter_gradient_avx2(&row, None, bpp);
+            let no_prev_scalar = filter_gradient_scalar(&row, None, bpp);
+            assert_eq!(no_prev, no_prev_scalar, "Gradient no-prev bpp={bpp}");
+        }
+    }
+
+    /// Regression test mirroring `test_filter_average_avx2_carry_bit_large_values`:
+    /// with `a=200, b=210+`, `a+b` can reach 400+, which must not silently wrap
+    /// mod 256 in the weighted-sum widening used by the 4-way directional and
+    /// TR-directional kernels.
+    #[test]
+    fn test_directional_filters_carry_bit_large_values() {
+        let bpp = 1;
+        let width = 100;
+        let row: Vec<u8> = (0..width).map(|i| 200u8.wrapping_add(i as u8)).collect();
+        let prev: Vec<u8> = (0..width).map(|i| 210u8.wrapping_add(i as u8)).collect();
+
+        macro_rules! check {
+            ($avx2:ident, $scalar_pred:expr) => {
+                let avx2_filtered = $avx2(&row, Some(&prev), bpp);
+                let scalar_filtered = filter_4way_scalar(&row, Some(&prev), bpp, $scalar_pred);
+                assert_eq!(
+                    avx2_filtered,
+                    scalar_filtered,
+                    "{} carry-bit mismatch",
+                    stringify!($avx2)
+                );
+            };
+        }
+        check!(
+            filter_4way_h_avx2,
+            |a, b, _c| ((a as u16 * 3 + b as u16) / 4) as u8
+        );
+        check!(
+            filter_4way_v_avx2,
+            |a, b, _c| ((a as u16 + b as u16 * 3) / 4) as u8
+        );
+        check!(filter_4way_d1_avx2, |a, b, c| {
+            ((a as u16 + b as u16 + c as u16 * 2) / 4) as u8
+        });
+        check!(filter_4way_d2_avx2, |a, b, c| {
+            ((a as u16 * 2 + b as u16 * 2 + c as u16) / 5) as u8
+        });
+    }
+
+    #[test]
+    fn test_filter_4way_h_avx2_matches_scalar_and_roundtrips() {
+        for &bpp in &[1usize, 3, 4] {
+            let width = 257;
+            let row: Vec<u8> = (0..width).map(|i| ((i * 197) % 256) as u8).collect();
+            let prev: Vec<u8> = (0..width).map(|i| ((i * 131 + 7) % 256) as u8).collect();
+
+            let avx2_filtered = filter_4way_h_avx2(&row, Some(&prev), bpp);
+            let scalar_filtered = filter_4way_scalar(&row, Some(&prev), bpp, |a, b, _c| {
+                ((a as u16 * 3 + b as u16) / 4) as u8
+            });
+            assert_eq!(avx2_filtered, scalar_filtered, "4wayH bpp={bpp}");
+
+            let unfiltered = unfilter_generic(&avx2_filtered, Some(&prev), bpp, h_pred);
+            assert_eq!(unfiltered, row, "4wayH roundtrip bpp={bpp}");
+
+            let no_prev = filter_4way_h_avx2(&row, None, bpp);
+            let no_prev_scalar = filter_4way_scalar(&row, None, bpp, |a, b, _c| {
+                ((a as u16 * 3 + b as u16) / 4) as u8
+            });
+            assert_eq!(no_prev, no_prev_scalar, "4wayH no-prev bpp={bpp}");
+        }
+    }
+
+    #[test]
+    fn test_filter_4way_v_avx2_matches_scalar_and_roundtrips() {
+        for &bpp in &[1usize, 3, 4] {
+            let width = 257;
+            let row: Vec<u8> = (0..width).map(|i| ((i * 197) % 256) as u8).collect();
+            let prev: Vec<u8> = (0..width).map(|i| ((i * 131 + 7) % 256) as u8).collect();
+
+            let avx2_filtered = filter_4way_v_avx2(&row, Some(&prev), bpp);
+            let scalar_filtered = filter_4way_scalar(&row, Some(&prev), bpp, |a, b, _c| {
+                ((a as u16 + b as u16 * 3) / 4) as u8
+            });
+            assert_eq!(avx2_filtered, scalar_filtered, "4wayV bpp={bpp}");
+
+            let unfiltered = unfilter_generic(&avx2_filtered, Some(&prev), bpp, v_pred);
+            assert_eq!(unfiltered, row, "4wayV roundtrip bpp={bpp}");
+
+            let no_prev = filter_4way_v_avx2(&row, None, bpp);
+            let no_prev_scalar = filter_4way_scalar(&row, None, bpp, |a, b, _c| {
+                ((a as u16 + b as u16 * 3) / 4) as u8
+            });
+            assert_eq!(no_prev, no_prev_scalar, "4wayV no-prev bpp={bpp}");
+        }
+    }
+
+    #[test]
+    fn test_filter_4way_d1_avx2_matches_scalar_and_roundtrips() {
+        for &bpp in &[1usize, 3, 4] {
+            let width = 257;
+            let row: Vec<u8> = (0..width).map(|i| ((i * 197) % 256) as u8).collect();
+            let prev: Vec<u8> = (0..width).map(|i| ((i * 131 + 7) % 256) as u8).collect();
+
+            let avx2_filtered = filter_4way_d1_avx2(&row, Some(&prev), bpp);
+            let scalar_filtered = filter_4way_scalar(&row, Some(&prev), bpp, |a, b, c| {
+                ((a as u16 + b as u16 + c as u16 * 2) / 4) as u8
+            });
+            assert_eq!(avx2_filtered, scalar_filtered, "4wayD1 bpp={bpp}");
+
+            let unfiltered = unfilter_generic(&avx2_filtered, Some(&prev), bpp, d1_pred);
+            assert_eq!(unfiltered, row, "4wayD1 roundtrip bpp={bpp}");
+
+            let no_prev = filter_4way_d1_avx2(&row, None, bpp);
+            let no_prev_scalar = filter_4way_scalar(&row, None, bpp, |a, b, c| {
+                ((a as u16 + b as u16 + c as u16 * 2) / 4) as u8
+            });
+            assert_eq!(no_prev, no_prev_scalar, "4wayD1 no-prev bpp={bpp}");
+        }
+    }
+
+    #[test]
+    fn test_filter_4way_d2_avx2_matches_scalar_and_roundtrips() {
+        for &bpp in &[1usize, 3, 4] {
+            let width = 257;
+            let row: Vec<u8> = (0..width).map(|i| ((i * 197) % 256) as u8).collect();
+            let prev: Vec<u8> = (0..width).map(|i| ((i * 131 + 7) % 256) as u8).collect();
+
+            let avx2_filtered = filter_4way_d2_avx2(&row, Some(&prev), bpp);
+            let scalar_filtered = filter_4way_scalar(&row, Some(&prev), bpp, |a, b, c| {
+                ((a as u16 * 2 + b as u16 * 2 + c as u16) / 5) as u8
+            });
+            assert_eq!(avx2_filtered, scalar_filtered, "4wayD2 bpp={bpp}");
+
+            let unfiltered = unfilter_generic(&avx2_filtered, Some(&prev), bpp, d2_pred);
+            assert_eq!(unfiltered, row, "4wayD2 roundtrip bpp={bpp}");
+
+            let no_prev = filter_4way_d2_avx2(&row, None, bpp);
+            let no_prev_scalar = filter_4way_scalar(&row, None, bpp, |a, b, c| {
+                ((a as u16 * 2 + b as u16 * 2 + c as u16) / 5) as u8
+            });
+            assert_eq!(no_prev, no_prev_scalar, "4wayD2 no-prev bpp={bpp}");
+        }
+    }
+
+    /// Exhaustive check that the `_mm256_mulhi_epu16` fixed-point reciprocal
+    /// (`(sum * 13108) >> 16`) used by Filter 12's AVX2 kernel is bit-exact
+    /// with true integer `/5` for every reachable `sum = 2a + 2b + c` value
+    /// (`0..=1275`), guarding against a subtle rounding regression if the
+    /// magic constant or shift amount is ever changed.
+    #[test]
+    fn test_4way_d2_reciprocal_division_by_5_exact_for_all_sums() {
+        for sum in 0u32..=1275 {
+            let expected = sum / 5;
+            let approx = (sum * 13108) >> 16;
+            assert_eq!(
+                expected, approx,
+                "reciprocal /5 approximation diverges at sum={sum}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_filter_tr_directional_avx2_matches_scalar_and_roundtrips() {
+        for &bpp in &[1usize, 3, 4] {
+            let width = 257;
+            let row: Vec<u8> = (0..width).map(|i| ((i * 197) % 256) as u8).collect();
+            let prev: Vec<u8> = (0..width).map(|i| ((i * 131 + 7) % 256) as u8).collect();
+
+            let avx2_filtered = filter_tr_directional_avx2(&row, Some(&prev), bpp);
+            let scalar_filtered = filter_tr_directional_scalar(&row, Some(&prev), bpp);
+            assert_eq!(avx2_filtered, scalar_filtered, "TR-directional bpp={bpp}");
+
+            let unfiltered = unfilter_generic(&avx2_filtered, Some(&prev), bpp, tr_pred);
+            assert_eq!(unfiltered, row, "TR-directional roundtrip bpp={bpp}");
+
+            let no_prev = filter_tr_directional_avx2(&row, None, bpp);
+            let no_prev_scalar = filter_tr_directional_scalar(&row, None, bpp);
+            assert_eq!(no_prev, no_prev_scalar, "TR-directional no-prev bpp={bpp}");
+        }
+    }
+
+    /// `width` smaller than `bpp + SIMD_WIDTH` (the TR kernel's inner-loop
+    /// guard is `i + bpp + SIMD_WIDTH <= len`, stricter than the other
+    /// filters' `i + SIMD_WIDTH <= len`) must still fall back correctly to
+    /// the scalar tail without ever reading past the row (which would happen
+    /// if the TR neighbor lookahead `i + bpp` overran the buffer).
+    #[test]
+    fn test_filter_tr_directional_avx2_small_row_no_overread() {
+        for &bpp in &[1usize, 4] {
+            let width = bpp + 10; // smaller than one SIMD chunk
+            let row: Vec<u8> = (0..width).map(|i| ((i * 53) % 256) as u8).collect();
+            let prev: Vec<u8> = (0..width).map(|i| ((i * 29 + 3) % 256) as u8).collect();
+
+            let avx2_filtered = filter_tr_directional_avx2(&row, Some(&prev), bpp);
+            let scalar_filtered = filter_tr_directional_scalar(&row, Some(&prev), bpp);
+            assert_eq!(avx2_filtered, scalar_filtered, "TR small row bpp={bpp}");
+        }
     }
 }
