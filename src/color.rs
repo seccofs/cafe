@@ -250,16 +250,13 @@ pub(crate) fn convert_rgba_to_color_type(
         COLOR_TYPE_GRAY => {
             let mut out = Vec::with_capacity(out_capacity);
 
-            // Converts RGBA → Gray (Y = 0.299*R + 0.587*G + 0.114*B)
+            // Converts RGBA → Gray (Y = 0.299*R + 0.587*G + 0.114*B), batched
+            // and SIMD-accelerated (bit-exact with the scalar integer formula).
             if target_bit_depth <= 8 {
                 // Sub-byte (1,2,4) and 8-bit: process as 8-bit values, then pack if needed
-                let mut all_samples = Vec::new();
-                for chunk in rgba.as_chunks::<4>().0 {
-                    let r = chunk[0] as u32;
-                    let g = chunk[1] as u32;
-                    let b = chunk[2] as u32;
-                    let gray = ((299 * r + 587 * g + 114 * b) / 1000).min(255) as u8;
-
+                let gray_samples = rgba_to_luma8_batch(rgba);
+                let mut all_samples = Vec::with_capacity(gray_samples.len());
+                for gray in gray_samples {
                     // If bit_depth < 8, reduce
                     let gray_reduced = reduce_sample_8_to_n_bits(gray, target_bit_depth)?;
                     all_samples.push(gray_reduced);
@@ -285,25 +282,16 @@ pub(crate) fn convert_rgba_to_color_type(
                     out.extend_from_slice(&all_samples);
                 }
             } else if target_bit_depth == 16 {
-                // bit_depth=16: compute all gray samples first, then expand the
-                // whole row in one batched call (SIMD-accelerated on x86_64/AVX2,
-                // bit-exact with expand_sample_8_to_n_bits(_, 16)).
-                let mut gray_samples = Vec::with_capacity(pixel_count);
-                for chunk in rgba.as_chunks::<4>().0 {
-                    let r = chunk[0] as u32;
-                    let g = chunk[1] as u32;
-                    let b = chunk[2] as u32;
-                    gray_samples.push(((299 * r + 587 * g + 114 * b) / 1000).min(255) as u8);
-                }
+                // bit_depth=16: compute all gray samples first (SIMD-accelerated),
+                // then expand the whole row in one batched call (also
+                // SIMD-accelerated on x86_64/AVX2, bit-exact with
+                // expand_sample_8_to_n_bits(_, 16)).
+                let gray_samples = rgba_to_luma8_batch(rgba);
                 out.extend_from_slice(&expand_8to16_batch(&gray_samples)?);
             } else {
                 // Multi-byte (10,12,32): expands 8-bit values to N-bit big-endian
-                for chunk in rgba.as_chunks::<4>().0 {
-                    let r = chunk[0] as u32;
-                    let g = chunk[1] as u32;
-                    let b = chunk[2] as u32;
-                    let gray = ((299 * r + 587 * g + 114 * b) / 1000).min(255) as u8;
-
+                let gray_samples = rgba_to_luma8_batch(rgba);
+                for gray in gray_samples {
                     match target_bit_depth {
                         10 | 12 => {
                             let expanded = expand_sample_8_to_n_bits(gray, target_bit_depth)?;
@@ -398,13 +386,10 @@ pub(crate) fn convert_rgba_to_color_type(
             // Converts RGBA → Gray+Alpha (Y, A)
             if target_bit_depth <= 8 {
                 // Sub-byte (1,2,4) and 8-bit: process as 8-bit values, then pack if needed
-                let mut all_samples = Vec::new();
-                for chunk in rgba.as_chunks::<4>().0 {
-                    let r = chunk[0] as u32;
-                    let g = chunk[1] as u32;
-                    let b = chunk[2] as u32;
+                let gray_samples = rgba_to_luma8_batch(rgba);
+                let mut all_samples = Vec::with_capacity(gray_samples.len() * 2);
+                for (gray, chunk) in gray_samples.into_iter().zip(rgba.as_chunks::<4>().0) {
                     let a = chunk[3];
-                    let gray = ((299 * r + 587 * g + 114 * b) / 1000).min(255) as u8;
 
                     // Reduce if necessary
                     let gray_reduced = reduce_sample_8_to_n_bits(gray, target_bit_depth)?;
@@ -436,13 +421,9 @@ pub(crate) fn convert_rgba_to_color_type(
                 // bit_depth=16: deinterleave gray/alpha, batch-expand each,
                 // then re-interleave.
                 let n = rgba.as_chunks::<4>().0.len();
-                let mut gray_samples = Vec::with_capacity(n);
+                let gray_samples = rgba_to_luma8_batch(rgba);
                 let mut a_samples = Vec::with_capacity(n);
                 for chunk in rgba.as_chunks::<4>().0 {
-                    let r = chunk[0] as u32;
-                    let g = chunk[1] as u32;
-                    let b = chunk[2] as u32;
-                    gray_samples.push(((299 * r + 587 * g + 114 * b) / 1000).min(255) as u8);
                     a_samples.push(chunk[3]);
                 }
                 let gray_exp = expand_8to16_batch(&gray_samples)?;
@@ -453,12 +434,9 @@ pub(crate) fn convert_rgba_to_color_type(
                 }
             } else {
                 // Multi-byte (10,12,32): expands each sample
-                for chunk in rgba.as_chunks::<4>().0 {
-                    let r = chunk[0] as u32;
-                    let g = chunk[1] as u32;
-                    let b = chunk[2] as u32;
+                let gray_samples = rgba_to_luma8_batch(rgba);
+                for (gray, chunk) in gray_samples.into_iter().zip(rgba.as_chunks::<4>().0) {
                     let a = chunk[3];
-                    let gray = ((299 * r + 587 * g + 114 * b) / 1000).min(255) as u8;
 
                     match target_bit_depth {
                         10 | 12 => {
@@ -1081,6 +1059,32 @@ pub(crate) fn reduce_16to8_batch(samples_be: &[u8]) -> Result<Vec<u8>> {
         out.push(compress_sample_n_to_8bits(val, 16)?);
     }
     Ok(out)
+}
+
+/// Converts a full interleaved RGBA buffer to grayscale luma samples,
+/// bit-exact with the scalar per-pixel formula
+/// `Y = (299*R + 587*G + 114*B) / 1000` (alpha ignored). Uses the
+/// AVX2-accelerated `simd_sample_conversion::rgba_to_luma8` when the `simd`
+/// feature is enabled, falling back to the scalar formula otherwise (or if
+/// the batch helper errors for an unexpected reason, e.g. malformed length).
+pub(crate) fn rgba_to_luma8_batch(rgba: &[u8]) -> Vec<u8> {
+    #[cfg(feature = "simd")]
+    {
+        if let Ok(gray) = crate::simd_sample_conversion::rgba_to_luma8(rgba) {
+            return gray;
+        }
+    }
+
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| {
+            let r = chunk[0] as u32;
+            let g = chunk[1] as u32;
+            let b = chunk[2] as u32;
+            ((299 * r + 587 * g + 114 * b) / 1000).min(255) as u8
+        })
+        .collect()
 }
 
 pub(crate) fn bytes_per_row_for_bit_depth(width: u32, bit_depth: u8) -> Result<usize> {

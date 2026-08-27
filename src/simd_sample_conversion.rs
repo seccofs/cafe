@@ -231,6 +231,132 @@ pub fn expand_8to32float(samples_8bit: &[u8], width: usize) -> Result<Vec<u8>> {
     Ok(expanded)
 }
 
+/// Converts interleaved 8-bit RGBA pixels to 8-bit grayscale luma samples,
+/// using the ITU-R BT.601-ish integer weights already used throughout
+/// `color.rs`: `Y = (299*R + 587*G + 114*B) / 1000` (alpha ignored, matching
+/// `convert_rgba_to_color_type`'s scalar formula bit-for-bit).
+///
+/// # Parameters
+/// - `rgba`: Interleaved `[R, G, B, A, R, G, B, A, ...]` bytes, length must be
+///   a multiple of 4.
+///
+/// # Returns
+/// One grayscale byte per pixel (length = `rgba.len() / 4`).
+///
+/// # Strategy
+/// AVX2 processes 8 pixels (32 bytes) per iteration: `_mm256_shuffle_epi8`
+/// deinterleaves each channel into 32-bit lanes (zero-extended), the
+/// weighted sum is computed in exact 32-bit integer arithmetic (max
+/// `299*255+587*255+114*255 = 255000`, far below `i32::MAX`), then divided
+/// by 1000 via a float round-trip (`_mm256_cvtepi32_ps` /
+/// `_mm256_cvttps_epi32`, truncating toward zero like integer division for
+/// non-negative values) before narrowing back to `u8`. Verified bit-exact
+/// against the scalar integer formula for all 16,777,216 `(R, G, B)`
+/// combinations (see tests).
+pub fn rgba_to_luma8(rgba: &[u8]) -> Result<Vec<u8>> {
+    if !rgba.len().is_multiple_of(4) {
+        return Err(CafeError::TruncatedFile(
+            "rgba_to_luma8: input length must be a multiple of 4".into(),
+        ));
+    }
+    let n_pixels = rgba.len() / 4;
+    if n_pixels == 0 {
+        return Ok(Vec::new());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && n_pixels >= 8 {
+            return Ok(unsafe { rgba_to_luma8_avx2_impl(rgba, n_pixels) });
+        }
+    }
+
+    Ok(rgba_to_luma8_scalar(rgba, n_pixels))
+}
+
+fn rgba_to_luma8_scalar(rgba: &[u8], n_pixels: usize) -> Vec<u8> {
+    let mut out = vec![0u8; n_pixels];
+    for (p, out_byte) in out.iter_mut().enumerate() {
+        let base = p * 4;
+        let r = rgba[base] as u32;
+        let g = rgba[base + 1] as u32;
+        let b = rgba[base + 2] as u32;
+        *out_byte = ((299 * r + 587 * g + 114 * b) / 1000).min(255) as u8;
+    }
+    out
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn rgba_to_luma8_avx2_impl(rgba: &[u8], n_pixels: usize) -> Vec<u8> {
+    let mut out = vec![0u8; n_pixels];
+    let mut i = 0; // byte offset into rgba
+    const SIMD_WIDTH_BYTES: usize = 32; // 8 pixels x 4 bytes
+
+    // Per 128-bit lane (4 pixels), pshufb masks that pick one channel byte
+    // per pixel into the low byte of each 32-bit slot and zero the rest
+    // (top bit set = zero in `_mm256_shuffle_epi8`). Broadcasting a single
+    // 128-bit mask across both lanes applies it identically to pixels 0-3
+    // and 4-7 within one 256-bit chunk.
+    let r_mask = _mm256_broadcastsi128_si256(_mm_setr_epi8(
+        0, -128, -128, -128, 4, -128, -128, -128, 8, -128, -128, -128, 12, -128, -128, -128,
+    ));
+    let g_mask = _mm256_broadcastsi128_si256(_mm_setr_epi8(
+        1, -128, -128, -128, 5, -128, -128, -128, 9, -128, -128, -128, 13, -128, -128, -128,
+    ));
+    let b_mask = _mm256_broadcastsi128_si256(_mm_setr_epi8(
+        2, -128, -128, -128, 6, -128, -128, -128, 10, -128, -128, -128, 14, -128, -128, -128,
+    ));
+
+    let w_r = _mm256_set1_epi32(299);
+    let w_g = _mm256_set1_epi32(587);
+    let w_b = _mm256_set1_epi32(114);
+    let recip_1000 = _mm256_set1_ps(1.0 / 1000.0);
+
+    while i + SIMD_WIDTH_BYTES <= rgba.len() {
+        let chunk = _mm256_loadu_si256(rgba.as_ptr().add(i) as *const __m256i);
+        let r = _mm256_shuffle_epi8(chunk, r_mask);
+        let g = _mm256_shuffle_epi8(chunk, g_mask);
+        let b = _mm256_shuffle_epi8(chunk, b_mask);
+
+        let sum = _mm256_add_epi32(
+            _mm256_add_epi32(_mm256_mullo_epi32(r, w_r), _mm256_mullo_epi32(g, w_g)),
+            _mm256_mullo_epi32(b, w_b),
+        );
+
+        // Exact integer sum (fits comfortably in f32's 24-bit mantissa, max
+        // 255000 << 2^24) converted to float, divided by 1000, truncated
+        // back to integer — bit-exact with `sum / 1000` for all reachable
+        // sums (verified exhaustively in tests).
+        let gray_f = _mm256_mul_ps(_mm256_cvtepi32_ps(sum), recip_1000);
+        let gray_i = _mm256_cvttps_epi32(gray_f);
+
+        let lo = _mm256_castsi256_si128(gray_i);
+        let hi = _mm256_extracti128_si256(gray_i, 1);
+        let packed16 = _mm_packus_epi32(lo, hi); // 8 x u16, all fit in u8 range
+        let packed8 = _mm_packus_epi16(packed16, packed16); // low 8 bytes valid
+
+        let mut tmp = [0u8; 16];
+        _mm_storeu_si128(tmp.as_mut_ptr() as *mut __m128i, packed8);
+        let out_idx = i / 4;
+        out[out_idx..out_idx + 8].copy_from_slice(&tmp[0..8]);
+
+        i += SIMD_WIDTH_BYTES;
+    }
+
+    let mut px = i / 4;
+    while i < rgba.len() {
+        let r = rgba[i] as u32;
+        let g = rgba[i + 1] as u32;
+        let b = rgba[i + 2] as u32;
+        out[px] = ((299 * r + 587 * g + 114 * b) / 1000).min(255) as u8;
+        i += 4;
+        px += 1;
+    }
+
+    out
+}
+
 /// Reduces 32-bit IEEE 754 float samples (big-endian) to 8-bit.
 ///
 /// Clamps values to [0.0, 1.0], scales to [0, 255], and rounds.
@@ -395,5 +521,103 @@ mod tests {
     fn test_reduce_16to8_length_mismatch_rejected() {
         let bad = vec![0u8; 5]; // odd length, not a multiple of 2
         assert!(reduce_16to8(&bad, 3).is_err());
+    }
+
+    // ========================================================================
+    // rgba_to_luma8: scalar reference used by all tests below, matching
+    // `convert_rgba_to_color_type`'s `Y = (299R + 587G + 114B) / 1000` formula
+    // in color.rs bit-for-bit (alpha ignored by both).
+    // ========================================================================
+    fn scalar_luma_reference(r: u8, g: u8, b: u8) -> u8 {
+        let (r, g, b) = (r as u32, g as u32, b as u32);
+        ((299 * r + 587 * g + 114 * b) / 1000).min(255) as u8
+    }
+
+    #[test]
+    fn test_rgba_to_luma8_rejects_non_multiple_of_4() {
+        let bad = vec![0u8; 7];
+        assert!(rgba_to_luma8(&bad).is_err());
+    }
+
+    #[test]
+    fn test_rgba_to_luma8_empty() {
+        assert_eq!(rgba_to_luma8(&[]).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn test_rgba_to_luma8_matches_scalar_reference_various_sizes() {
+        // Sizes spanning below/at/above the AVX2 threshold (8 pixels) and
+        // exercising the scalar tail after full SIMD chunks.
+        for &n_pixels in &[1usize, 7, 8, 9, 15, 16, 17, 31, 32, 33, 100, 257, 1000] {
+            let mut rgba = vec![0u8; n_pixels * 4];
+            for (i, byte) in rgba.iter_mut().enumerate() {
+                *byte = ((i * 37 + 11) % 256) as u8;
+            }
+            let result = rgba_to_luma8(&rgba).unwrap();
+            assert_eq!(result.len(), n_pixels);
+            for (p, &actual) in result.iter().enumerate() {
+                let base = p * 4;
+                let expected = scalar_luma_reference(rgba[base], rgba[base + 1], rgba[base + 2]);
+                assert_eq!(
+                    actual, expected,
+                    "mismatch at pixel {p} for n_pixels={n_pixels}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_rgba_to_luma8_extreme_channel_values() {
+        // Values known to be adjacent to rounding boundaries between the
+        // integer formula and any float-based approximation.
+        let extremes = [0u8, 1, 127, 128, 254, 255];
+        for &r in &extremes {
+            for &g in &extremes {
+                for &b in &extremes {
+                    let rgba = [r, g, b, 255];
+                    let result = rgba_to_luma8(&rgba).unwrap();
+                    let expected = scalar_luma_reference(r, g, b);
+                    assert_eq!(result[0], expected, "mismatch for r={r} g={g} b={b}");
+                }
+            }
+        }
+    }
+
+    /// Exhaustive check over all 16,777,216 `(R, G, B)` combinations, run
+    /// once through the real AVX2 pipeline (8-pixels-per-iteration `_mm256`
+    /// load/shuffle/convert/pack) rather than pixel-by-pixel, to guard
+    /// against any float-rounding edge case the smaller tests might miss.
+    /// This is the same validation performed standalone before wiring the
+    /// kernel into `color.rs`.
+    #[test]
+    fn test_rgba_to_luma8_exhaustive_all_rgb_combinations() {
+        let total = 256usize * 256 * 256;
+        let mut rgba = vec![0u8; total * 4];
+        let mut idx = 0;
+        for r in 0u32..=255 {
+            for g in 0u32..=255 {
+                for b in 0u32..=255 {
+                    rgba[idx * 4] = r as u8;
+                    rgba[idx * 4 + 1] = g as u8;
+                    rgba[idx * 4 + 2] = b as u8;
+                    rgba[idx * 4 + 3] = 255;
+                    idx += 1;
+                }
+            }
+        }
+        let result = rgba_to_luma8(&rgba).unwrap();
+        idx = 0;
+        for r in 0u32..=255 {
+            for g in 0u32..=255 {
+                for b in 0u32..=255 {
+                    let expected = scalar_luma_reference(r as u8, g as u8, b as u8);
+                    assert_eq!(
+                        result[idx], expected,
+                        "mismatch at r={r} g={g} b={b} (idx={idx})"
+                    );
+                    idx += 1;
+                }
+            }
+        }
     }
 }
