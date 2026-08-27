@@ -82,7 +82,9 @@ jobs:
         with:
           workspaces: fuzz -> target
 
-      - uses: taiki-e/install-action@cargo-fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
 
       - name: Run ${{ matrix.target }} for 60s
         run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60
