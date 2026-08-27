@@ -31,7 +31,7 @@ fn gray_value(r: u8, g: u8, b: u8) -> u8 {
 fn expected_for(color_type: u8) -> Vec<u8> {
     let src = make_test_image().into_raw();
     let mut expected = src;
-    for px in expected.chunks_exact_mut(4) {
+    for px in expected.as_chunks_mut::<4>().0.iter_mut() {
         let (r, g, b) = (px[0], px[1], px[2]);
         match color_type {
             0 => {
