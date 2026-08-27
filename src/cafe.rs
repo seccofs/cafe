@@ -4273,6 +4273,102 @@ mod tests {
         assert_eq!(rgb_16.len(), 6); // 3 channels × 2 bytes
     }
 
+    /// Regression test for the SIMD-batched bit_depth=16 expansion path
+    /// (color.rs `expand_8to16_batch`): output must be bit-for-bit identical
+    /// to the original per-sample `expand_sample_8_to_n_bits(_, 16)` formula
+    /// for every color type, including full-range values (0x00 and 0xFF).
+    #[test]
+    fn test_convert_rgba_to_color_type_16bit_bit_exact_all_types() {
+        // 4 pixels covering edge values (0, 255) and mixed channels.
+        let rgba: Vec<u8> = vec![
+            0, 0, 0, 0, // pixel 0: all zero
+            255, 255, 255, 255, // pixel 1: all max
+            255, 0, 128, 64, // pixel 2: mixed
+            17, 200, 3, 250, // pixel 3: mixed
+        ];
+        let width = 4u32;
+        let height = 1u32;
+
+        for &(color_type, channels) in &[
+            (COLOR_TYPE_GRAY, 1usize),
+            (COLOR_TYPE_RGB, 3usize),
+            (COLOR_TYPE_GRAY_ALPHA, 2usize),
+            (COLOR_TYPE_RGBA, 4usize),
+        ] {
+            let out = convert_rgba_to_color_type(&rgba, width, height, color_type, 16).unwrap();
+            assert_eq!(
+                out.len(),
+                4 * channels * 2,
+                "unexpected length for color_type {color_type}"
+            );
+            // Every 16-bit big-endian sample must have identical high and low
+            // bytes (byte-replication scaling: v*65535/255 == (v<<8)|v).
+            for chunk in out.chunks_exact(2) {
+                assert_eq!(
+                    chunk[0], chunk[1],
+                    "16-bit sample {:?} is not byte-replicated for color_type {color_type}",
+                    chunk
+                );
+            }
+        }
+    }
+
+    /// Roundtrip RGBA -> color_type (bit_depth=16) -> RGBA must recover the
+    /// original 8-bit values exactly (lossless for uint sample_format),
+    /// exercising both the SIMD expand and SIMD reduce batched paths.
+    #[test]
+    fn test_convert_color_type_16bit_roundtrip_all_types() {
+        let width = 37u32; // odd width, exercises AVX2 tail handling
+        let height = 3u32;
+        let n = (width * height) as usize;
+        let rgba: Vec<u8> = (0..n * 4).map(|i| ((i * 53) % 256) as u8).collect();
+
+        for &color_type in &[
+            COLOR_TYPE_GRAY,
+            COLOR_TYPE_RGB,
+            COLOR_TYPE_GRAY_ALPHA,
+            COLOR_TYPE_RGBA,
+        ] {
+            let encoded = convert_rgba_to_color_type(&rgba, width, height, color_type, 16).unwrap();
+            let decoded =
+                convert_color_type_to_rgba(&encoded, width, height, color_type, 16).unwrap();
+
+            match color_type {
+                COLOR_TYPE_RGBA => {
+                    assert_eq!(decoded, rgba, "RGBA 16-bit roundtrip mismatch");
+                }
+                COLOR_TYPE_GRAY => {
+                    // Gray replicates Y to R,G,B and forces alpha=0xFF; just
+                    // check length and internal RGB replication.
+                    assert_eq!(decoded.len(), n * 4);
+                    for px in decoded.chunks_exact(4) {
+                        assert_eq!(px[0], px[1]);
+                        assert_eq!(px[1], px[2]);
+                        assert_eq!(px[3], 0xFF);
+                    }
+                }
+                COLOR_TYPE_RGB => {
+                    assert_eq!(decoded.len(), n * 4);
+                    for (orig, dec) in rgba.chunks_exact(4).zip(decoded.chunks_exact(4)) {
+                        assert_eq!(dec[0], orig[0]);
+                        assert_eq!(dec[1], orig[1]);
+                        assert_eq!(dec[2], orig[2]);
+                        assert_eq!(dec[3], 0xFF); // alpha forced opaque, original discarded
+                    }
+                }
+                COLOR_TYPE_GRAY_ALPHA => {
+                    assert_eq!(decoded.len(), n * 4);
+                    for (orig, dec) in rgba.chunks_exact(4).zip(decoded.chunks_exact(4)) {
+                        assert_eq!(dec[0], dec[1]);
+                        assert_eq!(dec[1], dec[2]);
+                        assert_eq!(dec[3], orig[3]); // alpha preserved
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
     #[test]
     fn test_convert_rgba_to_rgba_32bit() {
         // Convert RGBA -> RGBA 32-bit

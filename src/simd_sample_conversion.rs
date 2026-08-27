@@ -10,11 +10,14 @@
 //! automatically. No special build flags are required.
 //!
 //! # Status
-//! These functions are not yet wired into the encode/decode pipeline in
-//! `color.rs` (bit-depth conversion there uses `expand_sample_8_to_n_bits`
-//! and friends instead). They are kept public and tested as a
-//! ready-to-use building block for a future integration; hence the
-//! module-wide `allow(dead_code)`.
+//! `expand_8to16`/`reduce_16to8` are wired into `color.rs`'s bit_depth=16
+//! GRAY/RGB/GRAY_ALPHA/RGBA conversion paths (uint sample_format only).
+//! `expand_8to32float`/`reduce_32float_to8` remain unused for now: they are
+//! plain scalar code (no AVX2 kernel), and their rounding does not exactly
+//! match `u8_to_float`/`float_to_u8` (division vs. reciprocal
+//! multiplication can differ by 1 ULP), so wiring them up would risk a
+//! silent output change for zero performance benefit. Kept public/tested as
+//! a building block for a future proper AVX2 float implementation.
 
 #![allow(dead_code)]
 
@@ -33,8 +36,11 @@ use std::arch::x86_64::*;
 /// Vector of 16-bit big-endian samples (each occupies 2 bytes)
 ///
 /// # Strategy
-/// - For each 8-bit value: expand to 16-bit by shifting left 8 bits
-/// - Example: 0x12 → 0x1200 (big-endian: [0x12, 0x00])
+/// - For each 8-bit value `v`: expand to 16-bit by byte replication,
+///   `(v << 8) | v`, which is exactly `v * 65535 / 255` (full-range
+///   scaling, matching `expand_sample_8_to_n_bits(v, 16)` bit-for-bit) —
+///   e.g. 0xFF → 0xFFFF, not 0xFF00. Since both bytes of the big-endian
+///   pair equal `v`, this is written as `[v, v]`.
 pub fn expand_8to16(samples_8bit: &[u8], width: usize) -> Result<Vec<u8>> {
     if width == 0 {
         return Ok(Vec::new());
@@ -63,7 +69,7 @@ fn expand_8to16_scalar(samples_8bit: &[u8], width: usize, total_bytes: usize) ->
     for (j, &sample) in samples_8bit.iter().enumerate().take(width) {
         let out_idx = j * 2;
         expanded[out_idx] = sample;
-        expanded[out_idx + 1] = 0;
+        expanded[out_idx + 1] = sample;
     }
     expanded
 }
@@ -80,13 +86,16 @@ unsafe fn expand_8to16_avx2_impl(samples_8bit: &[u8], width: usize, total_bytes:
 
         let low_128 = _mm256_castsi256_si128(loaded);
         let high_128 = _mm256_extracti128_si256(loaded, 1);
-        let zeros = _mm_setzero_si128();
 
-        // Big-endian 16-bit expansion: [sample, 0x00] per output pair.
-        let expanded_low = _mm_unpacklo_epi8(low_128, zeros); // samples 0..7
-        let expanded_mid = _mm_unpackhi_epi8(low_128, zeros); // samples 8..15
-        let expanded_high_low = _mm_unpacklo_epi8(high_128, zeros); // samples 16..23
-        let expanded_high_high = _mm_unpackhi_epi8(high_128, zeros); // samples 24..31
+        // Big-endian 16-bit expansion via byte replication: [sample, sample]
+        // per output pair (full-range scaling, matches `(v << 8) | v`).
+        // Since both bytes of each pair are identical, interleaving a lane
+        // with itself (instead of with zeros) produces the correct result
+        // regardless of byte order.
+        let expanded_low = _mm_unpacklo_epi8(low_128, low_128); // samples 0..7
+        let expanded_mid = _mm_unpackhi_epi8(low_128, low_128); // samples 8..15
+        let expanded_high_low = _mm_unpacklo_epi8(high_128, high_128); // samples 16..23
+        let expanded_high_high = _mm_unpackhi_epi8(high_128, high_128); // samples 24..31
 
         let dst_ptr = expanded.as_mut_ptr().add(i * 2);
         _mm_storeu_si128(dst_ptr as *mut __m128i, expanded_low);
@@ -100,7 +109,7 @@ unsafe fn expand_8to16_avx2_impl(samples_8bit: &[u8], width: usize, total_bytes:
     for (j, &sample) in samples_8bit.iter().enumerate().take(width).skip(i) {
         let out_idx = j * 2;
         expanded[out_idx] = sample;
-        expanded[out_idx + 1] = 0;
+        expanded[out_idx + 1] = sample;
     }
 
     expanded
@@ -263,6 +272,59 @@ mod tests {
         let expanded = expand_8to16(&original, original.len()).unwrap();
         let reduced = reduce_16to8(&expanded, original.len()).unwrap();
         assert_eq!(original, reduced, "8→16→8 roundtrip failed");
+    }
+
+    /// `expand_8to16` must be bit-for-bit identical to
+    /// `color::expand_sample_8_to_n_bits(v, 16)` (byte replication / full-range
+    /// scaling, `v * 65535 / 255`), not a plain `v << 8` shift — otherwise
+    /// wiring it into `color.rs` would silently change encoded output
+    /// (e.g. 0xFF would map to 0xFF00 instead of 0xFFFF).
+    #[test]
+    fn test_expand_8to16_matches_full_range_scaling() {
+        let original: Vec<u8> = (0..=255u8).collect();
+        let expanded = expand_8to16(&original, original.len()).unwrap();
+        for (i, &v) in original.iter().enumerate() {
+            let expected = crate::color::expand_sample_8_to_n_bits(v, 16).unwrap();
+            let actual = u16::from_be_bytes([expanded[i * 2], expanded[i * 2 + 1]]);
+            assert_eq!(
+                actual, expected,
+                "mismatch for v={v}: got {actual:#06x}, expected {expected:#06x}"
+            );
+        }
+    }
+
+    /// AVX2 path (width >= 32) must also match, exercising the vectorized
+    /// kernel rather than just the scalar fallback.
+    #[test]
+    fn test_expand_8to16_avx2_matches_full_range_scaling_large() {
+        let original: Vec<u8> = (0..1024usize).map(|i| (i % 256) as u8).collect();
+        let expanded = expand_8to16(&original, original.len()).unwrap();
+        for (i, &v) in original.iter().enumerate() {
+            let expected = crate::color::expand_sample_8_to_n_bits(v, 16).unwrap();
+            let actual = u16::from_be_bytes([expanded[i * 2], expanded[i * 2 + 1]]);
+            assert_eq!(actual, expected, "mismatch for index {i}, v={v}");
+        }
+    }
+
+    /// `reduce_16to8` must match `color::compress_sample_n_to_8bits(v, 16)`
+    /// (take the high byte), which is what's actually used on the decode
+    /// path after wiring.
+    #[test]
+    fn test_reduce_16to8_matches_compress_sample() {
+        let width = 300; // exercises both AVX2 (>=16) and scalar tail
+        let samples_16: Vec<u16> = (0..width).map(|i| ((i * 37) % 65536) as u16).collect();
+        let mut bytes = Vec::with_capacity(width * 2);
+        for &s in &samples_16 {
+            bytes.extend_from_slice(&s.to_be_bytes());
+        }
+        let reduced = reduce_16to8(&bytes, width).unwrap();
+        for (i, &s) in samples_16.iter().enumerate() {
+            let expected = crate::color::compress_sample_n_to_8bits(s, 16).unwrap();
+            assert_eq!(
+                reduced[i], expected,
+                "mismatch for index {i}, sample={s:#06x}"
+            );
+        }
     }
 
     #[test]

@@ -284,8 +284,20 @@ pub(crate) fn convert_rgba_to_color_type(
                 } else {
                     out.extend_from_slice(&all_samples);
                 }
+            } else if target_bit_depth == 16 {
+                // bit_depth=16: compute all gray samples first, then expand the
+                // whole row in one batched call (SIMD-accelerated on x86_64/AVX2,
+                // bit-exact with expand_sample_8_to_n_bits(_, 16)).
+                let mut gray_samples = Vec::with_capacity(pixel_count);
+                for chunk in rgba.as_chunks::<4>().0 {
+                    let r = chunk[0] as u32;
+                    let g = chunk[1] as u32;
+                    let b = chunk[2] as u32;
+                    gray_samples.push(((299 * r + 587 * g + 114 * b) / 1000).min(255) as u8);
+                }
+                out.extend_from_slice(&expand_8to16_batch(&gray_samples)?);
             } else {
-                // Multi-byte (10,12,16,32): expands 8-bit values to N-bit big-endian
+                // Multi-byte (10,12,32): expands 8-bit values to N-bit big-endian
                 for chunk in rgba.as_chunks::<4>().0 {
                     let r = chunk[0] as u32;
                     let g = chunk[1] as u32;
@@ -293,7 +305,7 @@ pub(crate) fn convert_rgba_to_color_type(
                     let gray = ((299 * r + 587 * g + 114 * b) / 1000).min(255) as u8;
 
                     match target_bit_depth {
-                        10 | 12 | 16 => {
+                        10 | 12 => {
                             let expanded = expand_sample_8_to_n_bits(gray, target_bit_depth)?;
                             out.extend_from_slice(&expanded.to_be_bytes());
                         }
@@ -324,15 +336,35 @@ pub(crate) fn convert_rgba_to_color_type(
                     out.push(chunk[1]); // G
                     out.push(chunk[2]); // B
                 }
+            } else if target_bit_depth == 16 {
+                // bit_depth=16: deinterleave channels, batch-expand each with
+                // the SIMD-accelerated helper, then re-interleave R,G,B.
+                let n = rgba.as_chunks::<4>().0.len();
+                let mut r_samples = Vec::with_capacity(n);
+                let mut g_samples = Vec::with_capacity(n);
+                let mut b_samples = Vec::with_capacity(n);
+                for chunk in rgba.as_chunks::<4>().0 {
+                    r_samples.push(chunk[0]);
+                    g_samples.push(chunk[1]);
+                    b_samples.push(chunk[2]);
+                }
+                let r_exp = expand_8to16_batch(&r_samples)?;
+                let g_exp = expand_8to16_batch(&g_samples)?;
+                let b_exp = expand_8to16_batch(&b_samples)?;
+                for i in 0..n {
+                    out.extend_from_slice(&r_exp[i * 2..i * 2 + 2]);
+                    out.extend_from_slice(&g_exp[i * 2..i * 2 + 2]);
+                    out.extend_from_slice(&b_exp[i * 2..i * 2 + 2]);
+                }
             } else {
-                // RGB multi-byte (10,12,16,32): expands each channel
+                // RGB multi-byte (10,12,32): expands each channel
                 for chunk in rgba.as_chunks::<4>().0 {
                     let r = chunk[0];
                     let g = chunk[1];
                     let b = chunk[2];
 
                     match target_bit_depth {
-                        10 | 12 | 16 => {
+                        10 | 12 => {
                             let r_exp = expand_sample_8_to_n_bits(r, target_bit_depth)?;
                             let g_exp = expand_sample_8_to_n_bits(g, target_bit_depth)?;
                             let b_exp = expand_sample_8_to_n_bits(b, target_bit_depth)?;
@@ -400,8 +432,27 @@ pub(crate) fn convert_rgba_to_color_type(
                 } else {
                     out.extend_from_slice(&all_samples);
                 }
+            } else if target_bit_depth == 16 {
+                // bit_depth=16: deinterleave gray/alpha, batch-expand each,
+                // then re-interleave.
+                let n = rgba.as_chunks::<4>().0.len();
+                let mut gray_samples = Vec::with_capacity(n);
+                let mut a_samples = Vec::with_capacity(n);
+                for chunk in rgba.as_chunks::<4>().0 {
+                    let r = chunk[0] as u32;
+                    let g = chunk[1] as u32;
+                    let b = chunk[2] as u32;
+                    gray_samples.push(((299 * r + 587 * g + 114 * b) / 1000).min(255) as u8);
+                    a_samples.push(chunk[3]);
+                }
+                let gray_exp = expand_8to16_batch(&gray_samples)?;
+                let a_exp = expand_8to16_batch(&a_samples)?;
+                for i in 0..n {
+                    out.extend_from_slice(&gray_exp[i * 2..i * 2 + 2]);
+                    out.extend_from_slice(&a_exp[i * 2..i * 2 + 2]);
+                }
             } else {
-                // Multi-byte (10,12,16,32): expands each sample
+                // Multi-byte (10,12,32): expands each sample
                 for chunk in rgba.as_chunks::<4>().0 {
                     let r = chunk[0] as u32;
                     let g = chunk[1] as u32;
@@ -410,7 +461,7 @@ pub(crate) fn convert_rgba_to_color_type(
                     let gray = ((299 * r + 587 * g + 114 * b) / 1000).min(255) as u8;
 
                     match target_bit_depth {
-                        10 | 12 | 16 => {
+                        10 | 12 => {
                             let gray_exp = expand_sample_8_to_n_bits(gray, target_bit_depth)?;
                             let a_exp = expand_sample_8_to_n_bits(a, target_bit_depth)?;
                             out.extend_from_slice(&gray_exp.to_be_bytes());
@@ -441,8 +492,32 @@ pub(crate) fn convert_rgba_to_color_type(
             if target_bit_depth == 8 {
                 // RGBA 8-bit: no conversion
                 out.extend_from_slice(rgba);
+            } else if target_bit_depth == 16 {
+                // bit_depth=16: deinterleave R,G,B,A, batch-expand each,
+                // then re-interleave.
+                let n = rgba.as_chunks::<4>().0.len();
+                let mut r_samples = Vec::with_capacity(n);
+                let mut g_samples = Vec::with_capacity(n);
+                let mut b_samples = Vec::with_capacity(n);
+                let mut a_samples = Vec::with_capacity(n);
+                for chunk in rgba.as_chunks::<4>().0 {
+                    r_samples.push(chunk[0]);
+                    g_samples.push(chunk[1]);
+                    b_samples.push(chunk[2]);
+                    a_samples.push(chunk[3]);
+                }
+                let r_exp = expand_8to16_batch(&r_samples)?;
+                let g_exp = expand_8to16_batch(&g_samples)?;
+                let b_exp = expand_8to16_batch(&b_samples)?;
+                let a_exp = expand_8to16_batch(&a_samples)?;
+                for i in 0..n {
+                    out.extend_from_slice(&r_exp[i * 2..i * 2 + 2]);
+                    out.extend_from_slice(&g_exp[i * 2..i * 2 + 2]);
+                    out.extend_from_slice(&b_exp[i * 2..i * 2 + 2]);
+                    out.extend_from_slice(&a_exp[i * 2..i * 2 + 2]);
+                }
             } else {
-                // RGBA multi-byte (10,12,16,32): expands each channel
+                // RGBA multi-byte (10,12,32): expands each channel
                 for chunk in rgba.as_chunks::<4>().0 {
                     let r = chunk[0];
                     let g = chunk[1];
@@ -450,7 +525,7 @@ pub(crate) fn convert_rgba_to_color_type(
                     let a = chunk[3];
 
                     match target_bit_depth {
-                        10 | 12 | 16 => {
+                        10 | 12 => {
                             let r_exp = expand_sample_8_to_n_bits(r, target_bit_depth)?;
                             let g_exp = expand_sample_8_to_n_bits(g, target_bit_depth)?;
                             let b_exp = expand_sample_8_to_n_bits(b, target_bit_depth)?;
@@ -659,12 +734,28 @@ pub(crate) fn convert_color_type_to_rgba(
         let mut decompacted = Vec::new();
 
         match color_type {
+            COLOR_TYPE_GRAY if bit_depth == 16 => {
+                // Single channel: reduce_16to8_batch can be applied directly
+                // to the whole (already contiguous) big-endian sample stream.
+                let n = width as usize * height as usize;
+                let required = n.checked_mul(2).ok_or_else(|| {
+                    CafeError::TruncatedFile("Gray 16-bit size calculation overflow".into())
+                })?;
+                if data.len() < required {
+                    return Err(CafeError::TruncatedFile(format!(
+                        "convert_color_type_to_rgba: insufficient Gray 16-bit data, expected {} got {}",
+                        required,
+                        data.len()
+                    )));
+                }
+                reduce_16to8_batch(&data[..required])?
+            }
             COLOR_TYPE_GRAY => {
                 // Reads each big-endian value and compresses to 8-bit
                 let mut offset = 0;
                 for _ in 0..(width as usize * height as usize) {
                     match bit_depth {
-                        10 | 12 | 16 => {
+                        10 | 12 => {
                             let val = read_u16_be(data, offset)?;
                             let compressed = compress_sample_n_to_8bits(val, bit_depth)?;
                             decompacted.push(compressed);
@@ -681,12 +772,47 @@ pub(crate) fn convert_color_type_to_rgba(
                 }
                 decompacted
             }
+            COLOR_TYPE_RGB if bit_depth == 16 => {
+                // Deinterleave R,G,B (each 2 bytes BE), batch-reduce, re-interleave.
+                let n = width as usize * height as usize;
+                let required = n.checked_mul(6).ok_or_else(|| {
+                    CafeError::TruncatedFile("RGB 16-bit size calculation overflow".into())
+                })?;
+                if data.len() < required {
+                    return Err(CafeError::TruncatedFile(format!(
+                        "convert_color_type_to_rgba: insufficient RGB 16-bit data, expected {} got {}",
+                        required,
+                        data.len()
+                    )));
+                }
+                let (mut r_bytes, mut g_bytes, mut b_bytes) = (
+                    Vec::with_capacity(n * 2),
+                    Vec::with_capacity(n * 2),
+                    Vec::with_capacity(n * 2),
+                );
+                for i in 0..n {
+                    let base = i * 6;
+                    r_bytes.extend_from_slice(&data[base..base + 2]);
+                    g_bytes.extend_from_slice(&data[base + 2..base + 4]);
+                    b_bytes.extend_from_slice(&data[base + 4..base + 6]);
+                }
+                let r = reduce_16to8_batch(&r_bytes)?;
+                let g = reduce_16to8_batch(&g_bytes)?;
+                let b = reduce_16to8_batch(&b_bytes)?;
+                let mut out = Vec::with_capacity(n * 3);
+                for i in 0..n {
+                    out.push(r[i]);
+                    out.push(g[i]);
+                    out.push(b[i]);
+                }
+                out
+            }
             COLOR_TYPE_RGB => {
                 // Reads 3 big-endian values per pixel
                 let mut offset = 0;
                 for _ in 0..(width as usize * height as usize) {
                     match bit_depth {
-                        10 | 12 | 16 => {
+                        10 | 12 => {
                             let r = read_u16_be(data, offset)?;
                             let g = read_u16_be(data, offset + 2)?;
                             let b = read_u16_be(data, offset + 4)?;
@@ -709,12 +835,41 @@ pub(crate) fn convert_color_type_to_rgba(
                 }
                 decompacted
             }
+            COLOR_TYPE_GRAY_ALPHA if bit_depth == 16 => {
+                // Deinterleave gray/alpha (each 2 bytes BE), batch-reduce, re-interleave.
+                let n = width as usize * height as usize;
+                let required = n.checked_mul(4).ok_or_else(|| {
+                    CafeError::TruncatedFile("Gray+Alpha 16-bit size calculation overflow".into())
+                })?;
+                if data.len() < required {
+                    return Err(CafeError::TruncatedFile(format!(
+                        "convert_color_type_to_rgba: insufficient Gray+Alpha 16-bit data, expected {} got {}",
+                        required,
+                        data.len()
+                    )));
+                }
+                let (mut gray_bytes, mut alpha_bytes) =
+                    (Vec::with_capacity(n * 2), Vec::with_capacity(n * 2));
+                for i in 0..n {
+                    let base = i * 4;
+                    gray_bytes.extend_from_slice(&data[base..base + 2]);
+                    alpha_bytes.extend_from_slice(&data[base + 2..base + 4]);
+                }
+                let gray = reduce_16to8_batch(&gray_bytes)?;
+                let alpha = reduce_16to8_batch(&alpha_bytes)?;
+                let mut out = Vec::with_capacity(n * 2);
+                for i in 0..n {
+                    out.push(gray[i]);
+                    out.push(alpha[i]);
+                }
+                out
+            }
             COLOR_TYPE_GRAY_ALPHA => {
                 // Reads 2 big-endian values per pixel
                 let mut offset = 0;
                 for _ in 0..(width as usize * height as usize) {
                     match bit_depth {
-                        10 | 12 | 16 => {
+                        10 | 12 => {
                             let gray = read_u16_be(data, offset)?;
                             let alpha = read_u16_be(data, offset + 2)?;
                             decompacted.push(compress_sample_n_to_8bits(gray, bit_depth)?);
@@ -733,12 +888,51 @@ pub(crate) fn convert_color_type_to_rgba(
                 }
                 decompacted
             }
+            COLOR_TYPE_RGBA if bit_depth == 16 => {
+                // Deinterleave R,G,B,A (each 2 bytes BE), batch-reduce, re-interleave.
+                let n = width as usize * height as usize;
+                let required = n.checked_mul(8).ok_or_else(|| {
+                    CafeError::TruncatedFile("RGBA 16-bit size calculation overflow".into())
+                })?;
+                if data.len() < required {
+                    return Err(CafeError::TruncatedFile(format!(
+                        "convert_color_type_to_rgba: insufficient RGBA 16-bit data, expected {} got {}",
+                        required,
+                        data.len()
+                    )));
+                }
+                let (mut r_bytes, mut g_bytes, mut b_bytes, mut a_bytes) = (
+                    Vec::with_capacity(n * 2),
+                    Vec::with_capacity(n * 2),
+                    Vec::with_capacity(n * 2),
+                    Vec::with_capacity(n * 2),
+                );
+                for i in 0..n {
+                    let base = i * 8;
+                    r_bytes.extend_from_slice(&data[base..base + 2]);
+                    g_bytes.extend_from_slice(&data[base + 2..base + 4]);
+                    b_bytes.extend_from_slice(&data[base + 4..base + 6]);
+                    a_bytes.extend_from_slice(&data[base + 6..base + 8]);
+                }
+                let r = reduce_16to8_batch(&r_bytes)?;
+                let g = reduce_16to8_batch(&g_bytes)?;
+                let b = reduce_16to8_batch(&b_bytes)?;
+                let a = reduce_16to8_batch(&a_bytes)?;
+                let mut out = Vec::with_capacity(n * 4);
+                for i in 0..n {
+                    out.push(r[i]);
+                    out.push(g[i]);
+                    out.push(b[i]);
+                    out.push(a[i]);
+                }
+                out
+            }
             COLOR_TYPE_RGBA => {
                 // Reads 4 big-endian values per pixel
                 let mut offset = 0;
                 for _ in 0..(width as usize * height as usize) {
                     match bit_depth {
-                        10 | 12 | 16 => {
+                        10 | 12 => {
                             let r = read_u16_be(data, offset)?;
                             let g = read_u16_be(data, offset + 2)?;
                             let b = read_u16_be(data, offset + 4)?;
@@ -846,6 +1040,48 @@ pub(crate) fn convert_color_type_to_rgba(
 }
 
 // Helper functions for sample manipulation
+
+/// Expands a batch of 8-bit samples to 16-bit big-endian, bit-exact with
+/// `expand_sample_8_to_n_bits(_, 16)` (full-range byte-replication scaling).
+/// Uses the AVX2-accelerated `simd_sample_conversion::expand_8to16` when the
+/// `simd` feature is enabled, falling back to the scalar per-sample formula
+/// otherwise (or if the batch helper errors for an unexpected reason).
+pub(crate) fn expand_8to16_batch(samples: &[u8]) -> Result<Vec<u8>> {
+    #[cfg(feature = "simd")]
+    {
+        if let Ok(expanded) = crate::simd_sample_conversion::expand_8to16(samples, samples.len()) {
+            return Ok(expanded);
+        }
+    }
+
+    let mut out = Vec::with_capacity(samples.len() * 2);
+    for &s in samples {
+        let expanded = expand_sample_8_to_n_bits(s, 16)?;
+        out.extend_from_slice(&expanded.to_be_bytes());
+    }
+    Ok(out)
+}
+
+/// Reduces a batch of 16-bit big-endian samples to 8-bit, bit-exact with
+/// `compress_sample_n_to_8bits(_, 16)` (take the high byte). Uses the
+/// AVX2-accelerated `simd_sample_conversion::reduce_16to8` when the `simd`
+/// feature is enabled, falling back to scalar otherwise.
+pub(crate) fn reduce_16to8_batch(samples_be: &[u8]) -> Result<Vec<u8>> {
+    let width = samples_be.len() / 2;
+    #[cfg(feature = "simd")]
+    {
+        if let Ok(reduced) = crate::simd_sample_conversion::reduce_16to8(samples_be, width) {
+            return Ok(reduced);
+        }
+    }
+
+    let mut out = Vec::with_capacity(width);
+    for i in 0..width {
+        let val = read_u16_be(samples_be, i * 2)?;
+        out.push(compress_sample_n_to_8bits(val, 16)?);
+    }
+    Ok(out)
+}
 
 pub(crate) fn bytes_per_row_for_bit_depth(width: u32, bit_depth: u8) -> Result<usize> {
     if bit_depth != 1 && bit_depth != 2 && bit_depth != 4 && bit_depth != 8 {
@@ -1097,22 +1333,46 @@ pub(crate) fn pack_indices_row(row: &[u8], bit_depth: u8) -> Result<Vec<u8>> {
         )));
     }
 
+    // Validate up front: each value must fit in bit_depth bits. This mirrors
+    // the guarantee the scalar implementation used to provide inline, and is
+    // required because the SIMD bulk path below does not itself reject
+    // out-of-range values (it silently masks them for speed).
     let max_value = (1u8 << bit_depth) - 1; // 2^bit_depth - 1
-    let per_byte = 8 / bit_depth as usize;
-
-    let bpr = (row.len() * bit_depth as usize).div_ceil(8);
-    let mut out = vec![0u8; bpr];
-    let mask = max_value;
-
-    for (i, &idx) in row.iter().enumerate() {
-        // Validation: each value must fit in bit_depth bits
+    for &idx in row {
         if idx > max_value {
             return Err(CafeError::UnsupportedFeature(format!(
                 "Valor {} does not fit in {} bits (maximum {})",
                 idx, bit_depth, max_value
             )));
         }
+    }
 
+    // Try SIMD path (AVX2 on x86_64 with runtime fallback to scalar internally).
+    #[cfg(feature = "simd")]
+    {
+        let simd_result = match bit_depth {
+            1 => crate::simd_packing::pack_1bit_samples(row, row.len()),
+            2 => crate::simd_packing::pack_2bit_samples(row, row.len()),
+            4 => crate::simd_packing::pack_4bit_samples(row, row.len()),
+            _ => unreachable!(),
+        };
+        if let Ok(packed) = simd_result {
+            return Ok(packed);
+        }
+    }
+
+    pack_indices_row_scalar(row, bit_depth, max_value)
+}
+
+/// Scalar fallback for pack_indices_row (used when SIMD feature is disabled
+/// or the SIMD path errors out for an unexpected reason).
+fn pack_indices_row_scalar(row: &[u8], bit_depth: u8, max_value: u8) -> Result<Vec<u8>> {
+    let per_byte = 8 / bit_depth as usize;
+    let bpr = (row.len() * bit_depth as usize).div_ceil(8);
+    let mut out = vec![0u8; bpr];
+    let mask = max_value;
+
+    for (i, &idx) in row.iter().enumerate() {
         let byte_idx = i / per_byte;
         let slot = i % per_byte; // 0 = most significant position within the byte
         let shift = 8 - bit_depth as usize * (slot + 1);
@@ -1390,6 +1650,26 @@ pub(crate) fn unpack_indices_row(packed: &[u8], bit_depth: u8, width: usize) -> 
         )));
     }
 
+    // Try SIMD path (AVX2 on x86_64 with runtime fallback to scalar internally).
+    #[cfg(feature = "simd")]
+    {
+        let simd_result = match bit_depth {
+            1 => crate::simd_packing::unpack_1bit_samples(packed, width),
+            2 => crate::simd_packing::unpack_2bit_samples(packed, width),
+            4 => crate::simd_packing::unpack_4bit_samples(packed, width),
+            _ => unreachable!(),
+        };
+        if let Ok(unpacked) = simd_result {
+            return Ok(unpacked);
+        }
+    }
+
+    unpack_indices_row_scalar(packed, bit_depth, width)
+}
+
+/// Scalar fallback for unpack_indices_row (used when SIMD feature is disabled
+/// or the SIMD path errors out for an unexpected reason).
+fn unpack_indices_row_scalar(packed: &[u8], bit_depth: u8, width: usize) -> Result<Vec<u8>> {
     let per_byte = 8 / bit_depth as usize;
     let mask = (1u8 << bit_depth) - 1;
     let mut out = Vec::with_capacity(width);
