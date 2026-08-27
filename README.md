@@ -70,6 +70,8 @@ cafe/
 │   ├── color.rs                   # Color conversions, pack/unpack, float/half
 │   ├── filter.rs                  # 16 predictive filters + heuristics (with SIMD integration)
 │   ├── simd.rs                    # AVX2 vectorized filters 1-3 (v1.1+, optional feature)
+│   ├── simd_packing.rs            # AVX2 pack/unpack for 1/2/4-bit samples (v1.2+)
+│   ├── simd_sample_conversion.rs  # AVX2 8→16/32 expansion, 16/32→8 reduction (v1.2+)
 │   ├── shuffle.rs                 # Byte-shuffle (Filter Method=1, v1.1)
 │   ├── tonemap.rs                 # HDR tone-mapping (EOTF, primaries, operators, v1.1)
 │   ├── interlace.rs               # Adam7 and even/odd

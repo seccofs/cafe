@@ -333,5 +333,5 @@ Before submitting a PR:
 
 ---
 
-**Last updated**: August 10, 2026  
-**CAFE version**: v1.1.0
+**Last updated**: August 11, 2026  
+**CAFE version**: v1.2.1
