@@ -8,21 +8,25 @@
 //! - Filter 6 (Gradient): pixel - (left + above - diagonal), pure mod-256 arithmetic
 //! - Filters 9-12 (4-way Directional): weighted averages of left/above/diagonal
 //! - Filter 14 (TR-Directional): bilinear average of left/above/diagonal/top-right
+//! - Filter 4 (Paeth), Filter 13 (Context-Based): via 16-bit widening + branchless blend
+//! - Filter 5 (MED), Filter 7 (Simple Median): via unsigned byte min/max, no widening
+//! - Filter 8 (2nd Order): via 16-bit widening of left/above/`LL`/`UU`
 //!
-//! Filters 4, 5, 7, 8, 13, 15 (Paeth, MED, Simple Median, 2nd Order, Context,
-//! Weighted) are less vectorizable due to conditional/branchy logic or
-//! in-flight adaptive state; they use scalar fallback only.
+//! Filter 15 (Weighted) is not vectorized: its prediction depends on adaptive
+//! state carried byte-by-byte across the whole block, which is an inherently
+//! sequential (IIR-like) dependency and uses scalar fallback only.
 //!
 //! # Encode-only Vectorization for Left-Dependent Filters
 //!
-//! Filters 1, 3, 6, 9-12 and 14 all use the *same-row* left neighbor (`a`,
-//! and for 14 also the diagonal `c`) as part of their prediction. Applying
-//! the filter (encode) reads only from the original row, so it is always
-//! safe to vectorize (see "Encode vs. Decode Vectorization" below). Reversing
-//! it (decode) reconstructs `out[x]` from `out[x - bpp]`, the *just
-//! reconstructed* neighbor — unsafe to vectorize for the same reason as Sub
-//! and Average, so their `unfilter_*` counterparts remain scalar-only
-//! (handled directly in `filter.rs`, not duplicated here).
+//! Filters 1, 3, 4, 5, 6, 7, 8, 9-12, 13 and 14 all use the *same-row* left
+//! neighbor (`a`, and for several also the diagonal `c` or the two-back `LL`)
+//! as part of their prediction. Applying the filter (encode) reads only from
+//! the original row, so it is always safe to vectorize (see "Encode vs.
+//! Decode Vectorization" below). Reversing it (decode) reconstructs `out[x]`
+//! from `out[x - bpp]`, the *just reconstructed* neighbor — unsafe to
+//! vectorize for the same reason as Sub and Average, so their `unfilter_*`
+//! counterparts remain scalar-only (handled directly in `filter.rs`, not
+//! duplicated here).
 //!
 //! # Architecture
 //!
@@ -807,6 +811,428 @@ unsafe fn filter_tr_directional_avx2_impl(
     filtered
 }
 
+// ============================================================================
+// Filter 7 (Simple Median): pred = median(left, above, diagonal)
+// ============================================================================
+
+/// Applies Filter 7 (Simple Median) using AVX2 if the running CPU supports
+/// it, otherwise scalar. `median(a, b, c) = max(min(a, b), min(max(a, b),
+/// c))`, computed purely with unsigned-byte `min`/`max` — no 16-bit widening
+/// needed, unlike Paeth/Context-Based/2nd Order.
+pub(crate) fn filter_simple_median_avx2(
+    row: &[u8],
+    prev_row: Option<&[u8]>,
+    bpp: usize,
+) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { filter_simple_median_avx2_impl(row, prev_row, bpp) };
+        }
+    }
+    filter_4way_scalar(row, prev_row, bpp, simple_median_pred)
+}
+
+fn simple_median_pred(a: u8, b: u8, c: u8) -> u8 {
+    let mut vals = [a, b, c];
+    vals.sort_unstable();
+    vals[1]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn simple_median_chunk_avx2(a: __m256i, b: __m256i, c: __m256i) -> __m256i {
+    let mn_ab = _mm256_min_epu8(a, b);
+    let mx_ab = _mm256_max_epu8(a, b);
+    let mn_mxab_c = _mm256_min_epu8(mx_ab, c);
+    _mm256_max_epu8(mn_ab, mn_mxab_c)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_simple_median_avx2_impl(
+    row: &[u8],
+    prev_row: Option<&[u8]>,
+    bpp: usize,
+) -> Vec<u8> {
+    filter_directional_avx2_body(row, prev_row, bpp, simple_median_pred, |a, b, c| {
+        simple_median_chunk_avx2(a, b, c)
+    })
+}
+
+// ============================================================================
+// Filter 5 (MED / Median Edge Detector): JPEG-LS / FFV1 predictor
+// ============================================================================
+
+/// Applies Filter 5 (MED) using AVX2 if the running CPU supports it,
+/// otherwise scalar. Like Simple Median, operates purely on unsigned bytes
+/// (no widening): AVX2 has no native unsigned `cmpgt` for bytes, so the
+/// `c >= max(a,b)` / `c <= min(a,b)` comparisons are emulated via the
+/// `max_epu8(x, y) == x` trick (which holds `x >= y` for unsigned lanes).
+pub(crate) fn filter_med_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { filter_med_avx2_impl(row, prev_row, bpp) };
+        }
+    }
+    filter_4way_scalar(row, prev_row, bpp, med_pred)
+}
+
+fn med_pred(a: u8, b: u8, c: u8) -> u8 {
+    if c >= a.max(b) {
+        a.min(b)
+    } else if c <= a.min(b) {
+        a.max(b)
+    } else {
+        a.wrapping_add(b).wrapping_sub(c)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn med_chunk_avx2(a: __m256i, b: __m256i, c: __m256i) -> __m256i {
+    let mx = _mm256_max_epu8(a, b);
+    let mn = _mm256_min_epu8(a, b);
+    // c >= mx  <=>  max_epu8(c, mx) == c  (unsigned "greater-or-equal" trick).
+    let c_ge_mx = _mm256_cmpeq_epi8(_mm256_max_epu8(c, mx), c);
+    // c <= mn  <=>  min_epu8(c, mn) == c  (unsigned "less-or-equal" trick).
+    let c_le_mn = _mm256_cmpeq_epi8(_mm256_min_epu8(c, mn), c);
+
+    let else_val = _mm256_sub_epi8(_mm256_add_epi8(a, b), c); // wrapping a+b-c
+
+    // Priority matches `med_pred`: c>=max(a,b) branch first, then c<=min(a,b),
+    // else the wrapping sum. `blendv` picks the second operand where the mask
+    // is set, so nest from lowest to highest priority.
+    let result_else_or_le = _mm256_blendv_epi8(else_val, mx, c_le_mn);
+    _mm256_blendv_epi8(result_else_or_le, mn, c_ge_mx)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_med_avx2_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    filter_directional_avx2_body(row, prev_row, bpp, med_pred, |a, b, c| {
+        med_chunk_avx2(a, b, c)
+    })
+}
+
+// ============================================================================
+// Filter 4 (Paeth) and Filter 13 (Context-Based): 16-bit-widened, half-chunk
+// (16 bytes) AVX2 kernels, wrapped to process a full 32-byte SIMD chunk via
+// two calls (see `widen_epu8_16_to_epu16`/`narrow_epu16_to_epu8_16`).
+// ============================================================================
+
+/// Applies Filter 4 (Paeth) using AVX2 if the running CPU supports it,
+/// otherwise scalar. Widens `a`/`b`/`c` to 16-bit lanes (avoids overflow in
+/// `p = a + b - c`, which can range `[-255, 510]`), computes `pa`/`pb`/`pc`
+/// via `abs`, and blends by priority (`pa<=pb && pa<=pc` -> a; `pb<=pc` -> b;
+/// else c) using signed comparisons + inversion (AVX2 has no native `<=`).
+pub(crate) fn filter_paeth_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { filter_paeth_avx2_impl(row, prev_row, bpp) };
+        }
+    }
+    filter_4way_scalar(row, prev_row, bpp, paeth_pred)
+}
+
+fn paeth_pred(a: u8, b: u8, c: u8) -> u8 {
+    let (a, b, c) = (a as i32, b as i32, c as i32);
+    let p = a + b - c;
+    let pa = (p - a).abs();
+    let pb = (p - b).abs();
+    let pc = (p - c).abs();
+    if pa <= pb && pa <= pc {
+        a as u8
+    } else if pb <= pc {
+        b as u8
+    } else {
+        c as u8
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn paeth_half_avx2(a: __m128i, b: __m128i, c: __m128i) -> __m128i {
+    let a16 = widen_epu8_16_to_epu16(a);
+    let b16 = widen_epu8_16_to_epu16(b);
+    let c16 = widen_epu8_16_to_epu16(c);
+
+    let p = _mm256_sub_epi16(_mm256_add_epi16(a16, b16), c16);
+    let pa = _mm256_abs_epi16(_mm256_sub_epi16(p, a16));
+    let pb = _mm256_abs_epi16(_mm256_sub_epi16(p, b16));
+    let pc = _mm256_abs_epi16(_mm256_sub_epi16(p, c16));
+
+    let all_ones = _mm256_set1_epi16(-1);
+    // pa <= pb  <=>  !(pa > pb); pa <= pc  <=>  !(pa > pc).
+    let pa_le_pb = _mm256_xor_si256(_mm256_cmpgt_epi16(pa, pb), all_ones);
+    let pa_le_pc = _mm256_xor_si256(_mm256_cmpgt_epi16(pa, pc), all_ones);
+    let use_a = _mm256_and_si256(pa_le_pb, pa_le_pc);
+
+    let pb_le_pc = _mm256_xor_si256(_mm256_cmpgt_epi16(pb, pc), all_ones);
+    // use_b only considered when use_a doesn't already win (matches the
+    // scalar `else if` priority exactly).
+    let use_b = _mm256_andnot_si256(use_a, pb_le_pc);
+
+    let result_bc = _mm256_blendv_epi8(c16, b16, use_b);
+    let result16 = _mm256_blendv_epi8(result_bc, a16, use_a);
+
+    narrow_epu16_to_epu8_16(result16)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_paeth_avx2_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    filter_half_chunk_avx2_body(row, prev_row, bpp, paeth_pred, |a, b, c| {
+        paeth_half_avx2(a, b, c)
+    })
+}
+
+/// Applies Filter 13 (Context-Based) using AVX2 if the running CPU supports
+/// it, otherwise scalar. Widens `a`/`b`/`c` to 16-bit lanes to compute
+/// `dh = |a - c|`, `dv = |b - c|` without underflow, then blends by priority
+/// (`dh > dv` -> a; `dv > dh` -> b; else `(a + b) / 2`).
+pub(crate) fn filter_context_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { filter_context_avx2_impl(row, prev_row, bpp) };
+        }
+    }
+    filter_4way_scalar(row, prev_row, bpp, context_pred)
+}
+
+fn context_pred(a: u8, b: u8, c: u8) -> u8 {
+    let dh = (a as i16 - c as i16).abs();
+    let dv = (b as i16 - c as i16).abs();
+    if dh > dv {
+        a
+    } else if dv > dh {
+        b
+    } else {
+        ((a as u16 + b as u16) / 2) as u8
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn context_half_avx2(a: __m128i, b: __m128i, c: __m128i) -> __m128i {
+    let a16 = widen_epu8_16_to_epu16(a);
+    let b16 = widen_epu8_16_to_epu16(b);
+    let c16 = widen_epu8_16_to_epu16(c);
+
+    let dh = _mm256_abs_epi16(_mm256_sub_epi16(a16, c16));
+    let dv = _mm256_abs_epi16(_mm256_sub_epi16(b16, c16));
+
+    let dh_gt_dv = _mm256_cmpgt_epi16(dh, dv);
+    let dv_gt_dh = _mm256_cmpgt_epi16(dv, dh);
+    let avg = _mm256_srli_epi16(_mm256_add_epi16(a16, b16), 1); // a,b >= 0, no carry loss
+
+    // Priority matches `context_pred`: dh>dv -> a; elif dv>dh -> b; else avg.
+    let base = _mm256_blendv_epi8(avg, b16, dv_gt_dh);
+    let result16 = _mm256_blendv_epi8(base, a16, dh_gt_dv);
+
+    narrow_epu16_to_epu8_16(result16)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_context_avx2_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    filter_half_chunk_avx2_body(row, prev_row, bpp, context_pred, |a, b, c| {
+        context_half_avx2(a, b, c)
+    })
+}
+
+/// Generic AVX2 body shared by Paeth and Context-Based: identical edge/tail
+/// handling to `filter_directional_avx2_body`, but processes the SIMD chunk
+/// as two 16-byte halves (via `half_pred_fn`) instead of one 32-byte chunk,
+/// since both kernels widen to 16-bit lanes per half (`_mm256_cvtepu8_epi16`
+/// only accepts a 128-bit input).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_half_chunk_avx2_body(
+    row: &[u8],
+    prev_row: Option<&[u8]>,
+    bpp: usize,
+    pred_fn: impl Fn(u8, u8, u8) -> u8,
+    half_pred_fn: impl Fn(__m128i, __m128i, __m128i) -> __m128i,
+) -> Vec<u8> {
+    let len = row.len();
+    let mut filtered = vec![0u8; len];
+
+    let Some(prev) = prev_row else {
+        for i in 0..len {
+            let a = if i >= bpp { row[i - bpp] } else { 0 };
+            filtered[i] = row[i].wrapping_sub(pred_fn(a, 0, 0));
+        }
+        return filtered;
+    };
+
+    for i in 0..bpp.min(len) {
+        filtered[i] = row[i].wrapping_sub(pred_fn(0, prev[i], 0));
+    }
+
+    const HALF_WIDTH: usize = 16;
+    let mut i = bpp;
+    while i + HALF_WIDTH <= len {
+        let pixels = _mm_loadu_si128(row.as_ptr().add(i) as *const __m128i);
+        let left = _mm_loadu_si128(row.as_ptr().add(i - bpp) as *const __m128i);
+        let above = _mm_loadu_si128(prev.as_ptr().add(i) as *const __m128i);
+        let diag = _mm_loadu_si128(prev.as_ptr().add(i - bpp) as *const __m128i);
+
+        let pred = half_pred_fn(left, above, diag);
+        let residual = _mm_sub_epi8(pixels, pred);
+        _mm_storeu_si128(filtered.as_mut_ptr().add(i) as *mut __m128i, residual);
+
+        i += HALF_WIDTH;
+    }
+
+    for j in i..len {
+        let a = row[j - bpp];
+        let b = prev[j];
+        let c = prev[j - bpp];
+        filtered[j] = row[j].wrapping_sub(pred_fn(a, b, c));
+    }
+
+    filtered
+}
+
+// ============================================================================
+// Filter 8 (2nd Order): linear extrapolation using second-order differences
+// (left/above plus their two-back neighbors LL/UU)
+// ============================================================================
+
+/// Applies Filter 8 (2nd Order) using AVX2 if the running CPU supports it,
+/// otherwise scalar. Unlike the other filters here, its predictor also needs
+/// `ll` (two pixels back, same row) and `uu` (two rows back, same column),
+/// so it cannot reuse `filter_directional_avx2_body`/`filter_4way_scalar`
+/// (both fixed to the `a, b, c` signature) and gets its own edge handling.
+pub(crate) fn filter_2ndorder_avx2(
+    row: &[u8],
+    prev_row: Option<&[u8]>,
+    prev_prev_row: Option<&[u8]>,
+    bpp: usize,
+) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { filter_2ndorder_avx2_impl(row, prev_row, prev_prev_row, bpp) };
+        }
+    }
+    filter_2ndorder_scalar(row, prev_row, prev_prev_row, bpp)
+}
+
+fn second_order_pred(a: u8, b: u8, ll: u8, uu: u8) -> u8 {
+    let pred_h = 2i16 * a as i16 - ll as i16;
+    let pred_v = 2i16 * b as i16 - uu as i16;
+    let pred = (pred_h + pred_v) / 2;
+    pred.clamp(0, 255) as u8
+}
+
+fn filter_2ndorder_scalar(
+    row: &[u8],
+    prev_row: Option<&[u8]>,
+    prev_prev_row: Option<&[u8]>,
+    bpp: usize,
+) -> Vec<u8> {
+    let mut filtered = vec![0u8; row.len()];
+    for i in 0..row.len() {
+        let a = if i >= bpp { row[i - bpp] } else { 0 };
+        let b = prev_row.map(|p| p[i]).unwrap_or(0);
+        let ll = if i >= 2 * bpp { row[i - 2 * bpp] } else { 0 };
+        let uu = prev_prev_row.map(|p| p[i]).unwrap_or(0);
+        filtered[i] = row[i].wrapping_sub(second_order_pred(a, b, ll, uu));
+    }
+    filtered
+}
+
+/// `(2*a - ll + 2*b - uu) / 2`, widened to 16-bit lanes (the intermediate sum
+/// ranges `[-510, 510]`, safe in `i16`). The final arithmetic right-shift by 1
+/// (`_mm256_srai_epi16`, truncating toward `-infinity`) numerically differs
+/// from Rust's `/` (truncating toward zero) only on negative odd sums — but
+/// `narrow_epu16_to_epu8_16`'s `packus` saturates every out-of-`[0,255]`
+/// value (including all negatives) to the *same* clamped result regardless
+/// of that off-by-one, so the two are bit-exact after clamping (verified
+/// exhaustively over all boundary byte combinations plus 32M random samples;
+/// see tests below).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn second_order_half_avx2(a: __m128i, b: __m128i, ll: __m128i, uu: __m128i) -> __m128i {
+    let a16 = widen_epu8_16_to_epu16(a);
+    let b16 = widen_epu8_16_to_epu16(b);
+    let ll16 = widen_epu8_16_to_epu16(ll);
+    let uu16 = widen_epu8_16_to_epu16(uu);
+
+    let pred_h = _mm256_sub_epi16(_mm256_slli_epi16(a16, 1), ll16);
+    let pred_v = _mm256_sub_epi16(_mm256_slli_epi16(b16, 1), uu16);
+    let sum = _mm256_add_epi16(pred_h, pred_v);
+    let shifted = _mm256_srai_epi16(sum, 1);
+
+    narrow_epu16_to_epu8_16(shifted)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_2ndorder_avx2_impl(
+    row: &[u8],
+    prev_row: Option<&[u8]>,
+    prev_prev_row: Option<&[u8]>,
+    bpp: usize,
+) -> Vec<u8> {
+    let len = row.len();
+    let mut filtered = vec![0u8; len];
+
+    let Some(prev) = prev_row else {
+        for i in 0..len {
+            let a = if i >= bpp { row[i - bpp] } else { 0 };
+            let ll = if i >= 2 * bpp { row[i - 2 * bpp] } else { 0 };
+            filtered[i] = row[i].wrapping_sub(second_order_pred(a, 0, ll, 0));
+        }
+        return filtered;
+    };
+    let uu_row = prev_prev_row;
+
+    // First 2*bpp bytes have no `ll` (and possibly no `a`) neighbor: handle
+    // scalar, matching the general zero-fill convention exactly.
+    for i in 0..(2 * bpp).min(len) {
+        let a = if i >= bpp { row[i - bpp] } else { 0 };
+        let b = prev[i];
+        let ll = if i >= 2 * bpp { row[i - 2 * bpp] } else { 0 };
+        let uu = uu_row.map(|p| p[i]).unwrap_or(0);
+        filtered[i] = row[i].wrapping_sub(second_order_pred(a, b, ll, uu));
+    }
+
+    const HALF_WIDTH: usize = 16;
+    let mut i = 2 * bpp;
+    while i + HALF_WIDTH <= len {
+        let pixels = _mm_loadu_si128(row.as_ptr().add(i) as *const __m128i);
+        let left = _mm_loadu_si128(row.as_ptr().add(i - bpp) as *const __m128i);
+        let above = _mm_loadu_si128(prev.as_ptr().add(i) as *const __m128i);
+        let ll = _mm_loadu_si128(row.as_ptr().add(i - 2 * bpp) as *const __m128i);
+        let uu = match uu_row {
+            Some(p) => _mm_loadu_si128(p.as_ptr().add(i) as *const __m128i),
+            None => _mm_setzero_si128(),
+        };
+
+        let pred = second_order_half_avx2(left, above, ll, uu);
+        let residual = _mm_sub_epi8(pixels, pred);
+        _mm_storeu_si128(filtered.as_mut_ptr().add(i) as *mut __m128i, residual);
+
+        i += HALF_WIDTH;
+    }
+
+    for j in i..len {
+        let a = row[j - bpp];
+        let b = prev[j];
+        let ll = row[j - 2 * bpp];
+        let uu = uu_row.map(|p| p[j]).unwrap_or(0);
+        filtered[j] = row[j].wrapping_sub(second_order_pred(a, b, ll, uu));
+    }
+
+    filtered
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1184,6 +1610,429 @@ mod tests {
             let avx2_filtered = filter_tr_directional_avx2(&row, Some(&prev), bpp);
             let scalar_filtered = filter_tr_directional_scalar(&row, Some(&prev), bpp);
             assert_eq!(avx2_filtered, scalar_filtered, "TR small row bpp={bpp}");
+        }
+    }
+
+    // ========================================================================
+    // Phase 5: Filters 4 (Paeth), 5 (MED), 7 (Simple Median), 8 (2nd Order),
+    // 13 (Context-Based) — AVX2 vs. scalar cross-checks, roundtrip, no-prev-row
+    // and small-row (sub-one-chunk) edge cases.
+    // ========================================================================
+
+    fn med_pred4(a: u8, b: u8, c: u8, _d: u8) -> u8 {
+        med_pred(a, b, c)
+    }
+    fn simple_median_pred4(a: u8, b: u8, c: u8, _d: u8) -> u8 {
+        simple_median_pred(a, b, c)
+    }
+    fn paeth_pred4(a: u8, b: u8, c: u8, _d: u8) -> u8 {
+        paeth_pred(a, b, c)
+    }
+    fn context_pred4(a: u8, b: u8, c: u8, _d: u8) -> u8 {
+        context_pred(a, b, c)
+    }
+
+    /// Exhaustive check (all 16,777,216 `(a, b, c)` combinations) that
+    /// `simple_median_chunk_avx2` matches `simple_median_pred` exactly.
+    #[test]
+    fn test_simple_median_avx2_exhaustive() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut a_buf = [0u8; 32];
+        let mut b_buf = [0u8; 32];
+        let mut c_buf = [0u8; 32];
+        for a in 0u32..=255 {
+            for b in 0u32..=255 {
+                let mut c = 0u32;
+                while c <= 255 {
+                    let mut n = 0usize;
+                    while n < 32 && c as usize + n <= 255 {
+                        a_buf[n] = a as u8;
+                        b_buf[n] = b as u8;
+                        c_buf[n] = (c as usize + n) as u8;
+                        n += 1;
+                    }
+                    unsafe {
+                        let va = _mm256_loadu_si256(a_buf.as_ptr() as *const __m256i);
+                        let vb = _mm256_loadu_si256(b_buf.as_ptr() as *const __m256i);
+                        let vc = _mm256_loadu_si256(c_buf.as_ptr() as *const __m256i);
+                        let vresult = simple_median_chunk_avx2(va, vb, vc);
+                        let mut result = [0u8; 32];
+                        _mm256_storeu_si256(result.as_mut_ptr() as *mut __m256i, vresult);
+                        for k in 0..n {
+                            let expected = simple_median_pred(a_buf[k], b_buf[k], c_buf[k]);
+                            assert_eq!(
+                                result[k], expected,
+                                "SimpleMedian mismatch a={} b={} c={}",
+                                a_buf[k], b_buf[k], c_buf[k]
+                            );
+                        }
+                    }
+                    c += 32;
+                }
+            }
+        }
+    }
+
+    /// Exhaustive check (all 16,777,216 `(a, b, c)` combinations) that
+    /// `med_chunk_avx2` matches `med_pred` exactly, including the unsigned
+    /// `>=`/`<=` boundary trick.
+    #[test]
+    fn test_med_avx2_exhaustive() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut a_buf = [0u8; 32];
+        let mut b_buf = [0u8; 32];
+        let mut c_buf = [0u8; 32];
+        for a in 0u32..=255 {
+            for b in 0u32..=255 {
+                let mut c = 0u32;
+                while c <= 255 {
+                    let mut n = 0usize;
+                    while n < 32 && c as usize + n <= 255 {
+                        a_buf[n] = a as u8;
+                        b_buf[n] = b as u8;
+                        c_buf[n] = (c as usize + n) as u8;
+                        n += 1;
+                    }
+                    unsafe {
+                        let va = _mm256_loadu_si256(a_buf.as_ptr() as *const __m256i);
+                        let vb = _mm256_loadu_si256(b_buf.as_ptr() as *const __m256i);
+                        let vc = _mm256_loadu_si256(c_buf.as_ptr() as *const __m256i);
+                        let vresult = med_chunk_avx2(va, vb, vc);
+                        let mut result = [0u8; 32];
+                        _mm256_storeu_si256(result.as_mut_ptr() as *mut __m256i, vresult);
+                        for k in 0..n {
+                            let expected = med_pred(a_buf[k], b_buf[k], c_buf[k]);
+                            assert_eq!(
+                                result[k], expected,
+                                "MED mismatch a={} b={} c={}",
+                                a_buf[k], b_buf[k], c_buf[k]
+                            );
+                        }
+                    }
+                    c += 32;
+                }
+            }
+        }
+    }
+
+    /// Exhaustive check (all 16,777,216 `(a, b, c)` combinations, 16 lanes at
+    /// a time) that `paeth_half_avx2` matches `paeth_pred` exactly.
+    #[test]
+    fn test_paeth_avx2_exhaustive() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut a_buf = [0u8; 16];
+        let mut b_buf = [0u8; 16];
+        let mut c_buf = [0u8; 16];
+        for a in 0u32..=255 {
+            for b in 0u32..=255 {
+                let mut c = 0u32;
+                while c <= 255 {
+                    let mut n = 0usize;
+                    while n < 16 && c as usize + n <= 255 {
+                        a_buf[n] = a as u8;
+                        b_buf[n] = b as u8;
+                        c_buf[n] = (c as usize + n) as u8;
+                        n += 1;
+                    }
+                    unsafe {
+                        let va = _mm_loadu_si128(a_buf.as_ptr() as *const __m128i);
+                        let vb = _mm_loadu_si128(b_buf.as_ptr() as *const __m128i);
+                        let vc = _mm_loadu_si128(c_buf.as_ptr() as *const __m128i);
+                        let vresult = paeth_half_avx2(va, vb, vc);
+                        let mut result = [0u8; 16];
+                        _mm_storeu_si128(result.as_mut_ptr() as *mut __m128i, vresult);
+                        for k in 0..n {
+                            let expected = paeth_pred(a_buf[k], b_buf[k], c_buf[k]);
+                            assert_eq!(
+                                result[k], expected,
+                                "Paeth mismatch a={} b={} c={}",
+                                a_buf[k], b_buf[k], c_buf[k]
+                            );
+                        }
+                    }
+                    c += 16;
+                }
+            }
+        }
+    }
+
+    /// Exhaustive check (all 16,777,216 `(a, b, c)` combinations, 16 lanes at
+    /// a time) that `context_half_avx2` matches `context_pred` exactly.
+    #[test]
+    fn test_context_avx2_exhaustive() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut a_buf = [0u8; 16];
+        let mut b_buf = [0u8; 16];
+        let mut c_buf = [0u8; 16];
+        for a in 0u32..=255 {
+            for b in 0u32..=255 {
+                let mut c = 0u32;
+                while c <= 255 {
+                    let mut n = 0usize;
+                    while n < 16 && c as usize + n <= 255 {
+                        a_buf[n] = a as u8;
+                        b_buf[n] = b as u8;
+                        c_buf[n] = (c as usize + n) as u8;
+                        n += 1;
+                    }
+                    unsafe {
+                        let va = _mm_loadu_si128(a_buf.as_ptr() as *const __m128i);
+                        let vb = _mm_loadu_si128(b_buf.as_ptr() as *const __m128i);
+                        let vc = _mm_loadu_si128(c_buf.as_ptr() as *const __m128i);
+                        let vresult = context_half_avx2(va, vb, vc);
+                        let mut result = [0u8; 16];
+                        _mm_storeu_si128(result.as_mut_ptr() as *mut __m128i, vresult);
+                        for k in 0..n {
+                            let expected = context_pred(a_buf[k], b_buf[k], c_buf[k]);
+                            assert_eq!(
+                                result[k], expected,
+                                "Context mismatch a={} b={} c={}",
+                                a_buf[k], b_buf[k], c_buf[k]
+                            );
+                        }
+                    }
+                    c += 16;
+                }
+            }
+        }
+    }
+
+    /// Random sampling (2M groups of 16 lanes = 32M samples) plus targeted
+    /// boundary combinations for `second_order_half_avx2` vs. `second_order_pred`:
+    /// the 4D input space (`a, b, ll, uu`) is too large (2^32) to exhaust, but
+    /// this specifically stresses the `srai` (toward `-inf`) vs. Rust `/`
+    /// (toward zero) truncation-direction difference on negative odd sums,
+    /// which the final `packus` clamp must absorb identically in both paths.
+    #[test]
+    fn test_second_order_avx2_matches_scalar() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let extremes = [0u8, 1, 2, 3, 127, 128, 253, 254, 255];
+        let mut a_buf = [0u8; 16];
+        let mut b_buf = [0u8; 16];
+        let mut ll_buf = [0u8; 16];
+        let mut uu_buf = [0u8; 16];
+
+        for &a in &extremes {
+            for &ll in &extremes {
+                for &b in &extremes {
+                    for &uu in &extremes {
+                        a_buf.fill(a);
+                        b_buf.fill(b);
+                        ll_buf.fill(ll);
+                        uu_buf.fill(uu);
+                        unsafe {
+                            let va = _mm_loadu_si128(a_buf.as_ptr() as *const __m128i);
+                            let vb = _mm_loadu_si128(b_buf.as_ptr() as *const __m128i);
+                            let vll = _mm_loadu_si128(ll_buf.as_ptr() as *const __m128i);
+                            let vuu = _mm_loadu_si128(uu_buf.as_ptr() as *const __m128i);
+                            let vresult = second_order_half_avx2(va, vb, vll, vuu);
+                            let mut result = [0u8; 16];
+                            _mm_storeu_si128(result.as_mut_ptr() as *mut __m128i, vresult);
+                            let expected = second_order_pred(a, b, ll, uu);
+                            assert_eq!(
+                                result[0], expected,
+                                "2ndOrder mismatch a={a} b={b} ll={ll} uu={uu}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut rng: u64 = 0x1122_3344_5566_7788;
+        let mut next_byte = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng & 0xFF) as u8
+        };
+        for _ in 0..2_000_000u32 {
+            for n in 0..16 {
+                a_buf[n] = next_byte();
+                b_buf[n] = next_byte();
+                ll_buf[n] = next_byte();
+                uu_buf[n] = next_byte();
+            }
+            unsafe {
+                let va = _mm_loadu_si128(a_buf.as_ptr() as *const __m128i);
+                let vb = _mm_loadu_si128(b_buf.as_ptr() as *const __m128i);
+                let vll = _mm_loadu_si128(ll_buf.as_ptr() as *const __m128i);
+                let vuu = _mm_loadu_si128(uu_buf.as_ptr() as *const __m128i);
+                let vresult = second_order_half_avx2(va, vb, vll, vuu);
+                let mut result = [0u8; 16];
+                _mm_storeu_si128(result.as_mut_ptr() as *mut __m128i, vresult);
+                for k in 0..16 {
+                    let expected = second_order_pred(a_buf[k], b_buf[k], ll_buf[k], uu_buf[k]);
+                    assert_eq!(
+                        result[k], expected,
+                        "2ndOrder random mismatch a={} b={} ll={} uu={}",
+                        a_buf[k], b_buf[k], ll_buf[k], uu_buf[k]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_filter_simple_median_avx2_matches_scalar_and_roundtrips() {
+        for &bpp in &[1usize, 3, 4] {
+            let width = 257;
+            let row: Vec<u8> = (0..width).map(|i| ((i * 197) % 256) as u8).collect();
+            let prev: Vec<u8> = (0..width).map(|i| ((i * 131 + 7) % 256) as u8).collect();
+
+            let avx2_filtered = filter_simple_median_avx2(&row, Some(&prev), bpp);
+            let scalar_filtered = filter_4way_scalar(&row, Some(&prev), bpp, simple_median_pred);
+            assert_eq!(avx2_filtered, scalar_filtered, "SimpleMedian bpp={bpp}");
+
+            let unfiltered =
+                unfilter_generic(&avx2_filtered, Some(&prev), bpp, simple_median_pred4);
+            assert_eq!(unfiltered, row, "SimpleMedian roundtrip bpp={bpp}");
+
+            let no_prev = filter_simple_median_avx2(&row, None, bpp);
+            let no_prev_scalar = filter_4way_scalar(&row, None, bpp, simple_median_pred);
+            assert_eq!(no_prev, no_prev_scalar, "SimpleMedian no-prev bpp={bpp}");
+        }
+    }
+
+    #[test]
+    fn test_filter_med_avx2_matches_scalar_and_roundtrips() {
+        for &bpp in &[1usize, 3, 4] {
+            let width = 257;
+            let row: Vec<u8> = (0..width).map(|i| ((i * 197) % 256) as u8).collect();
+            let prev: Vec<u8> = (0..width).map(|i| ((i * 131 + 7) % 256) as u8).collect();
+
+            let avx2_filtered = filter_med_avx2(&row, Some(&prev), bpp);
+            let scalar_filtered = filter_4way_scalar(&row, Some(&prev), bpp, med_pred);
+            assert_eq!(avx2_filtered, scalar_filtered, "MED bpp={bpp}");
+
+            let unfiltered = unfilter_generic(&avx2_filtered, Some(&prev), bpp, med_pred4);
+            assert_eq!(unfiltered, row, "MED roundtrip bpp={bpp}");
+
+            let no_prev = filter_med_avx2(&row, None, bpp);
+            let no_prev_scalar = filter_4way_scalar(&row, None, bpp, med_pred);
+            assert_eq!(no_prev, no_prev_scalar, "MED no-prev bpp={bpp}");
+        }
+    }
+
+    #[test]
+    fn test_filter_paeth_avx2_matches_scalar_and_roundtrips() {
+        for &bpp in &[1usize, 3, 4] {
+            let width = 257;
+            let row: Vec<u8> = (0..width).map(|i| ((i * 197) % 256) as u8).collect();
+            let prev: Vec<u8> = (0..width).map(|i| ((i * 131 + 7) % 256) as u8).collect();
+
+            let avx2_filtered = filter_paeth_avx2(&row, Some(&prev), bpp);
+            let scalar_filtered = filter_4way_scalar(&row, Some(&prev), bpp, paeth_pred);
+            assert_eq!(avx2_filtered, scalar_filtered, "Paeth bpp={bpp}");
+
+            let unfiltered = unfilter_generic(&avx2_filtered, Some(&prev), bpp, paeth_pred4);
+            assert_eq!(unfiltered, row, "Paeth roundtrip bpp={bpp}");
+
+            let no_prev = filter_paeth_avx2(&row, None, bpp);
+            let no_prev_scalar = filter_4way_scalar(&row, None, bpp, paeth_pred);
+            assert_eq!(no_prev, no_prev_scalar, "Paeth no-prev bpp={bpp}");
+        }
+    }
+
+    #[test]
+    fn test_filter_context_avx2_matches_scalar_and_roundtrips() {
+        for &bpp in &[1usize, 3, 4] {
+            let width = 257;
+            let row: Vec<u8> = (0..width).map(|i| ((i * 197) % 256) as u8).collect();
+            let prev: Vec<u8> = (0..width).map(|i| ((i * 131 + 7) % 256) as u8).collect();
+
+            let avx2_filtered = filter_context_avx2(&row, Some(&prev), bpp);
+            let scalar_filtered = filter_4way_scalar(&row, Some(&prev), bpp, context_pred);
+            assert_eq!(avx2_filtered, scalar_filtered, "Context bpp={bpp}");
+
+            let unfiltered = unfilter_generic(&avx2_filtered, Some(&prev), bpp, context_pred4);
+            assert_eq!(unfiltered, row, "Context roundtrip bpp={bpp}");
+
+            let no_prev = filter_context_avx2(&row, None, bpp);
+            let no_prev_scalar = filter_4way_scalar(&row, None, bpp, context_pred);
+            assert_eq!(no_prev, no_prev_scalar, "Context no-prev bpp={bpp}");
+        }
+    }
+
+    /// `width` smaller than one half-chunk (16 bytes) must still fall back
+    /// correctly to the scalar tail for the half-chunk-based kernels (Paeth,
+    /// Context-Based), which use a stricter loop guard (`HALF_WIDTH = 16`)
+    /// than the full-chunk kernels (`SIMD_WIDTH = 32`).
+    #[test]
+    fn test_half_chunk_filters_small_row_no_overread() {
+        for &bpp in &[1usize, 4] {
+            let width = bpp + 5; // smaller than one half-chunk
+            let row: Vec<u8> = (0..width).map(|i| ((i * 53) % 256) as u8).collect();
+            let prev: Vec<u8> = (0..width).map(|i| ((i * 29 + 3) % 256) as u8).collect();
+
+            let paeth_avx2 = filter_paeth_avx2(&row, Some(&prev), bpp);
+            let paeth_scalar = filter_4way_scalar(&row, Some(&prev), bpp, paeth_pred);
+            assert_eq!(paeth_avx2, paeth_scalar, "Paeth small row bpp={bpp}");
+
+            let context_avx2 = filter_context_avx2(&row, Some(&prev), bpp);
+            let context_scalar = filter_4way_scalar(&row, Some(&prev), bpp, context_pred);
+            assert_eq!(context_avx2, context_scalar, "Context small row bpp={bpp}");
+        }
+    }
+
+    #[test]
+    fn test_filter_2ndorder_avx2_matches_scalar_and_roundtrips() {
+        for &bpp in &[1usize, 3, 4] {
+            let width = 257;
+            let row: Vec<u8> = (0..width).map(|i| ((i * 197) % 256) as u8).collect();
+            let prev: Vec<u8> = (0..width).map(|i| ((i * 131 + 7) % 256) as u8).collect();
+            let prev_prev: Vec<u8> = (0..width).map(|i| ((i * 71 + 5) % 256) as u8).collect();
+
+            let avx2_filtered = filter_2ndorder_avx2(&row, Some(&prev), Some(&prev_prev), bpp);
+            let scalar_filtered = filter_2ndorder_scalar(&row, Some(&prev), Some(&prev_prev), bpp);
+            assert_eq!(avx2_filtered, scalar_filtered, "2ndOrder bpp={bpp}");
+
+            // Roundtrip via the scalar unfilter reference (mirrors filter.rs'
+            // `predict(F_2NDORDER, ...)` dispatch, which uses `ll`/`uu` from
+            // the reconstructed output / prev_prev_row respectively).
+            let mut out = vec![0u8; width];
+            for i in 0..width {
+                let a = if i >= bpp { out[i - bpp] } else { 0 };
+                let b = prev[i];
+                let ll = if i >= 2 * bpp { out[i - 2 * bpp] } else { 0 };
+                let uu = prev_prev[i];
+                out[i] = avx2_filtered[i].wrapping_add(second_order_pred(a, b, ll, uu));
+            }
+            assert_eq!(out, row, "2ndOrder roundtrip bpp={bpp}");
+
+            let no_prev = filter_2ndorder_avx2(&row, None, None, bpp);
+            let no_prev_scalar = filter_2ndorder_scalar(&row, None, None, bpp);
+            assert_eq!(no_prev, no_prev_scalar, "2ndOrder no-prev bpp={bpp}");
+        }
+    }
+
+    /// `width` smaller than `2*bpp + HALF_WIDTH` must still fall back
+    /// correctly to the scalar tail without reading before the start of the
+    /// row (the `ll` lookback is `2*bpp`, twice as far as the other filters).
+    #[test]
+    fn test_filter_2ndorder_avx2_small_row_no_overread() {
+        for &bpp in &[1usize, 4] {
+            let width = 2 * bpp + 5; // smaller than one half-chunk past the ll offset
+            let row: Vec<u8> = (0..width).map(|i| ((i * 53) % 256) as u8).collect();
+            let prev: Vec<u8> = (0..width).map(|i| ((i * 29 + 3) % 256) as u8).collect();
+            let prev_prev: Vec<u8> = (0..width).map(|i| ((i * 17 + 1) % 256) as u8).collect();
+
+            let avx2_filtered = filter_2ndorder_avx2(&row, Some(&prev), Some(&prev_prev), bpp);
+            let scalar_filtered = filter_2ndorder_scalar(&row, Some(&prev), Some(&prev_prev), bpp);
+            assert_eq!(
+                avx2_filtered, scalar_filtered,
+                "2ndOrder small row bpp={bpp}"
+            );
         }
     }
 }

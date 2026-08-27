@@ -12,9 +12,11 @@ use crate::types::FilterHeuristic;
 
 #[cfg(feature = "simd")]
 use crate::simd::{
-    filter_4way_d1_avx2, filter_4way_d2_avx2, filter_4way_h_avx2, filter_4way_v_avx2,
-    filter_average_avx2, filter_gradient_avx2, filter_sub_avx2, filter_tr_directional_avx2,
-    filter_up_avx2, unfilter_average_avx2, unfilter_sub_avx2, unfilter_up_avx2,
+    filter_2ndorder_avx2, filter_4way_d1_avx2, filter_4way_d2_avx2, filter_4way_h_avx2,
+    filter_4way_v_avx2, filter_average_avx2, filter_context_avx2, filter_gradient_avx2,
+    filter_med_avx2, filter_paeth_avx2, filter_simple_median_avx2, filter_sub_avx2,
+    filter_tr_directional_avx2, filter_up_avx2, unfilter_average_avx2, unfilter_sub_avx2,
+    unfilter_up_avx2,
 };
 
 // ============================================================================
@@ -269,11 +271,13 @@ fn predict(ftype: u8, a: u8, b: u8, c: u8, d: u8, ll: u8, uu: u8) -> u8 {
 /// F_WEIGHTED does not go through here (requires in-flight state, see `filter_block`).
 ///
 /// # SIMD Optimizations (v1.1+)
-/// Uses AVX2 for Filters 1 (Sub), 2 (Up), 3 (Average), 6 (Gradient), 9-12
-/// (4-way Directional) and 14 (TR-Directional) when available — all of them
+/// Uses AVX2 for Filters 1 (Sub), 2 (Up), 3 (Average), 4 (Paeth), 5 (MED),
+/// 6 (Gradient), 7 (Simple Median), 8 (2nd Order), 9-12 (4-way Directional),
+/// 13 (Context-Based) and 14 (TR-Directional) when available — all of them
 /// safe to vectorize on the encode side (see `simd.rs` module docs for why
-/// decode-side reversal of left-dependent filters must stay scalar). Other
-/// filters use scalar fallback.
+/// decode-side reversal of left-dependent filters must stay scalar). Filter
+/// 15 (Weighted) uses scalar fallback only (adaptive state, see `filter.rs`
+/// module docs).
 fn filter_row(
     row: &[u8],
     prev_row: Option<&[u8]>,
@@ -289,11 +293,16 @@ fn filter_row(
             F_SUB => return filter_sub_avx2(row, bpp),
             F_UP => return filter_up_avx2(row, prev_row),
             F_AVERAGE => return filter_average_avx2(row, prev_row, bpp),
+            F_PAETH => return filter_paeth_avx2(row, prev_row, bpp),
+            F_MED => return filter_med_avx2(row, prev_row, bpp),
             F_GRADIENT => return filter_gradient_avx2(row, prev_row, bpp),
+            F_SMEDIAN => return filter_simple_median_avx2(row, prev_row, bpp),
+            F_2NDORDER => return filter_2ndorder_avx2(row, prev_row, prev_prev_row, bpp),
             F_4WAY_H => return filter_4way_h_avx2(row, prev_row, bpp),
             F_4WAY_V => return filter_4way_v_avx2(row, prev_row, bpp),
             F_4WAY_D1 => return filter_4way_d1_avx2(row, prev_row, bpp),
             F_4WAY_D2 => return filter_4way_d2_avx2(row, prev_row, bpp),
+            F_CONTEXT => return filter_context_avx2(row, prev_row, bpp),
             F_TR_DIRECTIONAL => return filter_tr_directional_avx2(row, prev_row, bpp),
             _ => {} // Fall through to scalar for other filters
         }
