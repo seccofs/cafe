@@ -4340,7 +4340,7 @@ mod tests {
             );
             // Every 16-bit big-endian sample must have identical high and low
             // bytes (byte-replication scaling: v*65535/255 == (v<<8)|v).
-            for chunk in out.chunks_exact(2) {
+            for chunk in out.as_chunks::<2>().0.iter() {
                 assert_eq!(
                     chunk[0], chunk[1],
                     "16-bit sample {:?} is not byte-replicated for color_type {color_type}",
@@ -4378,7 +4378,7 @@ mod tests {
                     // Gray replicates Y to R,G,B and forces alpha=0xFF; just
                     // check length and internal RGB replication.
                     assert_eq!(decoded.len(), n * 4);
-                    for px in decoded.chunks_exact(4) {
+                    for px in decoded.as_chunks::<4>().0.iter() {
                         assert_eq!(px[0], px[1]);
                         assert_eq!(px[1], px[2]);
                         assert_eq!(px[3], 0xFF);
@@ -4386,7 +4386,12 @@ mod tests {
                 }
                 COLOR_TYPE_RGB => {
                     assert_eq!(decoded.len(), n * 4);
-                    for (orig, dec) in rgba.chunks_exact(4).zip(decoded.chunks_exact(4)) {
+                    for (orig, dec) in rgba
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .zip(decoded.as_chunks::<4>().0.iter())
+                    {
                         assert_eq!(dec[0], orig[0]);
                         assert_eq!(dec[1], orig[1]);
                         assert_eq!(dec[2], orig[2]);
@@ -4395,7 +4400,12 @@ mod tests {
                 }
                 COLOR_TYPE_GRAY_ALPHA => {
                     assert_eq!(decoded.len(), n * 4);
-                    for (orig, dec) in rgba.chunks_exact(4).zip(decoded.chunks_exact(4)) {
+                    for (orig, dec) in rgba
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .zip(decoded.as_chunks::<4>().0.iter())
+                    {
                         assert_eq!(dec[0], dec[1]);
                         assert_eq!(dec[1], dec[2]);
                         assert_eq!(dec[3], orig[3]); // alpha preserved

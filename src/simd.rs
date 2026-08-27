@@ -1634,6 +1634,7 @@ mod tests {
 
     /// Exhaustive check (all 16,777,216 `(a, b, c)` combinations) that
     /// `simple_median_chunk_avx2` matches `simple_median_pred` exactly.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_simple_median_avx2_exhaustive() {
         if !is_x86_feature_detected!("avx2") {
@@ -1678,6 +1679,7 @@ mod tests {
     /// Exhaustive check (all 16,777,216 `(a, b, c)` combinations) that
     /// `med_chunk_avx2` matches `med_pred` exactly, including the unsigned
     /// `>=`/`<=` boundary trick.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_med_avx2_exhaustive() {
         if !is_x86_feature_detected!("avx2") {
@@ -1721,6 +1723,7 @@ mod tests {
 
     /// Exhaustive check (all 16,777,216 `(a, b, c)` combinations, 16 lanes at
     /// a time) that `paeth_half_avx2` matches `paeth_pred` exactly.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_paeth_avx2_exhaustive() {
         if !is_x86_feature_detected!("avx2") {
@@ -1764,6 +1767,7 @@ mod tests {
 
     /// Exhaustive check (all 16,777,216 `(a, b, c)` combinations, 16 lanes at
     /// a time) that `context_half_avx2` matches `context_pred` exactly.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_context_avx2_exhaustive() {
         if !is_x86_feature_detected!("avx2") {
@@ -1811,6 +1815,7 @@ mod tests {
     /// this specifically stresses the `srai` (toward `-inf`) vs. Rust `/`
     /// (toward zero) truncation-direction difference on negative odd sums,
     /// which the final `packus` clamp must absorb identically in both paths.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_second_order_avx2_matches_scalar() {
         if !is_x86_feature_detected!("avx2") {

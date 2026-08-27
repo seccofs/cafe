@@ -337,6 +337,7 @@ mod tests {
         assert_eq!(unshuffled, data);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_byte_shuffle_invalid_bpp() {
         let result = apply_byte_shuffle_simd(&[0u8; 9], 3, 3, 1);
