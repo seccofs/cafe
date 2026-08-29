@@ -785,6 +785,791 @@ pub fn decode_bytes(buf: &[u8]) -> Result<(Vec<u8>, DecodeResult)> {
 
 /// Decodes a CAFE buffer with custom decode options (tone-map operator selection, etc.)
 /// This is the core decode implementation without file I/O, with customizable options.
+/// Mutable state accumulated while walking the chunk stream of a CAFE file
+/// during decode (refactoring v1.2.2). Grouping these fields lets each chunk
+/// handler be a small, independently auditable function instead of one
+/// ~800-line match arm inline in the main loop — this state is populated
+/// entirely from untrusted file bytes, so keeping each handler small and
+/// testable in isolation reduces the chance a rare combination of chunks
+/// (e.g. iDIM + cHDR + interlace + unusual bit depth) slips through
+/// unvalidated.
+struct DecodeState {
+    width: Option<u32>,
+    height: Option<u32>,
+    filter_method: u8,
+    interlace_method_read: u8,
+    bytes_per_row: usize,
+    pixel_rows: Vec<u8>,
+    // SECURITY (CWE-409): cumulative decompression budget for the IDATs.
+    // Derived from the size expected by the IHDR; prevents multiple IDATs
+    // from expanding to gigabytes when the image is small.
+    decompress_budget: Option<u64>,
+    decompressed_total: u64,
+    adam7_passes: [Vec<u8>; ADAM7_NUM_PASSES], // For Adam7 (v1.0)
+    even_odd_passes: [Vec<u8>; EVEN_ODD_NUM_PASSES], // For even/odd (v1.0)
+    exif: Option<Vec<u8>>,
+    json_metadata: HashMap<String, Value>,
+    icc_profile: Option<Vec<u8>>,     // ICC profile (v1.0)
+    xmp_metadata: Option<String>,     // XMP metadata (v1.0)
+    zstd_dictionary: Option<Vec<u8>>, // ZSTD dictionary (v1.0)
+    color_type: u8,
+    bit_depth: u8,
+    sample_format: u8,
+    palette: Option<Palette>,
+    idim: Option<iDim>, // iDIM chunk (v1.0, ancillary)
+    tiles_seen: usize,  // Tile counter for 2D tiling (iDIM)
+    chdr: Option<cHDR>, // cHDR chunk (v1.0, ancillary, HDR metadata)
+}
+
+impl Default for DecodeState {
+    fn default() -> Self {
+        DecodeState {
+            width: None,
+            height: None,
+            filter_method: FILTER_METHOD_NONE,
+            interlace_method_read: INTERLACE_NONE,
+            bytes_per_row: 0,
+            pixel_rows: Vec::new(),
+            decompress_budget: None,
+            decompressed_total: 0,
+            adam7_passes: Default::default(),
+            even_odd_passes: Default::default(),
+            exif: None,
+            json_metadata: HashMap::new(),
+            icc_profile: None,
+            xmp_metadata: None,
+            zstd_dictionary: None,
+            color_type: COLOR_TYPE_RGBA, // Default, will be overwritten
+            bit_depth: 8,                // Default, will be overwritten
+            sample_format: SAMPLE_FORMAT_UINT, // Default: unsigned integer (v1.0)
+            palette: None,
+            idim: None,
+            tiles_seen: 0,
+            chdr: None,
+        }
+    }
+}
+
+/// Handles the IHDR chunk (section 4.1): parses and validates width, height,
+/// bit depth, sample format, color type, compression/filter/interlace
+/// methods, and computes `bytes_per_row` plus the cumulative decompression
+/// budget (CWE-409). Critical chunk — any inconsistency is a hard error.
+fn handle_ihdr_chunk(state: &mut DecodeState, data: &[u8]) -> Result<()> {
+    const IHDR_LEN: usize = 14;
+    if data.len() < IHDR_LEN {
+        return Err(CafeError::TruncatedFile(format!(
+            "IHDR must have {IHDR_LEN} bytes, got {}",
+            data.len()
+        )));
+    }
+    let w = u32::from_be_bytes(
+        data[0..4]
+            .try_into()
+            .map_err(|_| CafeError::TruncatedFile("IHDR Width conversion failed".into()))?,
+    );
+    let h = u32::from_be_bytes(
+        data[4..8]
+            .try_into()
+            .map_err(|_| CafeError::TruncatedFile("IHDR Height conversion failed".into()))?,
+    );
+    let bd = data[8];
+    let sf = data[9]; // Sample format (v1.0)
+    let ct = data[10];
+    let compression_method = data[11];
+    let fm = data[12];
+    let interlace_method = data[13];
+
+    // Width/Height = 0 is a degenerate image; rejecting here avoids
+    // a later division by zero (bytes_per_row computed from the
+    // width) instead of propagating an invalid state silently.
+    if w == 0 || h == 0 {
+        return Err(CafeError::UnsupportedFeature(format!(
+            "Invalid dimensions: Width={w}, Height={h} (neither can be 0)"
+        )));
+    }
+
+    // Validate sample format (section 4.1, v1.0)
+    match sf {
+        SAMPLE_FORMAT_UINT | SAMPLE_FORMAT_FLOAT | SAMPLE_FORMAT_HALF => {
+            // Valid, will be stored
+        }
+        _ => {
+            return Err(CafeError::UnsupportedFeature(format!(
+                "Sample format {} not supported (supports 0=uint, 1=float, 2=half)",
+                sf
+            )));
+        }
+    }
+    state.sample_format = sf;
+
+    // Validate the sample_format + bit_depth combination (section 4.1, v1.0)
+    if sf == SAMPLE_FORMAT_FLOAT && bd != 32 {
+        return Err(CafeError::UnsupportedFeature(format!(
+            "Sample format FLOAT requires bit_depth 32, got {}",
+            bd
+        )));
+    }
+    if sf == SAMPLE_FORMAT_HALF && bd != 16 {
+        return Err(CafeError::UnsupportedFeature(format!(
+            "Sample format HALF requires bit_depth 16, got {}",
+            bd
+        )));
+    }
+    if sf == SAMPLE_FORMAT_UINT && (bd == 32 || bd == 16) && bd != 32 && bd != 16 {
+        // uint allows multiple bit depths, but 16 and 32 may conflict with float/half
+        // Allowed only if explicitly uint
+    }
+
+    // Validate color type and bit depth (section 4.1, v1.0)
+    let mut bytes_per_row = state.bytes_per_row;
+    match ct {
+        COLOR_TYPE_GRAY => {
+            // Grayscale: bit depth 1, 2, 4, 8, 10, 12, 16, 32 (section 4.1.1, v1.0)
+            match bd {
+                1 | 2 | 4 => {
+                    // Sub-byte: compute ceil(width * bit_depth / 8)
+                    bytes_per_row = bytes_per_row_for_bit_depth(w, bd).unwrap_or(w as usize);
+                }
+                8 => {
+                    // 8-bit: 1 byte per pixel
+                    bytes_per_row = w as usize;
+                }
+                10 | 12 | 16 => {
+                    // 16-bit container: 2 bytes per pixel
+                    bytes_per_row = (w as u64).checked_mul(2).ok_or_else(|| {
+                        CafeError::TruncatedFile(
+                            "bytes_per_row calculation would overflow (Grayscale multi-byte 10/12/16)".into(),
+                        )
+                    })? as usize;
+                }
+                32 => {
+                    // 32-bit: 4 bytes per pixel
+                    bytes_per_row = (w as u64).checked_mul(4).ok_or_else(|| {
+                        CafeError::TruncatedFile(
+                            "bytes_per_row calculation would overflow (Grayscale 32-bit)".into(),
+                        )
+                    })? as usize;
+                }
+                _ => {
+                    return Err(CafeError::UnsupportedFeature(format!(
+                        "Color type=0 (Grayscale): bit depth {} not supported",
+                        bd
+                    )));
+                }
+            }
+            state.color_type = COLOR_TYPE_GRAY;
+            state.bit_depth = bd;
+        }
+        COLOR_TYPE_RGB => {
+            // RGB: bit depth 8, 10, 12, 16, 32 (section 4.1.2, v1.0)
+            match bd {
+                8 => {
+                    // 8-bit: 3 bytes/pixel
+                    bytes_per_row = (w as u64).checked_mul(3).ok_or_else(|| {
+                        CafeError::TruncatedFile(
+                            "bytes_per_row calculation would overflow (RGB 8-bit)".into(),
+                        )
+                    })? as usize;
+                }
+                10 | 12 | 16 => {
+                    // 16-bit container: 6 bytes/pixel (3 channels × 2 bytes)
+                    bytes_per_row = (w as u64).checked_mul(6).ok_or_else(|| {
+                        CafeError::TruncatedFile(
+                            "bytes_per_row calculation would overflow (RGB 10/12/16)".into(),
+                        )
+                    })? as usize;
+                }
+                32 => {
+                    // 32-bit: 12 bytes/pixel (3 channels × 4 bytes)
+                    bytes_per_row = (w as u64).checked_mul(12).ok_or_else(|| {
+                        CafeError::TruncatedFile(
+                            "bytes_per_row calculation would overflow (RGB 32-bit)".into(),
+                        )
+                    })? as usize;
+                }
+                _ => {
+                    return Err(CafeError::UnsupportedFeature(format!(
+                        "Color type=2 (RGB): bit depth {} not supported",
+                        bd
+                    )));
+                }
+            }
+            state.color_type = COLOR_TYPE_RGB;
+            state.bit_depth = bd;
+        }
+        COLOR_TYPE_INDEXED => {
+            // Palette: bit depth must be 1, 2, 4 or 8
+            if bd != 1 && bd != 2 && bd != 4 && bd != 8 {
+                return Err(CafeError::UnsupportedFeature(format!(
+                    "Color type=3 (Indexed): bit depth must be 1, 2, 4, or 8, got {bd}"
+                )));
+            }
+            state.color_type = COLOR_TYPE_INDEXED;
+            state.bit_depth = bd;
+            // For PLTE, bytes_per_row will be adjusted after reading the palette
+        }
+        COLOR_TYPE_GRAY_ALPHA => {
+            // Gray + Alpha: bit depth 1, 2, 4, 8, 10, 12, 16, 32 (section 4.1.3, v1.0)
+            match bd {
+                1 | 2 | 4 => {
+                    // Sub-byte: compute ceil(width * 2 * bit_depth / 8)
+                    let samples_per_row = w as u64 * 2u64;
+                    bytes_per_row = (samples_per_row.checked_mul(bd as u64).ok_or_else(|| {
+                        CafeError::TruncatedFile(
+                            "bytes_per_row calculation would overflow (Color type=4)".into(),
+                        )
+                    })? as usize)
+                        .div_ceil(8);
+                }
+                8 => {
+                    // 8-bit: 2 bytes/pixel (Gray + Alpha)
+                    bytes_per_row = (w as u64).checked_mul(2).ok_or_else(|| {
+                        CafeError::TruncatedFile(
+                            "bytes_per_row calculation would overflow (Gray+Alpha 8-bit)".into(),
+                        )
+                    })? as usize;
+                }
+                10 | 12 | 16 => {
+                    // 16-bit container: 4 bytes/pixel (2 channels × 2 bytes)
+                    bytes_per_row = (w as u64).checked_mul(4).ok_or_else(|| {
+                        CafeError::TruncatedFile(
+                            "bytes_per_row calculation would overflow (Gray+Alpha 10/12/16)".into(),
+                        )
+                    })? as usize;
+                }
+                32 => {
+                    // 32-bit: 8 bytes/pixel (2 channels × 4 bytes)
+                    bytes_per_row = (w as u64).checked_mul(8).ok_or_else(|| {
+                        CafeError::TruncatedFile(
+                            "bytes_per_row calculation would overflow (Gray+Alpha 32-bit)".into(),
+                        )
+                    })? as usize;
+                }
+                _ => {
+                    return Err(CafeError::UnsupportedFeature(format!(
+                        "Color type=4 (Gray+Alpha): bit depth {} not supported",
+                        bd
+                    )));
+                }
+            }
+            state.color_type = COLOR_TYPE_GRAY_ALPHA;
+            state.bit_depth = bd;
+        }
+        COLOR_TYPE_RGBA => {
+            // RGBA: bit depth 8, 10, 12, 16, 32 (section 4.1.4, v1.0)
+            match bd {
+                8 => {
+                    // 8-bit: 4 bytes/pixel (R, G, B, A)
+                    bytes_per_row = (w as u64).checked_mul(4).ok_or_else(|| {
+                        CafeError::TruncatedFile(
+                            "bytes_per_row calculation would overflow (RGBA 8-bit)".into(),
+                        )
+                    })? as usize;
+                }
+                10 | 12 | 16 => {
+                    // 16-bit container: 8 bytes/pixel (4 channels × 2 bytes)
+                    bytes_per_row = (w as u64).checked_mul(8).ok_or_else(|| {
+                        CafeError::TruncatedFile(
+                            "bytes_per_row calculation would overflow (RGBA 10/12/16)".into(),
+                        )
+                    })? as usize;
+                }
+                32 => {
+                    // 32-bit: 16 bytes/pixel (4 channels × 4 bytes)
+                    bytes_per_row = (w as u64).checked_mul(16).ok_or_else(|| {
+                        CafeError::TruncatedFile(
+                            "bytes_per_row calculation would overflow (RGBA 32-bit)".into(),
+                        )
+                    })? as usize;
+                }
+                _ => {
+                    return Err(CafeError::UnsupportedFeature(format!(
+                        "Color type=6 (RGBA): bit depth {} not supported",
+                        bd
+                    )));
+                }
+            }
+            state.color_type = COLOR_TYPE_RGBA;
+            state.bit_depth = bd;
+        }
+        _ => {
+            return Err(CafeError::UnsupportedFeature(format!(
+                "Color type {ct} not supported (supports 0, 2, 3, 4, 6)"
+            )));
+        }
+    }
+    state.bytes_per_row = bytes_per_row;
+
+    // SECURITY: Validate Filter method (section 4.1)
+    // Filter method = 1 (byte-shuffle) has been RESERVED since v1.0 and must be
+    // rejected explicitly, per spec section 4.1
+    // v1.1: Byte-shuffle (filter_method=1) now implemented
+    if fm != FILTER_METHOD_NONE
+        && fm != FILTER_METHOD_BYTE_SHUFFLE
+        && fm != FILTER_METHOD_PREDICTIVE
+    {
+        return Err(CafeError::UnsupportedFeature(format!(
+            "Filter method {} invalid: supports 0 (none), 1 (byte-shuffle), or 2 (predictive)",
+            fm
+        )));
+    }
+
+    // SECURITY: Validate Interlace method (section 5)
+    // v1.0 supports: 0 (none), 1 (Adam7) and 2 (even/odd)
+    if interlace_method != INTERLACE_NONE
+        && interlace_method != INTERLACE_ADAM7
+        && interlace_method != INTERLACE_EVEN_ODD
+    {
+        return Err(CafeError::UnsupportedFeature(format!(
+            "Interlace method {} invalid: supports only 0 (none), 1 (Adam7), and 2 (even/odd)",
+            interlace_method
+        )));
+    }
+    if compression_method & !COMPRESSION_METHOD_ZSTD_BIT != 0 {
+        return Err(CafeError::UnsupportedFeature(
+            "unknown compression codec".into(),
+        ));
+    }
+
+    // SECURITY/§4.3.2: byte-shuffle (filter_method=1) is incompatible with
+    // interlace. The encoder already rejects the combination; the decoder must
+    // reject malformed files that declare it — the Adam7/even-odd passes assume
+    // raw RGBA data, not byte-shuffled.
+    if fm == FILTER_METHOD_BYTE_SHUFFLE && interlace_method != INTERLACE_NONE {
+        return Err(CafeError::UnsupportedFeature(
+            "Byte-shuffle (filter_method=1) is incompatible with interlace (section 4.3.2)".into(),
+        ));
+    }
+
+    state.width = Some(w);
+    state.height = Some(h);
+    state.filter_method = fm;
+    state.interlace_method_read = interlace_method;
+
+    // SECURITY (CWE-409): compute the cumulative decompression cap from the IHDR
+    // dimensions. Each IDAT may only expand up to what the image still needs —
+    // multiple IDATs cannot sum to gigabytes if the image is small.
+    if state.decompress_budget.is_none() {
+        state.decompress_budget = Some(compute_decompress_budget(
+            interlace_method,
+            ct,
+            w,
+            h,
+            state.bytes_per_row,
+        ));
+    }
+
+    Ok(())
+}
+
+/// Handles the PLTE chunk (section 4.1.2): critical, required with
+/// color_type=3 (Indexed). Adjusts `bytes_per_row` for the indexed bit depth.
+fn handle_plte_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) -> Result<()> {
+    // PLTE is critical, required with Color type = 3 (section 4.1.2)
+    if state.palette.is_none() {
+        state.palette = Some(read_plte_chunk(flag, data)?);
+        // v1.0: Adjust bytes_per_row ONLY if color_type=3 (PLTE)
+        // If color_type=6 (RGBA) with Adam7, PLTE is ignored (don't overwrite bytes_per_row)
+        if state.color_type == COLOR_TYPE_INDEXED {
+            if let Some(w) = state.width {
+                // For palette, bytes_per_row depends on bit_depth (1, 2, 4, 8)
+                state.bytes_per_row = bytes_per_row_for_bit_depth(w, state.bit_depth)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handles the eXIF chunk (section 4.5): ancillary, single instance — ignores repeats.
+fn handle_exif_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) -> Result<()> {
+    if state.exif.is_none() {
+        state.exif = Some(decompress_chunk(flag, data)?);
+    }
+    Ok(())
+}
+
+/// Handles the jSON chunk (section 4.6): ancillary, multiple instances per
+/// namespace. Malformed JSON is silently discarded (ancillary contract).
+fn handle_json_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) -> Result<()> {
+    let (namespace, obj) = read_json_chunk(flag, data)?;
+    if let Some(obj) = obj {
+        state.json_metadata.insert(namespace, obj);
+    }
+    // obj == None -> malformed JSON, silently discarded (ancillary)
+    Ok(())
+}
+
+/// Handles the iCCP chunk (section 4.7): ancillary, single instance. Invalid
+/// profiles are silently discarded (ancillary contract), never propagated as
+/// a hard error.
+fn handle_iccp_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) {
+    if state.icc_profile.is_none() {
+        match read_iccp_chunk(flag, data) {
+            Ok(profile) => state.icc_profile = Some(profile),
+            Err(e) => {
+                // Invalid ICC profile, silently discarded (ancillary)
+                eprintln!("Warning: invalid iCCP chunk, discarded: {}", e);
+            }
+        }
+    }
+}
+
+/// Handles the xMPd chunk (section 4.8): ancillary, single instance. Invalid
+/// UTF-8 is silently discarded (ancillary contract).
+fn handle_xmpd_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) {
+    if state.xmp_metadata.is_none() {
+        match read_xmpd_chunk(flag, data) {
+            Ok(xmp) => state.xmp_metadata = Some(xmp),
+            Err(e) => {
+                // Invalid XMP metadata, silently discarded (ancillary)
+                eprintln!(
+                    "Warning: xMPd chunk contains invalid UTF-8, discarded: {}",
+                    e
+                );
+            }
+        }
+    }
+}
+
+/// Handles the zDIC chunk (v1.0): ancillary, single instance ZSTD
+/// dictionary. Invalid dictionaries are silently discarded (ancillary contract).
+fn handle_zdic_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) {
+    if state.zstd_dictionary.is_none() {
+        match read_zdic_chunk(flag, data) {
+            Ok(dict) => state.zstd_dictionary = Some(dict),
+            Err(e) => {
+                // Invalid ZSTD dictionary, silently discarded (ancillary)
+                eprintln!("Warning: invalid zDIC chunk, discarded: {}", e);
+            }
+        }
+    }
+}
+
+/// Handles the iDIM chunk (section 4.2): ancillary, optional, single
+/// instance per file — defines 2D tile partitioning for streaming.
+fn handle_idim_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) -> Result<()> {
+    if state.idim.is_none() {
+        // Single instance per file (similar to eXIF)
+        state.idim = Some(read_idim_chunk(flag, data)?);
+    }
+    Ok(())
+}
+
+/// Handles the cHDR chunk (section 4.4): ancillary, single instance HDR
+/// metadata. Invalid cHDR is silently discarded (ancillary contract).
+fn handle_chdr_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) {
+    if state.chdr.is_none() {
+        match read_chdr_chunk(flag, data) {
+            Ok(chdr_data) => state.chdr = Some(chdr_data),
+            Err(e) => {
+                // Invalid cHDR, silently discarded (ancillary)
+                eprintln!("Warning: invalid cHDR chunk, discarded: {}", e);
+            }
+        }
+    }
+}
+
+/// Handles a decompressed IDAT payload for the interlaced case (Adam7 or
+/// even/odd): extracts the 1-byte pass-number prefix and stashes the
+/// remainder in the appropriate pass slot.
+fn handle_interlaced_idat(state: &mut DecodeState, decompressed: Vec<u8>) -> Result<()> {
+    if state.interlace_method_read == INTERLACE_ADAM7 {
+        if decompressed.is_empty() {
+            return Err(CafeError::UnsupportedFeature("Empty Adam7 IDAT".into()));
+        }
+        let pass_number = decompressed[0];
+        if pass_number == 0 || pass_number > 7 {
+            return Err(CafeError::UnsupportedFeature(format!(
+                "Invalid Adam7 pass number: {}",
+                pass_number
+            )));
+        }
+        let pass_data = decompressed[1..].to_vec();
+        let pass_idx = (pass_number - 1) as usize;
+        state.adam7_passes[pass_idx] = pass_data;
+    } else {
+        // INTERLACE_EVEN_ODD
+        if decompressed.is_empty() {
+            return Err(CafeError::UnsupportedFeature("Empty even/odd IDAT".into()));
+        }
+        let pass_number = decompressed[0];
+        if pass_number == 0 || pass_number > 2 {
+            return Err(CafeError::UnsupportedFeature(format!(
+                "invalid even/odd pass number: {}",
+                pass_number
+            )));
+        }
+        let pass_data = decompressed[1..].to_vec();
+        let pass_idx = (pass_number - 1) as usize;
+        state.even_odd_passes[pass_idx] = pass_data;
+    }
+    Ok(())
+}
+
+/// Handles a non-interlaced IDAT tile payload when 2D tiling (iDIM) is
+/// present: undoes byte-shuffle/predictive filter for the tile, then copies
+/// it into the correct `(row0, col0)` region of `state.pixel_rows`.
+fn handle_idat_tile_idim(state: &mut DecodeState, tile_payload: Vec<u8>) -> Result<()> {
+    let idim = state.idim.clone().ok_or_else(|| {
+        CafeError::TruncatedFile("iDIM tile handler invoked without iDIM chunk".into())
+    })?;
+    // 2D tiling (section 4.2): each IDAT is a tile in the scan_order order;
+    // reassembles the tiles back into the `pixel_rows` buffer.
+    if state.color_type == COLOR_TYPE_INDEXED {
+        return Err(CafeError::UnsupportedFeature(
+            "iDIM (2D tiling) with indexed palette not supported".into(),
+        ));
+    }
+    if state.bit_depth < 8 {
+        return Err(CafeError::UnsupportedFeature(
+            "iDIM (tiling 2D) requires bit_depth >= 8 in decode".into(),
+        ));
+    }
+    let bpp_for_tile = bytes_per_pixel(state.color_type, state.bit_depth).ok_or_else(|| {
+        CafeError::UnsupportedFeature(format!(
+            "Color type {}, bit depth {} not supported",
+            state.color_type, state.bit_depth
+        ))
+    })?;
+    let img_width = state.width.ok_or(CafeError::MissingIhdr)?;
+    let img_height = state.height.ok_or(CafeError::MissingIhdr)?;
+    let ih = img_height as usize;
+    let full_size = state.bytes_per_row.checked_mul(ih).ok_or_else(|| {
+        CafeError::TruncatedFile("overflow in bytes_per_row × height (iDIM)".into())
+    })?;
+    let tile_count = idim.tiles_x as usize * idim.tiles_y as usize;
+    if state.tiles_seen >= tile_count {
+        return Err(CafeError::TruncatedFile(format!(
+            "Excess IDAT: expected {tile_count} tiles (iDIM)"
+        )));
+    }
+    if state.pixel_rows.is_empty() {
+        state.pixel_rows = vec![0u8; full_size];
+    }
+    if state.pixel_rows.len() != full_size {
+        return Err(CafeError::TruncatedFile(
+            "tile buffer inconsistent with IHDR (iDIM)".into(),
+        ));
+    }
+    let tile_order = idim.tile_order()?;
+    let (tx, ty) = tile_order[state.tiles_seen];
+    state.tiles_seen += 1;
+    let (tile_w, tile_h) = idim.tile_dimensions(tx, ty, img_width, img_height);
+    let tw = tile_w as usize;
+    let th = tile_h as usize;
+    let tile_stride = tw
+        .checked_mul(bpp_for_tile)
+        .ok_or_else(|| CafeError::UnsupportedFeature("overflow in tile stride (iDIM)".into()))?;
+    let tile_raw = if state.filter_method == FILTER_METHOD_BYTE_SHUFFLE {
+        // v1.1: byte-shuffle undone before any predictive filter
+        shuffle::undo_byte_shuffle(&tile_payload, bpp_for_tile, tile_w, tile_h)?
+    } else if state.filter_method == FILTER_METHOD_PREDICTIVE {
+        // 1 filter byte prefixed per tile, with tile_stride per row
+        let tile_h_est = tile_payload.len().saturating_sub(1) / tile_stride.max(1);
+        if tile_h_est != th {
+            return Err(CafeError::TruncatedFile(format!(
+                "tile with inconsistent height: expected {th}, "
+            )));
+        }
+        undo_predictive_filter(&tile_payload, th, tile_stride, bpp_for_tile)?
+    } else {
+        tile_payload
+    };
+    let tile_len = tile_stride
+        .checked_mul(th)
+        .ok_or_else(|| CafeError::TruncatedFile("overflow in tile len (iDIM)".into()))?;
+    if tile_raw.len() != tile_len {
+        return Err(CafeError::TruncatedFile(format!(
+            "tile {} with unexpected size: {} (expected {})",
+            state.tiles_seen,
+            tile_raw.len(),
+            tile_len
+        )));
+    }
+    let row0 = (ty as u32 * idim.tile_height as u32) as usize;
+    let col0 = (tx as u32 * idim.tile_width as u32) as usize;
+    for r in 0..th {
+        let dst_start = (row0 + r)
+            .checked_mul(state.bytes_per_row)
+            .and_then(|v| v.checked_add(col0 * bpp_for_tile))
+            .ok_or_else(|| {
+                CafeError::TruncatedFile("overflow in tile destination (iDIM)".into())
+            })?;
+        if dst_start + tile_stride > state.pixel_rows.len() {
+            return Err(CafeError::TruncatedFile(
+                "tile exceeds image buffer (iDIM)".into(),
+            ));
+        }
+        let src = &tile_raw[r * tile_stride..(r + 1) * tile_stride];
+        state.pixel_rows[dst_start..dst_start + tile_stride].copy_from_slice(src);
+    }
+    Ok(())
+}
+
+/// Handles a non-interlaced, non-tiled IDAT payload for `color_type=3`
+/// (Indexed): undoes byte-shuffle/predictive filter, unpacks each row back
+/// to 1 byte/index, and appends to `state.pixel_rows` with an explicit
+/// CWE-400 accumulation cap derived from the IHDR dimensions.
+fn handle_idat_indexed(state: &mut DecodeState, tile_payload: Vec<u8>) -> Result<()> {
+    // IDAT contains indices packed in bit_depth bits (or filtered)
+    // v1.0: the predictive filter prefixes 1 byte per block/tile (not per row)
+    // SECURITY (§4.1.2/CWE-369): color_type=3 requires a PLTE chunk before
+    // any IDAT; without it bytes_per_row is 0 and the division below
+    // would panic. Reject with a recoverable error.
+    if state.palette.is_none() {
+        return Err(CafeError::TruncatedFile(
+            "Color type=3 requires PLTE chunk before first IDAT".into(),
+        ));
+    }
+    // v1.1: Byte-shuffle undone before other filters
+    let tile_payload = if state.filter_method == FILTER_METHOD_BYTE_SHUFFLE {
+        let img_width = state.width.ok_or(CafeError::MissingIhdr)?;
+        let img_height = state.height.ok_or(CafeError::MissingIhdr)?;
+        let bpp = 1; // Indexed always 1 byte/pixel (before pack)
+        shuffle::undo_byte_shuffle(&tile_payload, bpp, img_width, img_height)?
+    } else {
+        tile_payload
+    };
+    let tile_h = if state.filter_method == FILTER_METHOD_PREDICTIVE {
+        tile_payload.len().saturating_sub(1) / state.bytes_per_row
+    } else {
+        tile_payload.len() / state.bytes_per_row
+    };
+    let tile_packed = if state.filter_method == FILTER_METHOD_PREDICTIVE {
+        undo_predictive_filter(&tile_payload, tile_h, state.bytes_per_row, 1)?
+    } else {
+        tile_payload
+    };
+    // Unpack each row back to 1 byte/index
+    // (bit_depth==8 is a trivial case inside unpack_indices_row)
+    let row_width = state.width.ok_or(CafeError::MissingIhdr)? as usize;
+    let img_height = state.height.ok_or(CafeError::MissingIhdr)? as usize;
+    // SECURITY (CWE-400): prevents accumulation of indices beyond the
+    // declared size (multiple-IDAT bomb).
+    let expected_indices = row_width.checked_mul(img_height).ok_or_else(|| {
+        CafeError::TruncatedFile("overflow in calculation of expected indices (indexed)".into())
+    })?;
+    for r in 0..tile_h {
+        let row_packed = &tile_packed[r * state.bytes_per_row..(r + 1) * state.bytes_per_row];
+        let row_indices = unpack_indices_row(row_packed, state.bit_depth, row_width)?;
+        let new_len = state
+            .pixel_rows
+            .len()
+            .checked_add(row_indices.len())
+            .ok_or_else(|| {
+                CafeError::TruncatedFile("overflow accumulating pixel indices".into())
+            })?;
+        if new_len > expected_indices {
+            return Err(CafeError::TruncatedFile(format!(
+                "Excess IDAT: indexed pixel data sum exceeds \
+                  {expected_indices} (IHDR {row_width}x{img_height})"
+            )));
+        }
+        state.pixel_rows.extend_from_slice(&row_indices);
+    }
+    Ok(())
+}
+
+/// Handles a non-interlaced, non-tiled IDAT payload for color types 0, 2, 4,
+/// 6 (Gray, RGB, Gray+Alpha, RGBA): undoes byte-shuffle/predictive filter
+/// using the type's bpp, and appends to `state.pixel_rows` with an explicit
+/// CWE-400 accumulation cap derived from the IHDR dimensions.
+fn handle_idat_direct_color(state: &mut DecodeState, tile_payload: Vec<u8>) -> Result<()> {
+    // Color types 0, 2, 4, 6: unpack with the correct bpp for the type
+    let bpp_for_filter = bytes_per_pixel(state.color_type, state.bit_depth).ok_or_else(|| {
+        CafeError::UnsupportedFeature(format!(
+            "Color type {}, bit depth {} not supported",
+            state.color_type, state.bit_depth
+        ))
+    })?;
+
+    // v1.1: Byte-shuffle undone before the predictive filter
+    let tile_payload = if state.filter_method == FILTER_METHOD_BYTE_SHUFFLE {
+        let img_width = state.width.ok_or(CafeError::MissingIhdr)?;
+        // tile_h derived from the payload (without the prefixed filter byte):
+        // each row has bytes_per_row bytes, so height = len / stride
+        let tile_h = tile_payload.len() / state.bytes_per_row.max(1);
+        shuffle::undo_byte_shuffle(&tile_payload, bpp_for_filter, img_width, tile_h as u32)?
+    } else {
+        tile_payload
+    };
+
+    let tile_raw = if state.filter_method == FILTER_METHOD_PREDICTIVE {
+        // v1.0: 1 filter byte per block/tile
+        let tile_h = tile_payload.len().saturating_sub(1) / state.bytes_per_row;
+        undo_predictive_filter(&tile_payload, tile_h, state.bytes_per_row, bpp_for_filter)?
+    } else {
+        tile_payload
+    };
+    // SECURITY (CWE-400): prevents accumulation of pixel rows beyond
+    // the declared size (multiple-IDAT bomb).
+    let img_height = state.height.ok_or(CafeError::MissingIhdr)? as usize;
+    let expected_row_bytes = state
+        .bytes_per_row
+        .checked_mul(img_height)
+        .ok_or_else(|| CafeError::TruncatedFile("overflow in bytes_per_row × height".into()))?;
+    let new_len = state
+        .pixel_rows
+        .len()
+        .checked_add(tile_raw.len())
+        .ok_or_else(|| CafeError::TruncatedFile("overflow accumulating linhas de pixel".into()))?;
+    if new_len > expected_row_bytes {
+        return Err(CafeError::TruncatedFile(format!(
+            "Excess IDAT: indexed data pixels sum more than \
+             {expected_row_bytes} bytes (bytes_per_row={}, \
+             height={img_height})",
+            state.bytes_per_row
+        )));
+    }
+    state.pixel_rows.extend_from_slice(&tile_raw);
+    Ok(())
+}
+
+/// Handles the IDAT chunk (pixel data): enforces the cumulative
+/// decompression budget (CWE-409), then dispatches to the interlaced,
+/// tiled (iDIM), indexed, or direct-color handler depending on the state
+/// accumulated so far from IHDR/iDIM/PLTE.
+fn handle_idat_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) -> Result<()> {
+    // SECURITY (CWE-409): the decompression cap for this IDAT is the
+    // remaining budget (computed from the IHDR). A single IDAT cannot
+    // expand beyond what the image still needs.
+    let budget = state
+        .decompress_budget
+        .ok_or_else(|| CafeError::TruncatedFile("IDAT before IHDR".into()))?;
+    let remaining = budget.saturating_sub(state.decompressed_total);
+    let decompressed =
+        decompress_chunk_dict_limited(flag, data, state.zstd_dictionary.as_deref(), remaining)?;
+    state.decompressed_total = state
+        .decompressed_total
+        .checked_add(decompressed.len() as u64)
+        .ok_or_else(|| CafeError::TruncatedFile("overflow in decompressed total".into()))?;
+
+    // v1.0/+5: If interlaced, extract pass_number from the prefix
+    if state.interlace_method_read == INTERLACE_ADAM7
+        || state.interlace_method_read == INTERLACE_EVEN_ODD
+    {
+        handle_interlaced_idat(state, decompressed)
+    } else {
+        // v1.0 (with full interlace support): process normally
+        let tile_payload = decompressed;
+
+        if state.idim.is_some() {
+            handle_idat_tile_idim(state, tile_payload)
+        } else if state.color_type == COLOR_TYPE_INDEXED {
+            handle_idat_indexed(state, tile_payload)
+        } else {
+            handle_idat_direct_color(state, tile_payload)
+        }
+    }
+}
+/// Decodes a CAFE buffer with custom decode options (tone-map operator selection, etc.)
+/// This is the core decode implementation without file I/O, with customizable options.
+///
+/// This is a small dispatch loop over `read_chunk`; each chunk type's parsing
+/// and validation logic lives in its own `handle_*_chunk` function above
+/// (refactoring v1.2.2) so the critical decode path — which processes 100%
+/// of the untrusted file bytes — stays auditable chunk-by-chunk instead of
+/// as one large function.
 fn decode_bytes_internal(
     buf: &[u8],
     tonemap_operator: tonemap::ToneMapOperator,
@@ -794,709 +1579,23 @@ fn decode_bytes_internal(
     }
 
     let mut offset = 9;
-    let mut width: Option<u32> = None;
-    let mut height: Option<u32> = None;
-    let mut filter_method = FILTER_METHOD_NONE;
-    let mut interlace_method_read = INTERLACE_NONE; // Read from IHDR (v1.0)
-    let mut bytes_per_row: usize = 0;
-    let mut pixel_rows: Vec<u8> = Vec::new();
-    // SECURITY (CWE-409): cumulative decompression budget for the IDATs.
-    // Derived from the size expected by the IHDR; prevents multiple IDATs
-    // from expanding to gigabytes when the image is small.
-    let mut decompress_budget: Option<u64> = None;
-    let mut decompressed_total: u64 = 0;
-    let mut adam7_passes: [Vec<u8>; ADAM7_NUM_PASSES] = Default::default(); // For Adam7 (v1.0)
-    let mut even_odd_passes: [Vec<u8>; EVEN_ODD_NUM_PASSES] = Default::default(); // For even/odd (v1.0)
-    let mut exif: Option<Vec<u8>> = None;
-    let mut json_metadata: HashMap<String, Value> = HashMap::new();
-    let mut icc_profile: Option<Vec<u8>> = None; // New: ICC profile (v1.0)
-    let mut xmp_metadata: Option<String> = None; // New: XMP metadata (v1.0)
-    let mut zstd_dictionary: Option<Vec<u8>> = None; // New: ZSTD dictionary (v1.0)
-    let mut color_type: u8 = COLOR_TYPE_RGBA; // Default, will be overwritten
-    let mut bit_depth: u8 = 8; // Default, will be overwritten
-    let mut sample_format: u8 = SAMPLE_FORMAT_UINT; // Default: unsigned integer (v1.0)
-    let mut palette: Option<Palette> = None;
-    let mut idim: Option<iDim> = None; // iDIM chunk (v1.0, ancillary)
-    let mut tiles_seen: usize = 0; // Tile counter for 2D tiling (iDIM)
-    let mut chdr: Option<cHDR> = None; // cHDR chunk (v1.0, ancilar, HDR metadata)
+    let mut state = DecodeState::default();
 
     while offset < buf.len() {
         let chunk = read_chunk(buf, offset)?;
         offset = chunk.next_offset;
 
         match &chunk.chunk_type {
-            t if t == CHUNK_IHDR => {
-                const IHDR_LEN: usize = 14;
-                if chunk.data.len() < IHDR_LEN {
-                    return Err(CafeError::TruncatedFile(format!(
-                        "IHDR must have {IHDR_LEN} bytes, got {}",
-                        chunk.data.len()
-                    )));
-                }
-                let w = u32::from_be_bytes(chunk.data[0..4].try_into().map_err(|_| {
-                    CafeError::TruncatedFile("IHDR Width conversion failed".into())
-                })?);
-                let h = u32::from_be_bytes(chunk.data[4..8].try_into().map_err(|_| {
-                    CafeError::TruncatedFile("IHDR Height conversion failed".into())
-                })?);
-                let bd = chunk.data[8];
-                let sf = chunk.data[9]; // Sample format (v1.0)
-                let ct = chunk.data[10];
-                let compression_method = chunk.data[11];
-                let fm = chunk.data[12];
-                let interlace_method = chunk.data[13];
-
-                // Width/Height = 0 is a degenerate image; rejecting here avoids
-                // a later division by zero (bytes_per_row computed from the
-                // width) instead of propagating an invalid state silently.
-                if w == 0 || h == 0 {
-                    return Err(CafeError::UnsupportedFeature(format!(
-                        "Invalid dimensions: Width={w}, Height={h} (neither can be 0)"
-                    )));
-                }
-
-                // Validate sample format (section 4.1, v1.0)
-                match sf {
-                    SAMPLE_FORMAT_UINT | SAMPLE_FORMAT_FLOAT | SAMPLE_FORMAT_HALF => {
-                        // Valid, will be stored
-                    }
-                    _ => {
-                        return Err(CafeError::UnsupportedFeature(format!(
-                            "Sample format {} not supported (supports 0=uint, 1=float, 2=half)",
-                            sf
-                        )));
-                    }
-                }
-                sample_format = sf;
-
-                // Validate the sample_format + bit_depth combination (section 4.1, v1.0)
-                if sf == SAMPLE_FORMAT_FLOAT && bd != 32 {
-                    return Err(CafeError::UnsupportedFeature(format!(
-                        "Sample format FLOAT requires bit_depth 32, got {}",
-                        bd
-                    )));
-                }
-                if sf == SAMPLE_FORMAT_HALF && bd != 16 {
-                    return Err(CafeError::UnsupportedFeature(format!(
-                        "Sample format HALF requires bit_depth 16, got {}",
-                        bd
-                    )));
-                }
-                if sf == SAMPLE_FORMAT_UINT && (bd == 32 || bd == 16) && bd != 32 && bd != 16 {
-                    // uint allows multiple bit depths, but 16 and 32 may conflict with float/half
-                    // Allowed only if explicitly uint
-                }
-
-                // Validate color type and bit depth (section 4.1, v1.0)
-                match ct {
-                    COLOR_TYPE_GRAY => {
-                        // Grayscale: bit depth 1, 2, 4, 8, 10, 12, 16, 32 (section 4.1.1, v1.0)
-                        match bd {
-                            1 | 2 | 4 => {
-                                // Sub-byte: compute ceil(width * bit_depth / 8)
-                                bytes_per_row =
-                                    bytes_per_row_for_bit_depth(w, bd).unwrap_or(w as usize);
-                            }
-                            8 => {
-                                // 8-bit: 1 byte per pixel
-                                bytes_per_row = w as usize;
-                            }
-                            10 | 12 | 16 => {
-                                // 16-bit container: 2 bytes per pixel
-                                bytes_per_row = (w as u64).checked_mul(2).ok_or_else(|| {
-                                    CafeError::TruncatedFile(
-                                        "bytes_per_row calculation would overflow (Grayscale multi-byte 10/12/16)".into(),
-                                    )
-                                })? as usize;
-                            }
-                            32 => {
-                                // 32-bit: 4 bytes per pixel
-                                bytes_per_row = (w as u64).checked_mul(4).ok_or_else(|| {
-                                    CafeError::TruncatedFile(
-                                        "bytes_per_row calculation would overflow (Grayscale 32-bit)"
-                                            .into(),
-                                    )
-                                })? as usize;
-                            }
-                            _ => {
-                                return Err(CafeError::UnsupportedFeature(format!(
-                                    "Color type=0 (Grayscale): bit depth {} not supported",
-                                    bd
-                                )));
-                            }
-                        }
-                        color_type = COLOR_TYPE_GRAY;
-                        bit_depth = bd;
-                    }
-                    COLOR_TYPE_RGB => {
-                        // RGB: bit depth 8, 10, 12, 16, 32 (section 4.1.2, v1.0)
-                        match bd {
-                            8 => {
-                                // 8-bit: 3 bytes/pixel
-                                bytes_per_row = (w as u64).checked_mul(3).ok_or_else(|| {
-                                    CafeError::TruncatedFile(
-                                        "bytes_per_row calculation would overflow (RGB 8-bit)"
-                                            .into(),
-                                    )
-                                })? as usize;
-                            }
-                            10 | 12 | 16 => {
-                                // 16-bit container: 6 bytes/pixel (3 channels × 2 bytes)
-                                bytes_per_row = (w as u64).checked_mul(6).ok_or_else(|| {
-                                    CafeError::TruncatedFile(
-                                        "bytes_per_row calculation would overflow (RGB 10/12/16)"
-                                            .into(),
-                                    )
-                                })? as usize;
-                            }
-                            32 => {
-                                // 32-bit: 12 bytes/pixel (3 channels × 4 bytes)
-                                bytes_per_row = (w as u64).checked_mul(12).ok_or_else(|| {
-                                    CafeError::TruncatedFile(
-                                        "bytes_per_row calculation would overflow (RGB 32-bit)"
-                                            .into(),
-                                    )
-                                })? as usize;
-                            }
-                            _ => {
-                                return Err(CafeError::UnsupportedFeature(format!(
-                                    "Color type=2 (RGB): bit depth {} not supported",
-                                    bd
-                                )));
-                            }
-                        }
-                        color_type = COLOR_TYPE_RGB;
-                        bit_depth = bd;
-                    }
-                    COLOR_TYPE_INDEXED => {
-                        // Palette: bit depth must be 1, 2, 4 or 8
-                        if bd != 1 && bd != 2 && bd != 4 && bd != 8 {
-                            return Err(CafeError::UnsupportedFeature(format!(
-                                "Color type=3 (Indexed): bit depth must be 1, 2, 4, or 8, got {bd}"
-                            )));
-                        }
-                        color_type = COLOR_TYPE_INDEXED;
-                        bit_depth = bd;
-                        // For PLTE, bytes_per_row will be adjusted after reading the palette
-                    }
-                    COLOR_TYPE_GRAY_ALPHA => {
-                        // Gray + Alpha: bit depth 1, 2, 4, 8, 10, 12, 16, 32 (section 4.1.3, v1.0)
-                        match bd {
-                            1 | 2 | 4 => {
-                                // Sub-byte: compute ceil(width * 2 * bit_depth / 8)
-                                let samples_per_row = w as u64 * 2u64;
-                                bytes_per_row =
-                                    (samples_per_row.checked_mul(bd as u64).ok_or_else(|| {
-                                        CafeError::TruncatedFile(
-                                        "bytes_per_row calculation would overflow (Color type=4)"
-                                            .into(),
-                                    )
-                                    })? as usize)
-                                        .div_ceil(8);
-                            }
-                            8 => {
-                                // 8-bit: 2 bytes/pixel (Gray + Alpha)
-                                bytes_per_row = (w as u64).checked_mul(2).ok_or_else(|| {
-                                    CafeError::TruncatedFile(
-                                        "bytes_per_row calculation would overflow (Gray+Alpha 8-bit)"
-                                            .into(),
-                                    )
-                                })? as usize;
-                            }
-                            10 | 12 | 16 => {
-                                // 16-bit container: 4 bytes/pixel (2 channels × 2 bytes)
-                                bytes_per_row = (w as u64).checked_mul(4).ok_or_else(|| {
-                                    CafeError::TruncatedFile(
-                                        "bytes_per_row calculation would overflow (Gray+Alpha 10/12/16)"
-                                            .into(),
-                                    )
-                                })? as usize;
-                            }
-                            32 => {
-                                // 32-bit: 8 bytes/pixel (2 channels × 4 bytes)
-                                bytes_per_row = (w as u64).checked_mul(8).ok_or_else(|| {
-                                    CafeError::TruncatedFile(
-                                        "bytes_per_row calculation would overflow (Gray+Alpha 32-bit)"
-                                            .into(),
-                                    )
-                                })? as usize;
-                            }
-                            _ => {
-                                return Err(CafeError::UnsupportedFeature(format!(
-                                    "Color type=4 (Gray+Alpha): bit depth {} not supported",
-                                    bd
-                                )));
-                            }
-                        }
-                        color_type = COLOR_TYPE_GRAY_ALPHA;
-                        bit_depth = bd;
-                    }
-                    COLOR_TYPE_RGBA => {
-                        // RGBA: bit depth 8, 10, 12, 16, 32 (section 4.1.4, v1.0)
-                        match bd {
-                            8 => {
-                                // 8-bit: 4 bytes/pixel (R, G, B, A)
-                                bytes_per_row = (w as u64).checked_mul(4).ok_or_else(|| {
-                                    CafeError::TruncatedFile(
-                                        "bytes_per_row calculation would overflow (RGBA 8-bit)"
-                                            .into(),
-                                    )
-                                })? as usize;
-                            }
-                            10 | 12 | 16 => {
-                                // 16-bit container: 8 bytes/pixel (4 channels × 2 bytes)
-                                bytes_per_row = (w as u64).checked_mul(8).ok_or_else(|| {
-                                    CafeError::TruncatedFile(
-                                        "bytes_per_row calculation would overflow (RGBA 10/12/16)"
-                                            .into(),
-                                    )
-                                })? as usize;
-                            }
-                            32 => {
-                                // 32-bit: 16 bytes/pixel (4 channels × 4 bytes)
-                                bytes_per_row = (w as u64).checked_mul(16).ok_or_else(|| {
-                                    CafeError::TruncatedFile(
-                                        "bytes_per_row calculation would overflow (RGBA 32-bit)"
-                                            .into(),
-                                    )
-                                })? as usize;
-                            }
-                            _ => {
-                                return Err(CafeError::UnsupportedFeature(format!(
-                                    "Color type=6 (RGBA): bit depth {} not supported",
-                                    bd
-                                )));
-                            }
-                        }
-                        color_type = COLOR_TYPE_RGBA;
-                        bit_depth = bd;
-                    }
-                    _ => {
-                        return Err(CafeError::UnsupportedFeature(format!(
-                            "Color type {ct} not supported (supports 0, 2, 3, 4, 6)"
-                        )));
-                    }
-                }
-
-                // SECURITY: Validate Filter method (section 4.1)
-                // Filter method = 1 (byte-shuffle) has been RESERVED since v1.0 and must be
-                // rejected explicitly, per spec section 4.1
-                // v1.1: Byte-shuffle (filter_method=1) now implemented
-                if fm != FILTER_METHOD_NONE
-                    && fm != FILTER_METHOD_BYTE_SHUFFLE
-                    && fm != FILTER_METHOD_PREDICTIVE
-                {
-                    return Err(CafeError::UnsupportedFeature(format!(
-                        "Filter method {} invalid: supports 0 (none), 1 (byte-shuffle), or 2 (predictive)",
-                        fm
-                    )));
-                }
-
-                // SECURITY: Validate Interlace method (section 5)
-                // v1.0 supports: 0 (none), 1 (Adam7) and 2 (even/odd)
-                if interlace_method != INTERLACE_NONE
-                    && interlace_method != INTERLACE_ADAM7
-                    && interlace_method != INTERLACE_EVEN_ODD
-                {
-                    return Err(CafeError::UnsupportedFeature(
-                        format!("Interlace method {} invalid: supports only 0 (none), 1 (Adam7), and 2 (even/odd)", interlace_method),
-                    ));
-                }
-                if compression_method & !COMPRESSION_METHOD_ZSTD_BIT != 0 {
-                    return Err(CafeError::UnsupportedFeature(
-                        "unknown compression codec".into(),
-                    ));
-                }
-
-                // SECURITY/§4.3.2: byte-shuffle (filter_method=1) is incompatible with
-                // interlace. The encoder already rejects the combination; the decoder must
-                // reject malformed files that declare it — the Adam7/even-odd passes assume
-                // raw RGBA data, not byte-shuffled.
-                if fm == FILTER_METHOD_BYTE_SHUFFLE && interlace_method != INTERLACE_NONE {
-                    return Err(CafeError::UnsupportedFeature(
-                        "Byte-shuffle (filter_method=1) is incompatible with interlace (section 4.3.2)"
-                            .into(),
-                    ));
-                }
-
-                width = Some(w);
-                height = Some(h);
-                filter_method = fm;
-                interlace_method_read = interlace_method;
-
-                // SECURITY (CWE-409): compute the cumulative decompression cap from the IHDR
-                // dimensions. Each IDAT may only expand up to what the image still needs —
-                // multiple IDATs cannot sum to gigabytes if the image is small.
-                if decompress_budget.is_none() {
-                    decompress_budget = Some(compute_decompress_budget(
-                        interlace_method,
-                        ct,
-                        w,
-                        h,
-                        bytes_per_row,
-                    ));
-                }
-            }
-            t if t == CHUNK_PLTE => {
-                // PLTE is critical, required with Color type = 3 (section 4.1.2)
-                if palette.is_none() {
-                    palette = Some(read_plte_chunk(chunk.flag, &chunk.data)?);
-                    // v1.0: Adjust bytes_per_row ONLY if color_type=3 (PLTE)
-                    // If color_type=6 (RGBA) with Adam7, PLTE is ignored (don't overwrite bytes_per_row)
-                    if color_type == COLOR_TYPE_INDEXED {
-                        if let Some(w) = width {
-                            // For palette, bytes_per_row depends on bit_depth (1, 2, 4, 8)
-                            bytes_per_row = bytes_per_row_for_bit_depth(w, bit_depth)?;
-                        }
-                    }
-                }
-            }
-            t if t == CHUNK_EXIF => {
-                if exif.is_none() {
-                    // single instance (section 4.5) - ignores repeats
-                    exif = Some(decompress_chunk(chunk.flag, &chunk.data)?);
-                }
-            }
-            t if t == CHUNK_JSON => {
-                let (namespace, obj) = read_json_chunk(chunk.flag, &chunk.data)?;
-                if let Some(obj) = obj {
-                    json_metadata.insert(namespace, obj);
-                }
-                // obj == None -> malformed JSON, silently discarded (ancillary)
-            }
-            t if t == CHUNK_ICCP => {
-                // iCCP is ancillary, single instance (v1.0)
-                if icc_profile.is_none() {
-                    match read_iccp_chunk(chunk.flag, &chunk.data) {
-                        Ok(profile) => icc_profile = Some(profile),
-                        Err(e) => {
-                            // Invalid ICC profile, silently discarded (ancillary)
-                            eprintln!("Warning: invalid iCCP chunk, discarded: {}", e);
-                        }
-                    }
-                }
-            }
-            t if t == CHUNK_XMPD => {
-                // xMPd is ancillary, single instance (v1.0)
-                if xmp_metadata.is_none() {
-                    match read_xmpd_chunk(chunk.flag, &chunk.data) {
-                        Ok(xmp) => xmp_metadata = Some(xmp),
-                        Err(e) => {
-                            // Invalid XMP metadata, silently discarded (ancillary)
-                            eprintln!(
-                                "Warning: xMPd chunk contains invalid UTF-8, discarded: {}",
-                                e
-                            );
-                        }
-                    }
-                }
-            }
-            t if t == CHUNK_ZDIC => {
-                // zDIC is ancillary, single instance (v1.0)
-                if zstd_dictionary.is_none() {
-                    match read_zdic_chunk(chunk.flag, &chunk.data) {
-                        Ok(dict) => zstd_dictionary = Some(dict),
-                        Err(e) => {
-                            // Invalid ZSTD dictionary, silently discarded (ancillary)
-                            eprintln!("Warning: invalid zDIC chunk, discarded: {}", e);
-                        }
-                    }
-                }
-            }
-            t if t == CHUNK_IDIM => {
-                // iDIM is ancillary, optional (v1.0, section 4.2)
-                if idim.is_none() {
-                    // Single instance per file (similar to eXIF)
-                    idim = Some(read_idim_chunk(chunk.flag, &chunk.data)?);
-                }
-            }
-            t if t == CHUNK_CHDR => {
-                // cHDR is ancillary, single instance (v1.0, section 4.4)
-                if chdr.is_none() {
-                    match read_chdr_chunk(chunk.flag, &chunk.data) {
-                        Ok(chdr_data) => chdr = Some(chdr_data),
-                        Err(e) => {
-                            // Invalid cHDR, silently discarded (ancillary)
-                            eprintln!("Warning: invalid cHDR chunk, discarded: {}", e);
-                        }
-                    }
-                }
-            }
-            t if t == CHUNK_IDAT => {
-                // SECURITY (CWE-409): the decompression cap for this IDAT is the
-                // remaining budget (computed from the IHDR). A single IDAT cannot
-                // expand beyond what the image still needs.
-                let budget = decompress_budget
-                    .ok_or_else(|| CafeError::TruncatedFile("IDAT before IHDR".into()))?;
-                let remaining = budget.saturating_sub(decompressed_total);
-                let decompressed = decompress_chunk_dict_limited(
-                    chunk.flag,
-                    &chunk.data,
-                    zstd_dictionary.as_deref(),
-                    remaining,
-                )?;
-                decompressed_total = decompressed_total
-                    .checked_add(decompressed.len() as u64)
-                    .ok_or_else(|| {
-                        CafeError::TruncatedFile("overflow in decompressed total".into())
-                    })?;
-
-                // v1.0/+5: If interlaced, extract pass_number from the prefix
-                if interlace_method_read == INTERLACE_ADAM7 {
-                    if decompressed.is_empty() {
-                        return Err(CafeError::UnsupportedFeature("Empty Adam7 IDAT".into()));
-                    }
-                    let pass_number = decompressed[0];
-                    if pass_number == 0 || pass_number > 7 {
-                        return Err(CafeError::UnsupportedFeature(format!(
-                            "Invalid Adam7 pass number: {}",
-                            pass_number
-                        )));
-                    }
-                    let pass_data = decompressed[1..].to_vec();
-                    let pass_idx = (pass_number - 1) as usize;
-                    adam7_passes[pass_idx] = pass_data;
-                } else if interlace_method_read == INTERLACE_EVEN_ODD {
-                    if decompressed.is_empty() {
-                        return Err(CafeError::UnsupportedFeature("Empty even/odd IDAT".into()));
-                    }
-                    let pass_number = decompressed[0];
-                    if pass_number == 0 || pass_number > 2 {
-                        return Err(CafeError::UnsupportedFeature(format!(
-                            "invalid even/odd pass number: {}",
-                            pass_number
-                        )));
-                    }
-                    let pass_data = decompressed[1..].to_vec();
-                    let pass_idx = (pass_number - 1) as usize;
-                    even_odd_passes[pass_idx] = pass_data;
-                } else {
-                    // v1.0 (with full interlace support): process normally
-                    let tile_payload = decompressed;
-
-                    if let Some(idim) = &idim {
-                        // 2D tiling (section 4.2): each IDAT is a tile in the scan_order order;
-                        // reassembles the tiles back into the `pixel_rows` buffer.
-                        if color_type == COLOR_TYPE_INDEXED {
-                            return Err(CafeError::UnsupportedFeature(
-                                "iDIM (2D tiling) with indexed palette not supported".into(),
-                            ));
-                        }
-                        if bit_depth < 8 {
-                            return Err(CafeError::UnsupportedFeature(
-                                "iDIM (tiling 2D) requires bit_depth >= 8 in decode".into(),
-                            ));
-                        }
-                        let bpp_for_tile =
-                            bytes_per_pixel(color_type, bit_depth).ok_or_else(|| {
-                                CafeError::UnsupportedFeature(format!(
-                                    "Color type {color_type}, bit depth {bit_depth} not supported"
-                                ))
-                            })?;
-                        let img_width = width.ok_or(CafeError::MissingIhdr)?;
-                        let img_height = height.ok_or(CafeError::MissingIhdr)?;
-                        let ih = img_height as usize;
-                        let full_size = bytes_per_row.checked_mul(ih).ok_or_else(|| {
-                            CafeError::TruncatedFile(
-                                "overflow in bytes_per_row × height (iDIM)".into(),
-                            )
-                        })?;
-                        let tile_count = idim.tiles_x as usize * idim.tiles_y as usize;
-                        if tiles_seen >= tile_count {
-                            return Err(CafeError::TruncatedFile(format!(
-                                "Excess IDAT: expected {tile_count} tiles (iDIM)"
-                            )));
-                        }
-                        if pixel_rows.is_empty() {
-                            pixel_rows = vec![0u8; full_size];
-                        }
-                        if pixel_rows.len() != full_size {
-                            return Err(CafeError::TruncatedFile(
-                                "tile buffer inconsistent with IHDR (iDIM)".into(),
-                            ));
-                        }
-                        let tile_order = idim.tile_order()?;
-                        let (tx, ty) = tile_order[tiles_seen];
-                        tiles_seen += 1;
-                        let (tile_w, tile_h) = idim.tile_dimensions(tx, ty, img_width, img_height);
-                        let tw = tile_w as usize;
-                        let th = tile_h as usize;
-                        let tile_stride = tw.checked_mul(bpp_for_tile).ok_or_else(|| {
-                            CafeError::UnsupportedFeature("overflow in tile stride (iDIM)".into())
-                        })?;
-                        let tile_raw = if filter_method == FILTER_METHOD_BYTE_SHUFFLE {
-                            // v1.1: byte-shuffle undone before any predictive filter
-                            shuffle::undo_byte_shuffle(&tile_payload, bpp_for_tile, tile_w, tile_h)?
-                        } else if filter_method == FILTER_METHOD_PREDICTIVE {
-                            // 1 filter byte prefixed per tile, with tile_stride per row
-                            let tile_h_est =
-                                tile_payload.len().saturating_sub(1) / tile_stride.max(1);
-                            if tile_h_est != th {
-                                return Err(CafeError::TruncatedFile(format!(
-                                    "tile with inconsistent height: expected {th}, "
-                                )));
-                            }
-                            undo_predictive_filter(&tile_payload, th, tile_stride, bpp_for_tile)?
-                        } else {
-                            tile_payload
-                        };
-                        let tile_len = tile_stride.checked_mul(th).ok_or_else(|| {
-                            CafeError::TruncatedFile("overflow in tile len (iDIM)".into())
-                        })?;
-                        if tile_raw.len() != tile_len {
-                            return Err(CafeError::TruncatedFile(format!(
-                                "tile {tiles_seen} with unexpected size: {} (expected {})",
-                                tile_raw.len(),
-                                tile_len
-                            )));
-                        }
-                        let row0 = (ty as u32 * idim.tile_height as u32) as usize;
-                        let col0 = (tx as u32 * idim.tile_width as u32) as usize;
-                        for r in 0..th {
-                            let dst_start = (row0 + r)
-                                .checked_mul(bytes_per_row)
-                                .and_then(|v| v.checked_add(col0 * bpp_for_tile))
-                                .ok_or_else(|| {
-                                    CafeError::TruncatedFile(
-                                        "overflow in tile destination (iDIM)".into(),
-                                    )
-                                })?;
-                            if dst_start + tile_stride > pixel_rows.len() {
-                                return Err(CafeError::TruncatedFile(
-                                    "tile exceeds image buffer (iDIM)".into(),
-                                ));
-                            }
-                            let src = &tile_raw[r * tile_stride..(r + 1) * tile_stride];
-                            pixel_rows[dst_start..dst_start + tile_stride].copy_from_slice(src);
-                        }
-                    } else if color_type == COLOR_TYPE_INDEXED {
-                        // IDAT contains indices packed in bit_depth bits (or filtered)
-                        // v1.0: the predictive filter prefixes 1 byte per block/tile (not per row)
-                        // SECURITY (§4.1.2/CWE-369): color_type=3 requires a PLTE chunk before
-                        // any IDAT; without it bytes_per_row is 0 and the division below
-                        // would panic. Reject with a recoverable error.
-                        if palette.is_none() {
-                            return Err(CafeError::TruncatedFile(
-                                "Color type=3 requires PLTE chunk before first IDAT".into(),
-                            ));
-                        }
-                        // v1.1: Byte-shuffle undone before other filters
-                        let tile_payload = if filter_method == FILTER_METHOD_BYTE_SHUFFLE {
-                            let img_width = width.ok_or(CafeError::MissingIhdr)?;
-                            let img_height = height.ok_or(CafeError::MissingIhdr)?;
-                            let bpp = 1; // Indexed always 1 byte/pixel (before pack)
-                            shuffle::undo_byte_shuffle(&tile_payload, bpp, img_width, img_height)?
-                        } else {
-                            tile_payload
-                        };
-                        let tile_h = if filter_method == FILTER_METHOD_PREDICTIVE {
-                            tile_payload.len().saturating_sub(1) / bytes_per_row
-                        } else {
-                            tile_payload.len() / bytes_per_row
-                        };
-                        let tile_packed = if filter_method == FILTER_METHOD_PREDICTIVE {
-                            undo_predictive_filter(&tile_payload, tile_h, bytes_per_row, 1)?
-                        } else {
-                            tile_payload
-                        };
-                        // Unpack each row back to 1 byte/index
-                        // (bit_depth==8 is a trivial case inside unpack_indices_row)
-                        let row_width = width.ok_or(CafeError::MissingIhdr)? as usize;
-                        let img_height = height.ok_or(CafeError::MissingIhdr)? as usize;
-                        // SECURITY (CWE-400): prevents accumulation of indices beyond the
-                        // declared size (multiple-IDAT bomb).
-                        let expected_indices =
-                            row_width.checked_mul(img_height).ok_or_else(|| {
-                                CafeError::TruncatedFile(
-                                    "overflow in calculation of expected indices (indexed)".into(),
-                                )
-                            })?;
-                        for r in 0..tile_h {
-                            let row_packed =
-                                &tile_packed[r * bytes_per_row..(r + 1) * bytes_per_row];
-                            let row_indices = unpack_indices_row(row_packed, bit_depth, row_width)?;
-                            let new_len = pixel_rows
-                                .len()
-                                .checked_add(row_indices.len())
-                                .ok_or_else(|| {
-                                    CafeError::TruncatedFile(
-                                        "overflow accumulating pixel indices".into(),
-                                    )
-                                })?;
-                            if new_len > expected_indices {
-                                return Err(CafeError::TruncatedFile(format!(
-                                    "Excess IDAT: indexed pixel data sum exceeds \
-                                      {expected_indices} (IHDR {row_width}x{img_height})"
-                                )));
-                            }
-                            pixel_rows.extend_from_slice(&row_indices);
-                        }
-                    } else {
-                        // Color types 0, 2, 4, 6: unpack with the correct bpp for the type
-                        let bpp_for_filter =
-                            bytes_per_pixel(color_type, bit_depth).ok_or_else(|| {
-                                CafeError::UnsupportedFeature(format!(
-                                    "Color type {color_type}, bit depth {bit_depth} not supported"
-                                ))
-                            })?;
-
-                        // v1.1: Byte-shuffle undone before the predictive filter
-                        let tile_payload = if filter_method == FILTER_METHOD_BYTE_SHUFFLE {
-                            let img_width = width.ok_or(CafeError::MissingIhdr)?;
-                            // tile_h derived from the payload (without the prefixed filter byte):
-                            // each row has bytes_per_row bytes, so height = len / stride
-                            let tile_h = tile_payload.len() / bytes_per_row.max(1);
-                            shuffle::undo_byte_shuffle(
-                                &tile_payload,
-                                bpp_for_filter,
-                                img_width,
-                                tile_h as u32,
-                            )?
-                        } else {
-                            tile_payload
-                        };
-
-                        let tile_raw = if filter_method == FILTER_METHOD_PREDICTIVE {
-                            // v1.0: 1 filter byte per block/tile
-                            let tile_h = tile_payload.len().saturating_sub(1) / bytes_per_row;
-                            undo_predictive_filter(
-                                &tile_payload,
-                                tile_h,
-                                bytes_per_row,
-                                bpp_for_filter,
-                            )?
-                        } else {
-                            tile_payload
-                        };
-                        // SECURITY (CWE-400): prevents accumulation of pixel rows beyond
-                        // the declared size (multiple-IDAT bomb).
-                        let img_height = height.ok_or(CafeError::MissingIhdr)? as usize;
-                        let expected_row_bytes =
-                            bytes_per_row.checked_mul(img_height).ok_or_else(|| {
-                                CafeError::TruncatedFile(
-                                    "overflow in bytes_per_row × height".into(),
-                                )
-                            })?;
-                        let new_len =
-                            pixel_rows
-                                .len()
-                                .checked_add(tile_raw.len())
-                                .ok_or_else(|| {
-                                    CafeError::TruncatedFile(
-                                        "overflow accumulating linhas de pixel".into(),
-                                    )
-                                })?;
-                        if new_len > expected_row_bytes {
-                            return Err(CafeError::TruncatedFile(format!(
-                                "Excess IDAT: indexed data pixels sum more than \
-                                 {expected_row_bytes} bytes (bytes_per_row={bytes_per_row}, \
-                                 height={img_height})"
-                            )));
-                        }
-                        pixel_rows.extend_from_slice(&tile_raw);
-                    }
-                }
-            }
+            t if t == CHUNK_IHDR => handle_ihdr_chunk(&mut state, &chunk.data)?,
+            t if t == CHUNK_PLTE => handle_plte_chunk(&mut state, chunk.flag, &chunk.data)?,
+            t if t == CHUNK_EXIF => handle_exif_chunk(&mut state, chunk.flag, &chunk.data)?,
+            t if t == CHUNK_JSON => handle_json_chunk(&mut state, chunk.flag, &chunk.data)?,
+            t if t == CHUNK_ICCP => handle_iccp_chunk(&mut state, chunk.flag, &chunk.data),
+            t if t == CHUNK_XMPD => handle_xmpd_chunk(&mut state, chunk.flag, &chunk.data),
+            t if t == CHUNK_ZDIC => handle_zdic_chunk(&mut state, chunk.flag, &chunk.data),
+            t if t == CHUNK_IDIM => handle_idim_chunk(&mut state, chunk.flag, &chunk.data)?,
+            t if t == CHUNK_CHDR => handle_chdr_chunk(&mut state, chunk.flag, &chunk.data),
+            t if t == CHUNK_IDAT => handle_idat_chunk(&mut state, chunk.flag, &chunk.data)?,
             t if t == CHUNK_IEND => break,
             t => {
                 // Unknown chunk: ancillary (1st letter lowercase) -> ignore;
@@ -1511,24 +1610,24 @@ fn decode_bytes_internal(
         }
     }
 
-    let width = width.ok_or(CafeError::MissingIhdr)?;
-    let height = height.ok_or(CafeError::MissingIhdr)?;
+    let width = state.width.ok_or(CafeError::MissingIhdr)?;
+    let height = state.height.ok_or(CafeError::MissingIhdr)?;
 
     // Reconstruct final pixels: deinterlace, dequantize, convert color type
     let params = ReconstructParams {
-        interlace_method: interlace_method_read,
-        color_type,
-        bit_depth,
-        sample_format,
+        interlace_method: state.interlace_method_read,
+        color_type: state.color_type,
+        bit_depth: state.bit_depth,
+        sample_format: state.sample_format,
         width,
         height,
-        palette: palette.as_ref(),
-        chdr: chdr.as_ref(),
-        adam7_passes: &adam7_passes,
-        even_odd_passes: &even_odd_passes,
+        palette: state.palette.as_ref(),
+        chdr: state.chdr.as_ref(),
+        adam7_passes: &state.adam7_passes,
+        even_odd_passes: &state.even_odd_passes,
         tonemap_operator,
     };
-    let final_pixels = reconstruct_final_pixels(pixel_rows, &params)?;
+    let final_pixels = reconstruct_final_pixels(state.pixel_rows, &params)?;
 
     // Validate final buffer: must have exactly width × height × 4 bytes (always RGBA)
     let expected_len = (width as u64)
@@ -1553,13 +1652,13 @@ fn decode_bytes_internal(
     let result = DecodeResult {
         width,
         height,
-        exif,
-        json_metadata,
+        exif: state.exif,
+        json_metadata: state.json_metadata,
         compression_stats,
-        icc_profile,
-        xmp_metadata,
-        zstd_dictionary,
-        chdr_metadata: chdr,
+        icc_profile: state.icc_profile,
+        xmp_metadata: state.xmp_metadata,
+        zstd_dictionary: state.zstd_dictionary,
+        chdr_metadata: state.chdr,
     };
 
     Ok((final_pixels, result))
