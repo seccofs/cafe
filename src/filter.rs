@@ -61,7 +61,7 @@ impl BlockStats {
 // Predictors (all receive a=left, b=up, c=upper-left diagonal)
 
 /// Paeth predictor
-fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
+pub(crate) fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
     let (a, b, c) = (a as i32, b as i32, c as i32);
     let p = a + b - c;
     let pa = (p - a).abs();
@@ -77,7 +77,7 @@ fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
 }
 
 /// MED (Median Edge Detector) — same predictor as JPEG-LS/FFV1.
-fn med_predictor(a: u8, b: u8, c: u8) -> u8 {
+pub(crate) fn med_predictor(a: u8, b: u8, c: u8) -> u8 {
     if c >= a.max(b) {
         a.min(b)
     } else if c <= a.min(b) {
@@ -92,13 +92,13 @@ fn med_predictor(a: u8, b: u8, c: u8) -> u8 {
 /// No clamping (unlike Paeth/MED); Rust's wrapping arithmetic already
 /// safely absorbs any overshoot, without risk of overflow in debug
 /// (that's why we use `wrapping_*` explicitly).
-fn gradient_predictor(a: u8, b: u8, c: u8) -> u8 {
+pub(crate) fn gradient_predictor(a: u8, b: u8, c: u8) -> u8 {
     a.wrapping_add(b).wrapping_sub(c)
 }
 
 /// Simple Median Filter — simple median of the 3 neighbors (left, up, upper-left diagonal).
 /// A fast alternative to MED, without a predicated branch.
-fn simple_median_predictor(a: u8, b: u8, c: u8) -> u8 {
+pub(crate) fn simple_median_predictor(a: u8, b: u8, c: u8) -> u8 {
     // Sort 3 elements
     let mut vals = [a, b, c];
     vals.sort_unstable();
@@ -106,28 +106,28 @@ fn simple_median_predictor(a: u8, b: u8, c: u8) -> u8 {
 }
 
 /// F_4WAY_H: Horizontal emphasis — good for horizontal lines/edges
-fn four_way_horizontal_predictor(a: u8, b: u8, _c: u8) -> u8 {
+pub(crate) fn four_way_horizontal_predictor(a: u8, b: u8, _c: u8) -> u8 {
     // More weight on left, less on up
 
     ((a as u16 * 3 + b as u16) / 4) as u8
 }
 
 /// F_4WAY_V: Vertical emphasis — good for vertical lines/edges
-fn four_way_vertical_predictor(a: u8, b: u8, _c: u8) -> u8 {
+pub(crate) fn four_way_vertical_predictor(a: u8, b: u8, _c: u8) -> u8 {
     // More weight on up, less on left
 
     ((a as u16 + b as u16 * 3) / 4) as u8
 }
 
 /// F_4WAY_D1: Diagonal \ emphasis — good for diagonal patterns
-fn four_way_diagonal1_predictor(a: u8, b: u8, c: u8) -> u8 {
+pub(crate) fn four_way_diagonal1_predictor(a: u8, b: u8, c: u8) -> u8 {
     // More weight on the upper-left diagonal
 
     ((a as u16 + b as u16 + c as u16 * 2) / 4) as u8
 }
 
 /// F_4WAY_D2: Diagonal / emphasis — good for inverse diagonal patterns
-fn four_way_diagonal2_predictor(a: u8, b: u8, c: u8) -> u8 {
+pub(crate) fn four_way_diagonal2_predictor(a: u8, b: u8, c: u8) -> u8 {
     // Symmetric distribution with emphasis on a and b
 
     ((a as u16 * 2 + b as u16 * 2 + c as u16) / 5) as u8
@@ -136,7 +136,7 @@ fn four_way_diagonal2_predictor(a: u8, b: u8, c: u8) -> u8 {
 /// F_CONTEXT: Context-Based Predictor (v1.0)
 /// Detects local orientation via gradient analysis and picks the appropriate filter.
 /// Very good for graphics, screenshots, icons with sharp edges.
-fn context_based_predictor(a: u8, b: u8, c: u8) -> u8 {
+pub(crate) fn context_based_predictor(a: u8, b: u8, c: u8) -> u8 {
     let dh = (a as i16 - c as i16).abs(); // Horizontal difference
     let dv = (b as i16 - c as i16).abs(); // Vertical difference
 
@@ -153,7 +153,7 @@ fn context_based_predictor(a: u8, b: u8, c: u8) -> u8 {
 }
 
 /// 2nd Order — linear extrapolation using second-order differences
-fn second_order_predictor(a: u8, b: u8, ll: u8, uu: u8) -> u8 {
+pub(crate) fn second_order_predictor(a: u8, b: u8, ll: u8, uu: u8) -> u8 {
     let pred_h = 2i16 * a as i16 - ll as i16;
     let pred_v = 2i16 * b as i16 - uu as i16;
     let pred = (pred_h + pred_v) / 2;
@@ -172,7 +172,7 @@ fn average2(a: u8, b: u8) -> u8 {
 /// diagonal `/` gradients the others cannot see.
 ///
 /// `d` is the top-right neighbor (TR), absent on the right edge (treated as 0).
-fn tr_directional_predictor(a: u8, b: u8, c: u8, d: u8) -> u8 {
+pub(crate) fn tr_directional_predictor(a: u8, b: u8, c: u8, d: u8) -> u8 {
     average2(average2(a, c), average2(b, d))
 }
 

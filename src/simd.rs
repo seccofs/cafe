@@ -2040,4 +2040,271 @@ mod tests {
             );
         }
     }
+
+    // ========================================================================
+    // Cross-module equivalence: `simd.rs`'s internal scalar predictors
+    // (`*_pred`, used as the non-AVX2 fallback) vs. the canonical predictors
+    // in `filter.rs` (used by `predict()`/`filter_row`'s scalar path and by
+    // the encoder's non-SIMD builds, e.g. `--no-default-features`).
+    //
+    // These two sets of functions independently implement the *same* math
+    // for the same filter, duplicated so the AVX2 fallback path in `simd.rs`
+    // doesn't need to call back into `filter.rs`. Nothing enforces they stay
+    // in sync if one is edited without the other — these tests close that
+    // gap by asserting bit-exact equivalence across the full input domain
+    // (exhaustive for 3-argument predictors; targeted boundaries + random
+    // sampling for the two 4-argument predictors, whose input space is too
+    // large to exhaust).
+    // ========================================================================
+
+    /// Exhaustive (all 16,777,216 `(a, b, c)` combinations) equivalence check
+    /// between `simd.rs::paeth_pred` and `filter.rs::paeth_predictor`.
+    #[test]
+    fn test_paeth_pred_matches_filter_rs_predictor() {
+        for a in 0u16..=255 {
+            for b in 0u16..=255 {
+                for c in 0u16..=255 {
+                    let (a, b, c) = (a as u8, b as u8, c as u8);
+                    assert_eq!(
+                        paeth_pred(a, b, c),
+                        crate::filter::paeth_predictor(a, b, c),
+                        "Paeth mismatch a={a} b={b} c={c}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Exhaustive equivalence check between `simd.rs::med_pred` and
+    /// `filter.rs::med_predictor`.
+    #[test]
+    fn test_med_pred_matches_filter_rs_predictor() {
+        for a in 0u16..=255 {
+            for b in 0u16..=255 {
+                for c in 0u16..=255 {
+                    let (a, b, c) = (a as u8, b as u8, c as u8);
+                    assert_eq!(
+                        med_pred(a, b, c),
+                        crate::filter::med_predictor(a, b, c),
+                        "MED mismatch a={a} b={b} c={c}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Exhaustive equivalence check between `simd.rs::simple_median_pred`
+    /// and `filter.rs::simple_median_predictor`.
+    #[test]
+    fn test_simple_median_pred_matches_filter_rs_predictor() {
+        for a in 0u16..=255 {
+            for b in 0u16..=255 {
+                for c in 0u16..=255 {
+                    let (a, b, c) = (a as u8, b as u8, c as u8);
+                    assert_eq!(
+                        simple_median_pred(a, b, c),
+                        crate::filter::simple_median_predictor(a, b, c),
+                        "SimpleMedian mismatch a={a} b={b} c={c}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Exhaustive equivalence check between `simd.rs::context_pred` and
+    /// `filter.rs::context_based_predictor`.
+    #[test]
+    fn test_context_pred_matches_filter_rs_predictor() {
+        for a in 0u16..=255 {
+            for b in 0u16..=255 {
+                for c in 0u16..=255 {
+                    let (a, b, c) = (a as u8, b as u8, c as u8);
+                    assert_eq!(
+                        context_pred(a, b, c),
+                        crate::filter::context_based_predictor(a, b, c),
+                        "Context mismatch a={a} b={b} c={c}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Exhaustive equivalence check between the inline Gradient formula used
+    /// by `simd.rs::filter_gradient_scalar` and `filter.rs::gradient_predictor`.
+    #[test]
+    fn test_gradient_formula_matches_filter_rs_predictor() {
+        for a in 0u16..=255 {
+            for b in 0u16..=255 {
+                for c in 0u16..=255 {
+                    let (a, b, c) = (a as u8, b as u8, c as u8);
+                    let simd_formula = a.wrapping_add(b).wrapping_sub(c);
+                    assert_eq!(
+                        simd_formula,
+                        crate::filter::gradient_predictor(a, b, c),
+                        "Gradient mismatch a={a} b={b} c={c}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Exhaustive equivalence check between the inline 4-way Horizontal
+    /// formula used by `simd.rs::filter_4way_h_avx2`'s scalar fallback and
+    /// `filter.rs::four_way_horizontal_predictor`.
+    #[test]
+    fn test_four_way_h_formula_matches_filter_rs_predictor() {
+        for a in 0u16..=255 {
+            for b in 0u16..=255 {
+                let (au8, bu8) = (a as u8, b as u8);
+                let simd_formula = ((a * 3 + b) / 4) as u8;
+                assert_eq!(
+                    simd_formula,
+                    crate::filter::four_way_horizontal_predictor(au8, bu8, 0),
+                    "4wayH mismatch a={au8} b={bu8}"
+                );
+            }
+        }
+    }
+
+    /// Exhaustive equivalence check between the inline 4-way Vertical
+    /// formula used by `simd.rs::filter_4way_v_avx2`'s scalar fallback and
+    /// `filter.rs::four_way_vertical_predictor`.
+    #[test]
+    fn test_four_way_v_formula_matches_filter_rs_predictor() {
+        for a in 0u16..=255 {
+            for b in 0u16..=255 {
+                let (au8, bu8) = (a as u8, b as u8);
+                let simd_formula = ((a + b * 3) / 4) as u8;
+                assert_eq!(
+                    simd_formula,
+                    crate::filter::four_way_vertical_predictor(au8, bu8, 0),
+                    "4wayV mismatch a={au8} b={bu8}"
+                );
+            }
+        }
+    }
+
+    /// Exhaustive equivalence check between the inline 4-way Diagonal-\
+    /// formula used by `simd.rs::filter_4way_d1_avx2`'s scalar fallback and
+    /// `filter.rs::four_way_diagonal1_predictor`.
+    #[test]
+    fn test_four_way_d1_formula_matches_filter_rs_predictor() {
+        for a in 0u16..=255 {
+            for b in 0u16..=255 {
+                for c in 0u16..=255 {
+                    let (au8, bu8, cu8) = (a as u8, b as u8, c as u8);
+                    let simd_formula = ((a + b + c * 2) / 4) as u8;
+                    assert_eq!(
+                        simd_formula,
+                        crate::filter::four_way_diagonal1_predictor(au8, bu8, cu8),
+                        "4wayD1 mismatch a={au8} b={bu8} c={cu8}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Exhaustive equivalence check between the inline 4-way Diagonal-/
+    /// formula used by `simd.rs::filter_4way_d2_avx2`'s scalar fallback and
+    /// `filter.rs::four_way_diagonal2_predictor`.
+    #[test]
+    fn test_four_way_d2_formula_matches_filter_rs_predictor() {
+        for a in 0u16..=255 {
+            for b in 0u16..=255 {
+                for c in 0u16..=255 {
+                    let (au8, bu8, cu8) = (a as u8, b as u8, c as u8);
+                    let simd_formula = ((a * 2 + b * 2 + c) / 5) as u8;
+                    assert_eq!(
+                        simd_formula,
+                        crate::filter::four_way_diagonal2_predictor(au8, bu8, cu8),
+                        "4wayD2 mismatch a={au8} b={bu8} c={cu8}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Boundary + random-sampling equivalence check between
+    /// `simd.rs::second_order_pred` and `filter.rs::second_order_predictor`.
+    /// The 4D input space (`a, b, ll, uu`) is too large (2^32) to exhaust.
+    #[test]
+    fn test_second_order_pred_matches_filter_rs_predictor() {
+        let extremes = [0u8, 1, 2, 3, 127, 128, 253, 254, 255];
+        for &a in &extremes {
+            for &b in &extremes {
+                for &ll in &extremes {
+                    for &uu in &extremes {
+                        assert_eq!(
+                            second_order_pred(a, b, ll, uu),
+                            crate::filter::second_order_predictor(a, b, ll, uu),
+                            "2ndOrder mismatch a={a} b={b} ll={ll} uu={uu}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next_byte = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng & 0xFF) as u8
+        };
+        for _ in 0..1_000_000u32 {
+            let a = next_byte();
+            let b = next_byte();
+            let ll = next_byte();
+            let uu = next_byte();
+            assert_eq!(
+                second_order_pred(a, b, ll, uu),
+                crate::filter::second_order_predictor(a, b, ll, uu),
+                "2ndOrder random mismatch a={a} b={b} ll={ll} uu={uu}"
+            );
+        }
+    }
+
+    /// Boundary + random-sampling equivalence check between the inline
+    /// TR-Directional formula used by `simd.rs::filter_tr_directional_scalar`
+    /// and `filter.rs::tr_directional_predictor`. The 4D input space
+    /// (`a, b, c, d`) is too large (2^32) to exhaust.
+    #[test]
+    fn test_tr_directional_formula_matches_filter_rs_predictor() {
+        let avg2 = |x: u8, y: u8| ((x as u16 + y as u16) >> 1) as u8;
+        let simd_formula = |a: u8, b: u8, c: u8, d: u8| avg2(avg2(a, c), avg2(b, d));
+
+        let extremes = [0u8, 1, 2, 3, 127, 128, 253, 254, 255];
+        for &a in &extremes {
+            for &b in &extremes {
+                for &c in &extremes {
+                    for &d in &extremes {
+                        assert_eq!(
+                            simd_formula(a, b, c, d),
+                            crate::filter::tr_directional_predictor(a, b, c, d),
+                            "TR-directional mismatch a={a} b={b} c={c} d={d}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut rng: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next_byte = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng & 0xFF) as u8
+        };
+        for _ in 0..1_000_000u32 {
+            let a = next_byte();
+            let b = next_byte();
+            let c = next_byte();
+            let d = next_byte();
+            assert_eq!(
+                simd_formula(a, b, c, d),
+                crate::filter::tr_directional_predictor(a, b, c, d),
+                "TR-directional random mismatch a={a} b={b} c={c} d={d}"
+            );
+        }
+    }
 }
