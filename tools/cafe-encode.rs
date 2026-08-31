@@ -74,6 +74,17 @@ fn main() -> ExitCode {
     }
 }
 
+/// Returns the value following a flag at `pos` (i.e. `args[pos + 1]`), or an
+/// error if the flag was the last argument. Used instead of raw `args[pos +
+/// 1]` indexing so a trailing flag without its value (e.g. `... --level`)
+/// produces a normal `Error: ...` message and exit code 1, instead of a
+/// panic (index out of bounds).
+fn require_arg_value<'a>(args: &'a [String], pos: usize, flag: &str) -> Result<&'a str, String> {
+    args.get(pos + 1)
+        .map(String::as_str)
+        .ok_or_else(|| format!("{flag} requires an argument"))
+}
+
 fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::error::Error>> {
     let use_filter = !args.iter().any(|a| a == "--no-filter");
     let use_byte_shuffle = args.iter().any(|a| a == "--byte-shuffle");
@@ -84,7 +95,7 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
     // Parse --palette-algorithm <nearest|median-cut>
     let palette_algorithm = if let Some(pos) = args.iter().position(|a| a == "--palette-algorithm")
     {
-        let algo = &args.get(pos + 1).map(|s| s.as_str()).unwrap_or("nearest");
+        let algo = require_arg_value(args, pos, "--palette-algorithm")?;
         use std::str::FromStr;
         match cafe::PaletteAlgorithm::from_str(algo) {
             Ok(alg) => alg,
@@ -99,8 +110,8 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
 
     // Parse --filter-heuristic <entropy|msad|test|quick-prune|adaptive>
     let filter_heuristic = if let Some(pos) = args.iter().position(|a| a == "--filter-heuristic") {
-        let h = &args[pos + 1];
-        match h.as_str() {
+        let h = require_arg_value(args, pos, "--filter-heuristic")?;
+        match h {
             "entropy" => FilterHeuristic::Entropy,
             "msad" => FilterHeuristic::Msad,
             "test" => FilterHeuristic::CompressionTest,
@@ -120,7 +131,7 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
 
     // Parse --level <1-22>
     let level = if let Some(pos) = args.iter().position(|a| a == "--level") {
-        let level_str = &args[pos + 1];
+        let level_str = require_arg_value(args, pos, "--level")?;
         let level: i32 = level_str.parse().map_err(|_| {
             format!("Error: --level must be an integer between 1 and 22, got: {level_str}")
         })?;
@@ -137,7 +148,7 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
 
     // Parse --color-type <0|2|4|6> (overrides the detected default)
     let target_color_type = if let Some(pos) = args.iter().position(|a| a == "--color-type") {
-        let ct_str = &args[pos + 1];
+        let ct_str = require_arg_value(args, pos, "--color-type")?;
         let ct: u8 = ct_str
             .parse()
             .map_err(|_| format!("Error: --color-type must be 0, 2, 4, or 6, got: {ct_str}"))?;
@@ -151,7 +162,7 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
 
     // Parse --bit-depth <d> (uint only; float/half fix at 32/16)
     let target_bit_depth = if let Some(pos) = args.iter().position(|a| a == "--bit-depth") {
-        let bd_str = &args[pos + 1];
+        let bd_str = require_arg_value(args, pos, "--bit-depth")?;
         let bd: u8 = bd_str
             .parse()
             .map_err(|_| format!("Error: --bit-depth must be numeric, got: {bd_str}"))?;
@@ -171,7 +182,7 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
 
     let json_metadata: HashMap<String, serde_json::Value> =
         if let Some(pos) = args.iter().position(|a| a == "--json-file") {
-            let path = &args[pos + 1];
+            let path = require_arg_value(args, pos, "--json-file")?;
             let text = std::fs::read_to_string(path)?;
             serde_json::from_str(&text)?
         } else {
@@ -179,7 +190,7 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
         };
 
     let exif = if let Some(pos) = args.iter().position(|a| a == "--exif-file") {
-        let path = &args[pos + 1];
+        let path = require_arg_value(args, pos, "--exif-file")?;
         Some(std::fs::read(path)?)
     } else {
         None
@@ -189,7 +200,7 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
 
     // Sample format (uint/float/half)
     let sample_format = if let Some(pos) = args.iter().position(|a| a == "--sample-format") {
-        let fmt_str = &args[pos + 1];
+        let fmt_str = require_arg_value(args, pos, "--sample-format")?;
         let fmt: u8 = fmt_str.parse().map_err(|_| {
             format!("--sample-format must be 0(uint), 1(float) or 2(half), got: {fmt_str}")
         })?;
@@ -205,33 +216,33 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
     let chdr = if args.iter().any(|a| a.starts_with("--chdr-")) {
         let transfer_function = if let Some(pos) = args.iter().position(|a| a == "--chdr-transfer")
         {
-            args[pos + 1]
+            require_arg_value(args, pos, "--chdr-transfer")?
                 .parse()
-                .map_err(|_| "Erro ao parsear --chdr-transfer como número entre 0-3".to_string())?
+                .map_err(|_| "Error parsing --chdr-transfer as a number between 0-3".to_string())?
         } else {
             3 // sRGB default
         };
 
         let color_primaries = if let Some(pos) = args.iter().position(|a| a == "--chdr-primaries") {
-            args[pos + 1]
+            require_arg_value(args, pos, "--chdr-primaries")?
                 .parse()
-                .map_err(|_| "Erro ao parsear --chdr-primaries como número entre 0-2".to_string())?
+                .map_err(|_| "Error parsing --chdr-primaries as a number between 0-2".to_string())?
         } else {
             0 // sRGB default
         };
 
         let max_luminance = if let Some(pos) = args.iter().position(|a| a == "--chdr-max-lum") {
-            args[pos + 1]
+            require_arg_value(args, pos, "--chdr-max-lum")?
                 .parse()
-                .map_err(|_| "Erro ao parsear --chdr-max-lum como float".to_string())?
+                .map_err(|_| "Error parsing --chdr-max-lum as a float".to_string())?
         } else {
             1.0
         };
 
         let min_luminance = if let Some(pos) = args.iter().position(|a| a == "--chdr-min-lum") {
-            args[pos + 1]
+            require_arg_value(args, pos, "--chdr-min-lum")?
                 .parse()
-                .map_err(|_| "Erro ao parsear --chdr-min-lum como float".to_string())?
+                .map_err(|_| "Error parsing --chdr-min-lum as a float".to_string())?
         } else {
             0.0
         };
@@ -250,18 +261,15 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
 
     // ZSTD dictionary
     let zstd_dictionary = if let Some(pos) = args.iter().position(|a| a == "--chdr-dict-file") {
-        let path = &args[pos + 1];
-        Some(
-            std::fs::read(path)
-                .map_err(|e| format!("Erro ao ler arquivo de dicionário ZSTD: {e}"))?,
-        )
+        let path = require_arg_value(args, pos, "--chdr-dict-file")?;
+        Some(std::fs::read(path).map_err(|e| format!("Error reading ZSTD dictionary file: {e}"))?)
     } else {
         None
     };
 
     // Interlace method
     let interlace_method = if let Some(pos) = args.iter().position(|a| a == "--interlace") {
-        let method_str = &args[pos + 1];
+        let method_str = require_arg_value(args, pos, "--interlace")?;
         let method: u8 = method_str.parse().map_err(|_| {
             format!("--interlace must be 0(none), 1(Adam7) or 2(Even/Odd), got: {method_str}")
         })?;
