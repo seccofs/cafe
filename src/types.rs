@@ -109,7 +109,19 @@ impl iDim {
         }
     }
 
-    /// Computes the real dimensions of a tile (may be smaller at the edges)
+    /// Computes the real dimensions of a tile (may be smaller at the edges).
+    ///
+    /// Defense in depth (CWE-190): `iDim` fields are all `pub` and can be
+    /// populated from an untrusted `iDIM` chunk without going through
+    /// `iDim::new()` (see `read_idim_chunk` in `src/cafe.rs`), so `tile_x`/
+    /// `tile_y`/`tiles_x`/`tiles_y`/`tile_width`/`tile_height`/`img_width`/
+    /// `img_height` here must all be treated as adversarial and cannot be
+    /// assumed internally consistent. Uses saturating arithmetic throughout
+    /// so a malformed/inconsistent combination degrades to `0` instead of
+    /// panicking (debug builds) or wrapping to a huge value (release
+    /// builds) on subtraction underflow. Callers still validate the result
+    /// against the actual decompressed payload size before use, but this
+    /// function itself must never panic on any input.
     pub fn tile_dimensions(
         &self,
         tile_x: u16,
@@ -117,14 +129,14 @@ impl iDim {
         img_width: u32,
         img_height: u32,
     ) -> (u32, u32) {
-        let width = if tile_x == self.tiles_x - 1 {
-            img_width - (tile_x as u32) * (self.tile_width as u32)
+        let width = if tile_x == self.tiles_x.saturating_sub(1) {
+            img_width.saturating_sub((tile_x as u32).saturating_mul(self.tile_width as u32))
         } else {
             self.tile_width as u32
         };
 
-        let height = if tile_y == self.tiles_y - 1 {
-            img_height - (tile_y as u32) * (self.tile_height as u32)
+        let height = if tile_y == self.tiles_y.saturating_sub(1) {
+            img_height.saturating_sub((tile_y as u32).saturating_mul(self.tile_height as u32))
         } else {
             self.tile_height as u32
         };

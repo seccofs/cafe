@@ -1332,10 +1332,49 @@ fn handle_zdic_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) {
 
 /// Handles the iDIM chunk (section 4.2): ancillary, optional, single
 /// instance per file — defines 2D tile partitioning for streaming.
+///
+/// SECURITY (CWE-190): `read_idim_chunk` only validates `scan_order`; the
+/// tile geometry itself (`tile_width`/`tile_height`/`tiles_x`/`tiles_y`)
+/// comes straight from untrusted file bytes. Per section 6 of the spec,
+/// `IHDR` is always the first chunk, so `state.width`/`state.height` are
+/// already known here; reject an `iDIM` chunk whose geometry cannot be
+/// reconciled with the declared image dimensions (mirrors the encoder's own
+/// `iDim::new()` derivation: `tiles_x = ceil(width / tile_width)`). Without
+/// this check, `iDim::tile_dimensions` would later be called with
+/// self-inconsistent values and either panic (debug builds, integer
+/// underflow) or silently wrap to a bogus tile size (release builds).
 fn handle_idim_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) -> Result<()> {
     if state.idim.is_none() {
+        let idim = read_idim_chunk(flag, data)?;
+        if idim.tile_width == 0 || idim.tile_height == 0 {
+            return Err(CafeError::UnsupportedFeature(
+                "iDIM: tile_width and tile_height must be nonzero".into(),
+            ));
+        }
+        if idim.tiles_x == 0 || idim.tiles_y == 0 {
+            return Err(CafeError::UnsupportedFeature(
+                "iDIM: tiles_x and tiles_y must be nonzero".into(),
+            ));
+        }
+        let width = state.width.ok_or(CafeError::MissingIhdr)?;
+        let height = state.height.ok_or(CafeError::MissingIhdr)?;
+        let expected_tiles_x = width.div_ceil(idim.tile_width as u32);
+        let expected_tiles_y = height.div_ceil(idim.tile_height as u32);
+        if idim.tiles_x as u32 != expected_tiles_x || idim.tiles_y as u32 != expected_tiles_y {
+            return Err(CafeError::UnsupportedFeature(format!(
+                "iDIM: tiles_x/tiles_y ({}, {}) inconsistent with IHDR dimensions {}x{} and tile size {}x{} (expected {}, {})",
+                idim.tiles_x,
+                idim.tiles_y,
+                width,
+                height,
+                idim.tile_width,
+                idim.tile_height,
+                expected_tiles_x,
+                expected_tiles_y
+            )));
+        }
         // Single instance per file (similar to eXIF)
-        state.idim = Some(read_idim_chunk(flag, data)?);
+        state.idim = Some(idim);
     }
     Ok(())
 }
@@ -2436,6 +2475,107 @@ mod tests {
             result.is_err(),
             "forged file must be rejected without panic"
         );
+    }
+
+    #[test]
+    fn test_decode_adversarial_inconsistent_idim_geometry() {
+        // SECURITY (CWE-190): iDIM chunk whose tiles_x/tiles_y/tile_width/
+        // tile_height cannot be reconciled with IHDR's width/height. Before
+        // the fix, this reached iDim::tile_dimensions with self-inconsistent
+        // values and panicked on unchecked subtraction (debug builds) or
+        // silently wrapped to a bogus huge tile size (release builds).
+        // handle_idim_chunk must now reject it immediately with a clean error.
+        let mut evil = Vec::new();
+        evil.extend_from_slice(&SIGNATURE);
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&8u32.to_be_bytes());
+        ihdr.extend_from_slice(&8u32.to_be_bytes());
+        ihdr.push(8); // bit_depth
+        ihdr.push(SAMPLE_FORMAT_UINT);
+        ihdr.push(COLOR_TYPE_RGBA);
+        ihdr.push(COMPRESSION_METHOD_ZSTD_BIT);
+        ihdr.push(FILTER_METHOD_NONE);
+        ihdr.push(INTERLACE_NONE);
+        evil.extend_from_slice(&write_chunk(CHUNK_IHDR, FLAG_RAW, &ihdr));
+
+        // img_width=8, tile_width=5 -> consistent tiles_x would be
+        // ceil(8/5)=2, but the forged chunk declares tiles_x=3.
+        let mut idim = Vec::new();
+        idim.extend_from_slice(&5u16.to_be_bytes()); // tile_width
+        idim.extend_from_slice(&1u16.to_be_bytes()); // tile_height
+        idim.extend_from_slice(&3u16.to_be_bytes()); // tiles_x (wrong: should be 2)
+        idim.extend_from_slice(&8u16.to_be_bytes()); // tiles_y
+        idim.push(0); // scan_order
+        evil.extend_from_slice(&write_chunk(CHUNK_IDIM, FLAG_RAW, &idim));
+        evil.extend_from_slice(&write_chunk(CHUNK_IEND, FLAG_RAW, &[]));
+
+        let result = decode_bytes(&evil);
+        match result {
+            Ok(_) => panic!("inconsistent iDIM geometry must be rejected"),
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("iDIM"),
+                    "expected iDIM-consistency error, got: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_decode_adversarial_idim_zero_tile_dims() {
+        // SECURITY (CWE-190/CWE-369): tile_width=0 or tile_height=0 would
+        // make tiles_x/tiles_y's div_ceil divide by zero. Must be rejected
+        // before any such computation happens.
+        let mut evil = Vec::new();
+        evil.extend_from_slice(&SIGNATURE);
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&8u32.to_be_bytes());
+        ihdr.extend_from_slice(&8u32.to_be_bytes());
+        ihdr.push(8);
+        ihdr.push(SAMPLE_FORMAT_UINT);
+        ihdr.push(COLOR_TYPE_RGBA);
+        ihdr.push(COMPRESSION_METHOD_ZSTD_BIT);
+        ihdr.push(FILTER_METHOD_NONE);
+        ihdr.push(INTERLACE_NONE);
+        evil.extend_from_slice(&write_chunk(CHUNK_IHDR, FLAG_RAW, &ihdr));
+
+        let mut idim = Vec::new();
+        idim.extend_from_slice(&0u16.to_be_bytes()); // tile_width = 0 (invalid)
+        idim.extend_from_slice(&1u16.to_be_bytes());
+        idim.extend_from_slice(&1u16.to_be_bytes());
+        idim.extend_from_slice(&8u16.to_be_bytes());
+        idim.push(0);
+        evil.extend_from_slice(&write_chunk(CHUNK_IDIM, FLAG_RAW, &idim));
+        evil.extend_from_slice(&write_chunk(CHUNK_IEND, FLAG_RAW, &[]));
+
+        let result = decode_bytes(&evil);
+        assert!(
+            result.is_err(),
+            "iDIM with tile_width=0 must be rejected without panic"
+        );
+    }
+
+    #[test]
+    fn test_idim_tile_dimensions_saturates_on_inconsistent_geometry() {
+        // Defense-in-depth unit test for iDim::tile_dimensions itself:
+        // since all iDim fields are `pub`, a caller (or a future code path)
+        // could construct a self-inconsistent instance directly, bypassing
+        // handle_idim_chunk's validation entirely. tile_dimensions must
+        // never panic regardless - it saturates to 0 instead of
+        // underflowing.
+        let idim = iDim {
+            tile_width: 200,
+            tile_height: 200,
+            tiles_x: 2,
+            tiles_y: 2,
+            scan_order: 0,
+        };
+        // tile_x=1 is the "last tile" (tiles_x-1=1); img_width=8 is far
+        // smaller than tile_x*tile_width=200, so unchecked subtraction
+        // would underflow. Must saturate to 0 instead of panicking.
+        let (w, h) = idim.tile_dimensions(1, 1, 8, 8);
+        assert_eq!((w, h), (0, 0));
     }
 
     #[test]
