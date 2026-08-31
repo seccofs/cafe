@@ -176,6 +176,124 @@ fn build_idat_chunk(data: &[u8], level: i32, dict: Option<&[u8]>) -> Result<(Vec
     ))
 }
 
+/// Writes interlaced (Adam7 or even/odd, section 5) IDATs for RGBA pixel
+/// data. Shared between `encode()` (direct RGBA path) and `encode_indexed()`
+/// (which first expands its palette indices to RGBA before interlacing,
+/// since Adam7/even-odd only operate on uint RGBA — section 5). Each pass
+/// becomes its own IDAT, prefixed with a 1-byte pass_number. Returns whether
+/// any pass used ZSTD.
+///
+/// Passes are written sequentially (not parallelized): each pass is itself a
+/// single compression unit, so there is no independent per-tile work to farm
+/// out to a thread pool here (unlike the row/2D tiling paths below).
+fn write_interlaced_idats(
+    out: &mut Vec<u8>,
+    interlace_method: u8,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    level: i32,
+    dict: Option<&[u8]>,
+) -> Result<bool> {
+    let mut uses_zstd = false;
+    let passes: Vec<Vec<u8>> = if interlace_method == INTERLACE_ADAM7 {
+        apply_adam7_interlace(rgba, width, height)
+            .into_iter()
+            .collect()
+    } else if interlace_method == INTERLACE_EVEN_ODD {
+        apply_even_odd_interlace(rgba, width, height)
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for (pass_idx, pass_data) in passes.iter().enumerate() {
+        let pass_number = (pass_idx + 1) as u8;
+        let mut pass_payload = Vec::with_capacity(1 + pass_data.len());
+        pass_payload.push(pass_number);
+        pass_payload.extend_from_slice(pass_data);
+        uses_zstd |= append_idat_chunk(out, &pass_payload, level, dict)?;
+    }
+    Ok(uses_zstd)
+}
+
+/// Writes row-tiled IDATs (section 4.3, no 2D tiling/interlace): partitions
+/// `height` into chunks of `tile_rows` lines, then — in parallel across a
+/// rayon thread pool, since tiles are independent — builds each tile's raw
+/// bytes via `build_tile_raw`, applies byte-shuffle or the predictive filter
+/// (mutually exclusive, byte-shuffle takes precedence), compresses with
+/// fallback, and finally appends the resulting chunks to `out` in original
+/// row order (preserving the exact byte layout a sequential loop would
+/// produce). Shared between `encode()` (raw pixel bytes) and
+/// `encode_indexed()` (packed palette indices) — the only difference between
+/// the two is how a tile's raw bytes are produced, captured by
+/// `build_tile_raw`.
+///
+/// `bytes_per_row` / `bpp` describe the raw tile bytes returned by
+/// `build_tile_raw` (used for the predictive filter's neighbor math);
+/// `stride_width` is the pixel/sample width passed to byte-shuffle.
+#[allow(clippy::too_many_arguments)]
+fn write_row_tiled_idats<F>(
+    out: &mut Vec<u8>,
+    height: u32,
+    tile_rows: u32,
+    bytes_per_row: usize,
+    bpp: usize,
+    stride_width: u32,
+    use_byte_shuffle: bool,
+    use_filter: bool,
+    filter_heuristic: FilterHeuristic,
+    level: i32,
+    zstd_dict: Option<&[u8]>,
+    build_tile_raw: F,
+) -> Result<bool>
+where
+    F: Fn(usize, usize) -> Result<Vec<u8>> + Sync,
+{
+    let height_usize = height as usize;
+    let tile_rows = tile_rows as usize;
+
+    let mut tile_bounds = Vec::new();
+    let mut row_start = 0;
+    while row_start < height_usize {
+        let row_end = (row_start + tile_rows).min(height_usize);
+        tile_bounds.push((row_start, row_end));
+        row_start = row_end;
+    }
+
+    let chunks: Vec<(Vec<u8>, bool)> = tile_bounds
+        .par_iter()
+        .map(|&(row_start, row_end)| -> Result<(Vec<u8>, bool)> {
+            let tile_h = row_end - row_start;
+            let tile_raw = build_tile_raw(row_start, row_end)?;
+
+            let tile_payload = if use_byte_shuffle {
+                shuffle::apply_byte_shuffle(&tile_raw, bpp, stride_width, tile_h as u32)?
+            } else if use_filter {
+                apply_predictive_filter(
+                    &tile_raw,
+                    tile_h,
+                    bytes_per_row,
+                    bpp,
+                    filter_heuristic,
+                    level,
+                )?
+            } else {
+                tile_raw
+            };
+
+            build_idat_chunk(&tile_payload, level, zstd_dict)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut uses_zstd = false;
+    for (chunk, chunk_used_zstd) in chunks {
+        uses_zstd |= chunk_used_zstd;
+        out.extend_from_slice(&chunk);
+    }
+    Ok(uses_zstd)
+}
+
 /// Writes the iDIM chunk (section 4.2, tiling for progressive streaming) if
 /// present in `opts`. Shared between `encode()` and `encode_indexed()` — must
 /// appear immediately after IHDR in both (section 9, mandatory chunk order).
@@ -492,35 +610,16 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
     // New feature (v1.0): local complexity analysis per tile (extended section 4.3.1).
     if opts.interlace_method == INTERLACE_ADAM7 || opts.interlace_method == INTERLACE_EVEN_ODD {
         // Interlaced path (section 5): each pass becomes an IDAT with a
-        // prefixed pass_number. Same logic as already used by encode_indexed(),
-        // now also available for the direct RGBA path.
-        if opts.interlace_method == INTERLACE_ADAM7 {
-            let passes = apply_adam7_interlace(&raw, width, height);
-            for (pass_idx, pass_data) in passes.iter().enumerate() {
-                let pass_number = (pass_idx + 1) as u8;
-                let mut pass_payload = vec![pass_number];
-                pass_payload.extend_from_slice(pass_data);
-                uses_zstd |= append_idat_chunk(
-                    &mut out,
-                    &pass_payload,
-                    opts.level,
-                    final_zstd_dict.as_deref(),
-                )?;
-            }
-        } else {
-            let passes = apply_even_odd_interlace(&raw, width, height);
-            for (pass_idx, pass_data) in passes.iter().enumerate() {
-                let pass_number = (pass_idx + 1) as u8;
-                let mut pass_payload = vec![pass_number];
-                pass_payload.extend_from_slice(pass_data);
-                uses_zstd |= append_idat_chunk(
-                    &mut out,
-                    &pass_payload,
-                    opts.level,
-                    final_zstd_dict.as_deref(),
-                )?;
-            }
-        }
+        // prefixed pass_number. Shared helper also used by encode_indexed().
+        uses_zstd |= write_interlaced_idats(
+            &mut out,
+            opts.interlace_method,
+            &raw,
+            width,
+            height,
+            opts.level,
+            final_zstd_dict.as_deref(),
+        )?;
     } else if let Some(idim) = &opts.idim {
         // Real 2D tiling (section 4.2): each IDAT is a rectangular tile, in the
         // scan_order order (row-major or Z-order). Requires bit_depth >= 8 so
@@ -595,80 +694,62 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
         }
     } else {
         // No interlace (v1.0): row tiles, with optional predictive filter.
-        // Tiles are independent (no shared state between them), so the
-        // expensive per-tile work — filter search and ZSTD compression — is
-        // parallelized across a rayon thread pool (v1.2.2). Tile boundaries
-        // are computed sequentially first, then processed in parallel, and
-        // finally appended to `out` in original order to keep the exact same
-        // byte layout a sequential loop would produce.
-        let tile_rows = opts.tile_rows as usize;
-        let height = height as usize;
-
-        let mut tile_bounds = Vec::new();
-        let mut row_start = 0;
-        while row_start < height {
-            let row_end = (row_start + tile_rows).min(height);
-            tile_bounds.push((row_start, row_end));
-            row_start = row_end;
-        }
-
         // Local complexity analysis (extended section 4.3.1) — cheap enough
-        // to keep sequential, but computed alongside the parallel pass below.
-        let complexities: Vec<f64> = if opts.adaptive_analysis {
-            tile_bounds
+        // to keep sequential, computed upfront so it doesn't interfere with
+        // the shared row-tiling helper below.
+        if opts.adaptive_analysis {
+            let tile_rows = opts.tile_rows as usize;
+            let height_usize = height as usize;
+            let mut tile_bounds = Vec::new();
+            let mut row_start = 0;
+            while row_start < height_usize {
+                let row_end = (row_start + tile_rows).min(height_usize);
+                tile_bounds.push((row_start, row_end));
+                row_start = row_end;
+            }
+            let complexities: Vec<f64> = tile_bounds
                 .par_iter()
                 .map(|&(row_start, row_end)| {
                     let tile_raw = &raw[row_start * bytes_per_row..row_end * bytes_per_row];
                     analyze_tile_complexity(tile_raw)
                 })
-                .collect()
-        } else {
-            Vec::new()
-        };
+                .collect();
 
-        let zstd_dict = opts.zstd_dictionary.as_deref();
-        let chunks: Vec<(Vec<u8>, bool)> = tile_bounds
-            .par_iter()
-            .map(|&(row_start, row_end)| -> Result<(Vec<u8>, bool)> {
-                let tile_h = row_end - row_start;
-                let tile_raw = &raw[row_start * bytes_per_row..row_end * bytes_per_row];
-
-                let tile_payload = if opts.use_byte_shuffle {
-                    shuffle::apply_byte_shuffle(tile_raw, bpp, width, tile_h as u32)?
-                } else if opts.use_filter {
-                    apply_predictive_filter(
-                        tile_raw,
-                        tile_h,
-                        bytes_per_row,
-                        bpp,
-                        opts.filter_heuristic,
-                        opts.level,
-                    )?
-                } else {
-                    tile_raw.to_vec()
-                };
-
-                build_idat_chunk(&tile_payload, opts.level, zstd_dict)
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let tile_count = chunks.len();
-        for (chunk, chunk_used_zstd) in chunks {
-            uses_zstd |= chunk_used_zstd;
-            out.extend_from_slice(&chunk);
+            if !complexities.is_empty() {
+                eprintln!(
+                    "[CAFE] Adaptive analysis: {} tiles processed",
+                    complexities.len()
+                );
+                let avg_complexity = complexities.iter().sum::<f64>() / complexities.len() as f64;
+                eprintln!("[CAFE] Average complexity: {:.2} bits/byte", avg_complexity);
+                let max_complexity = complexities
+                    .iter()
+                    .cloned()
+                    .fold(f64::NEG_INFINITY, f64::max);
+                eprintln!("[CAFE] Maximum complexity: {:.2} bits/byte", max_complexity);
+            }
         }
 
-        // Adaptive analysis log (if enabled)
-        if opts.adaptive_analysis && !complexities.is_empty() {
-            eprintln!("[CAFE] Adaptive analysis: {} tiles processed", tile_count);
-            let avg_complexity = complexities.iter().sum::<f64>() / complexities.len() as f64;
-            eprintln!("[CAFE] Average complexity: {:.2} bits/byte", avg_complexity);
-            let max_complexity = complexities
-                .iter()
-                .cloned()
-                .fold(f64::NEG_INFINITY, f64::max);
-            eprintln!("[CAFE] Maximum complexity: {:.2} bits/byte", max_complexity);
-        }
+        // Tiles are independent (no shared state between them), so the
+        // expensive per-tile work — filter search and ZSTD compression — is
+        // parallelized across a rayon thread pool (v1.2.2) inside the shared
+        // helper.
+        uses_zstd |= write_row_tiled_idats(
+            &mut out,
+            height,
+            opts.tile_rows,
+            bytes_per_row,
+            bpp,
+            width,
+            opts.use_byte_shuffle,
+            opts.use_filter,
+            opts.filter_heuristic,
+            opts.level,
+            opts.zstd_dictionary.as_deref(),
+            |row_start, row_end| {
+                Ok(raw[row_start * bytes_per_row..row_end * bytes_per_row].to_vec())
+            },
+        )?;
     }
 
     // --- IEND ---
@@ -1812,60 +1893,40 @@ pub fn encode_indexed(input_path: &str, output_path: &str, opts: &EncodeOptions)
             })
             .collect::<Vec<u8>>();
 
-        // Apply interlace (Adam7 or even/odd)
-        if opts.interlace_method == INTERLACE_ADAM7 {
-            let passes = apply_adam7_interlace(&rgba_raw, width, height);
-            // Write each pass as an IDAT with a prefixed pass_number
-            for (pass_idx, pass_data) in passes.iter().enumerate() {
-                let pass_number = (pass_idx + 1) as u8;
-                let mut pass_payload = vec![pass_number];
-                pass_payload.extend_from_slice(pass_data);
-                uses_zstd |= append_idat_chunk(
-                    &mut out,
-                    &pass_payload,
-                    opts.level,
-                    opts.zstd_dictionary.as_deref(),
-                )?;
-            }
-        } else if opts.interlace_method == INTERLACE_EVEN_ODD {
-            let passes = apply_even_odd_interlace(&rgba_raw, width, height);
-            // Write each pass as an IDAT with a prefixed pass_number
-            for (pass_idx, pass_data) in passes.iter().enumerate() {
-                let pass_number = (pass_idx + 1) as u8;
-                let mut pass_payload = vec![pass_number];
-                pass_payload.extend_from_slice(pass_data);
-                uses_zstd |= append_idat_chunk(
-                    &mut out,
-                    &pass_payload,
-                    opts.level,
-                    opts.zstd_dictionary.as_deref(),
-                )?;
-            }
-        }
+        // Apply interlace (Adam7 or even/odd) via the shared helper (also
+        // used by encode()'s direct RGBA path).
+        uses_zstd |= write_interlaced_idats(
+            &mut out,
+            opts.interlace_method,
+            &rgba_raw,
+            width,
+            height,
+            opts.level,
+            opts.zstd_dictionary.as_deref(),
+        )?;
     } else {
-        // v1.0 (with full interlace support): write in row tiles.
-        // Tiles are independent, so packing + filter + compression is
-        // parallelized across a rayon thread pool (v1.2.2); chunks are then
-        // appended to `out` in original row order.
-        let tile_rows = opts.tile_rows as usize;
-        let height_usize = height as usize;
+        // v1.0 (with full interlace support): write in row tiles, via the
+        // shared helper also used by encode()'s direct-color path. Tiles are
+        // independent, so packing + filter + compression is parallelized
+        // across a rayon thread pool (v1.2.2) inside the helper; chunks are
+        // appended to `out` in original row order. Byte-shuffle is rejected
+        // above (bpp=1 for packed indices), so it's always disabled here.
         let idx_bytes_per_row = bytes_per_row_for_bit_depth(width, bit_depth)?;
-
-        let mut tile_bounds = Vec::new();
-        let mut row_start = 0;
-        while row_start < height_usize {
-            let row_end = (row_start + tile_rows).min(height_usize);
-            tile_bounds.push((row_start, row_end));
-            row_start = row_end;
-        }
-
-        let zstd_dict = opts.zstd_dictionary.as_deref();
-        let chunks: Vec<(Vec<u8>, bool)> = tile_bounds
-            .par_iter()
-            .map(|&(row_start, row_end)| -> Result<(Vec<u8>, bool)> {
-                let tile_h = row_end - row_start;
-
+        uses_zstd |= write_row_tiled_idats(
+            &mut out,
+            height,
+            opts.tile_rows,
+            idx_bytes_per_row,
+            1, // bpp: predictive filter operates on packed bytes (1 byte/unit)
+            width,
+            false, // use_byte_shuffle: incompatible with indexed (rejected above)
+            opts.use_filter,
+            opts.filter_heuristic,
+            opts.level,
+            opts.zstd_dictionary.as_deref(),
+            |row_start, row_end| {
                 // Pack each row of indices into bit_depth bits/index (section 4.1.2)
+                let tile_h = row_end - row_start;
                 let mut tile_packed = Vec::with_capacity(tile_h * idx_bytes_per_row);
                 for row in row_start..row_end {
                     let row_indices =
@@ -1873,30 +1934,9 @@ pub fn encode_indexed(input_path: &str, output_path: &str, opts: &EncodeOptions)
                     let packed_row = pack_indices_row(row_indices, bit_depth)?;
                     tile_packed.extend_from_slice(&packed_row);
                 }
-
-                // The predictive filter operates on the already-packed bytes (bpp=1),
-                // valid for any bit_depth (section 4.1.1/4.1.2 - interaction with Filter method).
-                let tile_payload = if opts.use_filter {
-                    apply_predictive_filter(
-                        &tile_packed,
-                        tile_h,
-                        idx_bytes_per_row,
-                        1,
-                        opts.filter_heuristic,
-                        opts.level,
-                    )?
-                } else {
-                    tile_packed
-                };
-
-                build_idat_chunk(&tile_payload, opts.level, zstd_dict)
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        for (chunk, chunk_used_zstd) in chunks {
-            uses_zstd |= chunk_used_zstd;
-            out.extend_from_slice(&chunk);
-        }
+                Ok(tile_packed)
+            },
+        )?;
     }
 
     // --- IEND ---
