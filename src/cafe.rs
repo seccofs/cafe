@@ -725,17 +725,14 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
                 .collect();
 
             if !complexities.is_empty() {
-                eprintln!(
-                    "[CAFE] Adaptive analysis: {} tiles processed",
-                    complexities.len()
-                );
+                log::debug!("Adaptive analysis: {} tiles processed", complexities.len());
                 let avg_complexity = complexities.iter().sum::<f64>() / complexities.len() as f64;
-                eprintln!("[CAFE] Average complexity: {:.2} bits/byte", avg_complexity);
+                log::debug!("Average complexity: {:.2} bits/byte", avg_complexity);
                 let max_complexity = complexities
                     .iter()
                     .cloned()
                     .fold(f64::NEG_INFINITY, f64::max);
-                eprintln!("[CAFE] Maximum complexity: {:.2} bits/byte", max_complexity);
+                log::debug!("Maximum complexity: {:.2} bits/byte", max_complexity);
             }
         }
 
@@ -1299,7 +1296,7 @@ fn handle_iccp_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) {
             Ok(profile) => state.icc_profile = Some(profile),
             Err(e) => {
                 // Invalid ICC profile, silently discarded (ancillary)
-                eprintln!("Warning: invalid iCCP chunk, discarded: {}", e);
+                log::warn!("invalid iCCP chunk, discarded: {}", e);
             }
         }
     }
@@ -1313,10 +1310,7 @@ fn handle_xmpd_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) {
             Ok(xmp) => state.xmp_metadata = Some(xmp),
             Err(e) => {
                 // Invalid XMP metadata, silently discarded (ancillary)
-                eprintln!(
-                    "Warning: xMPd chunk contains invalid UTF-8, discarded: {}",
-                    e
-                );
+                log::warn!("xMPd chunk contains invalid UTF-8, discarded: {}", e);
             }
         }
     }
@@ -1330,7 +1324,7 @@ fn handle_zdic_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) {
             Ok(dict) => state.zstd_dictionary = Some(dict),
             Err(e) => {
                 // Invalid ZSTD dictionary, silently discarded (ancillary)
-                eprintln!("Warning: invalid zDIC chunk, discarded: {}", e);
+                log::warn!("invalid zDIC chunk, discarded: {}", e);
             }
         }
     }
@@ -1354,7 +1348,7 @@ fn handle_chdr_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) {
             Ok(chdr_data) => state.chdr = Some(chdr_data),
             Err(e) => {
                 // Invalid cHDR, silently discarded (ancillary)
-                eprintln!("Warning: invalid cHDR chunk, discarded: {}", e);
+                log::warn!("invalid cHDR chunk, discarded: {}", e);
             }
         }
     }
@@ -1963,8 +1957,8 @@ pub fn encode_indexed(input_path: &str, output_path: &str, opts: &EncodeOptions)
     );
 
     std::fs::write(output_path, out)?;
-    eprintln!(
-        "[CAFE] encoded with palette: {} colors, bit depth = {}",
+    log::info!(
+        "encoded with palette: {} colors, bit depth = {}",
         palette.entries.len(),
         bit_depth
     );

@@ -4,6 +4,36 @@ use std::str::FromStr;
 
 use cafe::{decode_with_opts, EncodeOptions, ToneMapOperator};
 
+/// Minimal stderr logger so the `cafe` library's `log::warn!` diagnostics
+/// (e.g. "invalid iCCP chunk, discarded") remain visible when running this
+/// CLI. See the identical logger in `cafe-encode.rs` for rationale on why
+/// this is hand-rolled instead of pulling in `env_logger`.
+struct StderrLogger;
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn init_logger() {
+    static LOGGER: StderrLogger = StderrLogger;
+    let level = env::var("RUST_LOG")
+        .ok()
+        .and_then(|s| s.parse::<log::LevelFilter>().ok())
+        .unwrap_or(log::LevelFilter::Info);
+    log::set_max_level(level);
+    let _ = log::set_logger(&LOGGER);
+}
+
 fn usage() {
     eprintln!("Usage: cafe-decode <input.cafe> <output> [options]");
     eprintln!();
@@ -14,6 +44,7 @@ fn usage() {
 }
 
 fn main() -> ExitCode {
+    init_logger();
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 3 {

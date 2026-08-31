@@ -55,6 +55,7 @@ zstd = "0.13"             # ZSTD compression/decompression
 serde_json = "1.0"        # JSON metadata parsing
 half = "2.7"              # Half-float (fp16) for sample_format HALF (HDR, v1.0)
 crc32fast = "1.3"         # Chunk validation via CRC32
+log = "0.4"               # Diagnostic facade (debug/info/warn); consumers choose their own logger
 ```
 
 ---
