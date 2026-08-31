@@ -321,6 +321,26 @@ fn roundtrip_byte_shuffle_tiling() {
     assert_pixels_close(&pixels, &make_image(33, 23).into_raw(), 0);
 }
 
+#[test]
+fn roundtrip_tiling_many_tiles() {
+    // Regression test: with a 1x1 tile, a 200x1 image produces 200 IDATs,
+    // each one exercising handle_idat_tile_idim's tile-order lookup
+    // (previously recomputed idim.tile_order() from scratch on every IDAT -
+    // correctness was never affected, only decode-side performance, but
+    // this pins down that decoding many small tiles still reconstructs the
+    // image correctly after caching that lookup in DecodeState).
+    let width = 200;
+    let height = 1;
+    let img = make_image(width, height);
+    let opts = EncodeOptions {
+        idim: Some(cafe::iDim::new(1, 1, width, height, 0)),
+        use_filter: false,
+        ..EncodeOptions::default()
+    };
+    let pixels = roundtrip_image(img.clone(), &opts, "tiling_many_tiles");
+    assert_pixels_close(&pixels, &img.into_raw(), 0);
+}
+
 /// Encodes a single file and returns the Result (without unwrap) for tests of
 /// rejection of invalid combinations.
 fn encode_result(opts: &EncodeOptions, label: &str) -> Result<(), cafe::error::CafeError> {

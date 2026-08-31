@@ -906,6 +906,13 @@ struct DecodeState {
     palette: Option<Palette>,
     idim: Option<iDim>, // iDIM chunk (v1.0, ancillary)
     tiles_seen: usize,  // Tile counter for 2D tiling (iDIM)
+    // Cached result of `idim.tile_order()`, computed once in
+    // `handle_idim_chunk` right after the iDIM geometry is validated.
+    // `handle_idat_tile_idim` indexes into this instead of recomputing
+    // `tile_order()` (an O(tile_count) allocation, O(tile_count log
+    // tile_count) for Z-order) on every single IDAT — recomputing it per
+    // tile would make decoding an N-tile image O(N^2)/O(N^2 log N) overall.
+    idim_tile_order: Option<Vec<(u16, u16)>>,
     chdr: Option<cHDR>, // cHDR chunk (v1.0, ancillary, HDR metadata)
 }
 
@@ -933,6 +940,7 @@ impl Default for DecodeState {
             palette: None,
             idim: None,
             tiles_seen: 0,
+            idim_tile_order: None,
             chdr: None,
         }
     }
@@ -1373,6 +1381,10 @@ fn handle_idim_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) -> Result<(
                 expected_tiles_y
             )));
         }
+        // Compute the tile visitation order once here (not per-IDAT in
+        // handle_idat_tile_idim) - see the doc comment on
+        // DecodeState::idim_tile_order for why this matters.
+        state.idim_tile_order = Some(idim.tile_order()?);
         // Single instance per file (similar to eXIF)
         state.idim = Some(idim);
     }
@@ -1475,8 +1487,19 @@ fn handle_idat_tile_idim(state: &mut DecodeState, tile_payload: Vec<u8>) -> Resu
             "tile buffer inconsistent with IHDR (iDIM)".into(),
         ));
     }
-    let tile_order = idim.tile_order()?;
-    let (tx, ty) = tile_order[state.tiles_seen];
+    // Use the tile order cached once in handle_idim_chunk instead of
+    // recomputing it from scratch on every IDAT (would be O(tile_count^2)
+    // - or worse, O(tile_count^2 log tile_count) for Z-order - across a
+    // full decode instead of O(tile_count)).
+    let (tx, ty) = state
+        .idim_tile_order
+        .as_ref()
+        .ok_or_else(|| {
+            CafeError::TruncatedFile("iDIM tile order not computed (internal error)".into())
+        })?
+        .get(state.tiles_seen)
+        .copied()
+        .ok_or_else(|| CafeError::TruncatedFile("iDIM tile order index out of range".into()))?;
     state.tiles_seen += 1;
     let (tile_w, tile_h) = idim.tile_dimensions(tx, ty, img_width, img_height);
     let tw = tile_w as usize;
