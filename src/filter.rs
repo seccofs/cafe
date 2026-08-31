@@ -819,11 +819,13 @@ pub(crate) fn undo_predictive_filter(
         )
     })?;
     let needed = 1usize.checked_add(data_bytes).ok_or_else(|| {
-        CafeError::TruncatedFile("undo_predictive_filter: overflow no Calculation of bytes".into())
+        CafeError::TruncatedFile(
+            "undo_predictive_filter: overflow in byte count calculation".into(),
+        )
     })?;
     if tile_data.len() < needed {
         return Err(CafeError::TruncatedFile(format!(
-            "Insufficient filter data: expected {} bytes (1 de filtro + {} de dados), mas apenas {} available",
+            "Insufficient filter data: expected {} bytes (1 filter byte + {} data bytes), but only {} available",
             needed, data_bytes, tile_data.len()
         )));
     }

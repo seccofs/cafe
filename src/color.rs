@@ -189,7 +189,7 @@ pub(crate) fn convert_rgba_to_color_type(
     // Validation: prevents division by zero and overflow
     if width == 0 || height == 0 {
         return Err(CafeError::UnsupportedFeature(
-            "Invalid dimensions para color conversion".into(),
+            "Invalid dimensions for color conversion".into(),
         ));
     }
 
@@ -209,21 +209,19 @@ pub(crate) fn convert_rgba_to_color_type(
     let bpp = bytes_per_pixel(target_color_type, target_bit_depth)
         .ok_or_else(|| {
             CafeError::UnsupportedFeature(format!(
-                "Conversion para color type {target_color_type}, bit depth {target_bit_depth} not supported"
+                "Conversion to color type {target_color_type}, bit depth {target_bit_depth} not supported"
             ))
         })?;
 
     // Computes the output buffer size with overflow validation (section 12.1)
     let pixel_count_u64 = (width as u64).checked_mul(height as u64).ok_or_else(|| {
-        CafeError::UnsupportedFeature(
-            "Image dimensions causam overflow in conversion de cor".into(),
-        )
+        CafeError::UnsupportedFeature("Image dimensions cause overflow in color conversion".into())
     })?;
 
     // SECURITY: Validates that pixel_count fits in usize (especially important on 32-bit platforms)
     if pixel_count_u64 > (usize::MAX as u64) {
         return Err(CafeError::UnsupportedFeature(
-            "Image dimensions excedem limite de memory allocation".into(),
+            "Image dimensions exceed memory allocation limit".into(),
         ));
     }
     let pixel_count = pixel_count_u64 as usize;
@@ -242,7 +240,7 @@ pub(crate) fn convert_rgba_to_color_type(
             })?
     } else {
         pixel_count.checked_mul(bpp).ok_or_else(|| {
-            CafeError::UnsupportedFeature("Output buffer da color conversion would overflow".into())
+            CafeError::UnsupportedFeature("Output buffer of color conversion would overflow".into())
         })?
     };
 
@@ -557,7 +555,7 @@ pub(crate) fn convert_color_type_to_rgba_with_format(
 ) -> Result<Vec<u8>> {
     let channels = samples_per_pixel(color_type).ok_or_else(|| {
         CafeError::UnsupportedFeature(format!(
-            "convert_color_type_to_rgba_with_format: color type {color_type} sem canais definidos"
+            "convert_color_type_to_rgba_with_format: color type {color_type} has no defined channels"
         ))
     })?;
     let sample_count = (width as usize)
@@ -579,7 +577,7 @@ pub(crate) fn convert_color_type_to_rgba_with_format(
             for _ in 0..sample_count {
                 if offset + 4 > data.len() {
                     return Err(CafeError::TruncatedFile(
-                        "convert_color_type_to_rgba: insuficientes dados float".into(),
+                        "convert_color_type_to_rgba: insufficient float data".into(),
                     ));
                 }
                 let float_bits = u32::from_be_bytes([
@@ -603,7 +601,7 @@ pub(crate) fn convert_color_type_to_rgba_with_format(
             for _ in 0..sample_count {
                 if offset + 2 > data.len() {
                     return Err(CafeError::TruncatedFile(
-                        "convert_color_type_to_rgba: insuficientes dados half".into(),
+                        "convert_color_type_to_rgba: insufficient half data".into(),
                     ));
                 }
                 let half_bits = u16::from_be_bytes([data[offset], data[offset + 1]]);
@@ -647,7 +645,7 @@ pub(crate) fn convert_color_type_to_rgba(
     // Dimensions validation
     if width == 0 || height == 0 {
         return Err(CafeError::UnsupportedFeature(
-            "Invalid dimensions para color conversion".into(),
+            "Invalid dimensions for color conversion".into(),
         ));
     }
 
@@ -666,8 +664,7 @@ pub(crate) fn convert_color_type_to_rgba(
                     let row_end = row_start + bytes_per_row;
                     if row_end > data.len() {
                         return Err(CafeError::TruncatedFile(
-                            "convert_color_type_to_rgba: insuficientes dados compactados (GRAY)"
-                                .into(),
+                            "convert_color_type_to_rgba: insufficient packed data (GRAY)".into(),
                         ));
                     }
                     let row_packed = &data[row_start..row_end];
@@ -694,8 +691,7 @@ pub(crate) fn convert_color_type_to_rgba(
                     let row_end = row_start + bytes_per_row;
                     if row_end > data.len() {
                         return Err(CafeError::TruncatedFile(
-                            "convert_color_type_to_rgba: insuficientes dados compactados (GA)"
-                                .into(),
+                            "convert_color_type_to_rgba: insufficient packed data (GA)".into(),
                         ));
                     }
                     let row_packed = &data[row_start..row_end];
@@ -948,20 +944,18 @@ pub(crate) fn convert_color_type_to_rgba(
 
     let _bpp = bytes_per_pixel(color_type, effective_bit_depth).ok_or_else(|| {
         CafeError::UnsupportedFeature(format!(
-            "Conversion do color type {color_type}, bit depth {effective_bit_depth} not supported"
+            "Conversion from color type {color_type}, bit depth {effective_bit_depth} not supported"
         ))
     })?;
 
     let pixel_count_u64 = (width as u64).checked_mul(height as u64).ok_or_else(|| {
-        CafeError::UnsupportedFeature(
-            "Image dimensions causam overflow in conversion de cor".into(),
-        )
+        CafeError::UnsupportedFeature("Image dimensions cause overflow in color conversion".into())
     })?;
 
     // SECURITY: Validates that pixel_count fits in usize
     if pixel_count_u64 > (usize::MAX as u64) {
         return Err(CafeError::UnsupportedFeature(
-            "Image dimensions excedem limite de memory allocation".into(),
+            "Image dimensions exceed memory allocation limit".into(),
         ));
     }
     let pixel_count = pixel_count_u64 as usize;
@@ -1090,7 +1084,7 @@ pub(crate) fn rgba_to_luma8_batch(rgba: &[u8]) -> Vec<u8> {
 pub(crate) fn bytes_per_row_for_bit_depth(width: u32, bit_depth: u8) -> Result<usize> {
     if bit_depth != 1 && bit_depth != 2 && bit_depth != 4 && bit_depth != 8 {
         return Err(CafeError::UnsupportedFeature(format!(
-            "bit_depth {} not allowed para packing (only 1, 2, 4, 8)",
+            "bit_depth {} not allowed for packing (only 1, 2, 4, 8)",
             bit_depth
         )));
     }
@@ -1138,7 +1132,7 @@ pub(crate) fn reduce_sample_8_to_n_bits(value_8bit: u8, bit_depth: u8) -> Result
 pub(crate) fn read_u16_be(buf: &[u8], offset: usize) -> Result<u16> {
     if offset + 2 > buf.len() {
         return Err(CafeError::TruncatedFile(
-            "Buffer muito pequeno para ler u16 big-endian".into(),
+            "Buffer too small to read u16 big-endian".into(),
         ));
     }
     Ok(u16::from_be_bytes([buf[offset], buf[offset + 1]]))
@@ -1152,7 +1146,7 @@ pub(crate) fn read_u16_be(buf: &[u8], offset: usize) -> Result<u16> {
 pub(crate) fn read_u32_be(buf: &[u8], offset: usize) -> Result<u32> {
     if offset + 4 > buf.len() {
         return Err(CafeError::TruncatedFile(
-            "Buffer muito pequeno para ler u32 big-endian".into(),
+            "Buffer too small to read u32 big-endian".into(),
         ));
     }
     Ok(u32::from_be_bytes([
@@ -1332,7 +1326,7 @@ pub(crate) fn pack_indices_row(row: &[u8], bit_depth: u8) -> Result<Vec<u8>> {
 
     if bit_depth != 1 && bit_depth != 2 && bit_depth != 4 {
         return Err(CafeError::UnsupportedFeature(format!(
-            "pack_indices_row: bit_depth {} not supported (apenas 1, 2, 4, 8)",
+            "pack_indices_row: bit_depth {} not supported (only 1, 2, 4, 8)",
             bit_depth
         )));
     }
@@ -1407,7 +1401,7 @@ pub(crate) fn pack_samples_row(
         // No packing needed, just copy
         if samples.len() < width * bpp {
             return Err(CafeError::TruncatedFile(
-                "pack_samples_row: samples buffer curto para bit_depth=8".into(),
+                "pack_samples_row: samples buffer too short for bit_depth=8".into(),
             ));
         }
         return Ok(samples[..width * bpp].to_vec());

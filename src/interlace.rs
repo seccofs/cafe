@@ -131,7 +131,7 @@ pub(crate) fn reconstruct_adam7(
     }
     if expected_bytes > usize::MAX as u64 {
         return Err(CafeError::TruncatedFile(
-            "Adam7: imagem grande demais para este processo".into(),
+            "Adam7: image too large for this process".into(),
         ));
     }
 

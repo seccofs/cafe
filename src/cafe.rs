@@ -672,7 +672,7 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
                     })?;
                     if end > raw.len() {
                         return Err(CafeError::TruncatedFile(
-                            "tile excede os dados da imagem durante encode".into(),
+                            "tile exceeds image data during encode".into(),
                         ));
                     }
                     tile_raw.extend_from_slice(&raw[start..end]);
@@ -1603,7 +1603,7 @@ fn handle_idat_direct_color(state: &mut DecodeState, tile_payload: Vec<u8>) -> R
         .pixel_rows
         .len()
         .checked_add(tile_raw.len())
-        .ok_or_else(|| CafeError::TruncatedFile("overflow accumulating linhas de pixel".into()))?;
+        .ok_or_else(|| CafeError::TruncatedFile("overflow accumulating pixel rows".into()))?;
     if new_len > expected_row_bytes {
         return Err(CafeError::TruncatedFile(format!(
             "Excess IDAT: indexed data pixels sum more than \
@@ -4053,7 +4053,7 @@ mod tests {
         }
 
         let img =
-            image::RgbaImage::from_raw(width, height, img_data).expect("failed ao criar imagem");
+            image::RgbaImage::from_raw(width, height, img_data).expect("failed to create image");
 
         let temp_dir = std::env::temp_dir();
         let input_path = temp_dir
@@ -4139,7 +4139,7 @@ mod tests {
         }
 
         let img = image::RgbaImage::from_raw(width, height, img_data.clone())
-            .expect("failed ao criar imagem");
+            .expect("failed to create image");
 
         let temp_dir = std::env::temp_dir();
         let input_path = temp_dir
@@ -4194,7 +4194,7 @@ mod tests {
         }
 
         let img = image::RgbaImage::from_raw(width, height, img_data.clone())
-            .expect("failed ao criar imagem");
+            .expect("failed to create image");
 
         let temp_dir = std::env::temp_dir();
         let input_path = temp_dir
