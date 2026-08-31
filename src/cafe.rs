@@ -633,7 +633,16 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
         // parallelized across a rayon thread pool (v1.2.2); chunks are then
         // appended to `out` in the original tile_order sequence, which the
         // decoder relies on to reconstruct tile positions.
-        let zstd_dict = opts.zstd_dictionary.as_deref();
+        //
+        // NOTE: uses `final_zstd_dict` (not `opts.zstd_dictionary`) so that an
+        // auto-trained dictionary (opts.auto_dictionary) is actually used to
+        // compress these IDATs too, matching the dictionary announced in the
+        // zDIC chunk above. Using the wrong (empty) dictionary here would
+        // silently produce IDATs the decoder cannot reconstruct with the
+        // dictionary it read from zDIC — see doc comment on
+        // `append_common_metadata_chunks` for the historical bug this class
+        // of divergence already caused in `encode_indexed()`.
+        let zstd_dict = final_zstd_dict.as_deref();
         let chunks: Vec<(Vec<u8>, bool)> = idim
             .tile_order()?
             .into_par_iter()
@@ -733,7 +742,8 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
         // Tiles are independent (no shared state between them), so the
         // expensive per-tile work — filter search and ZSTD compression — is
         // parallelized across a rayon thread pool (v1.2.2) inside the shared
-        // helper.
+        // helper. Uses `final_zstd_dict` for the same reason as the iDIM
+        // branch above (auto-trained dictionary must actually be used).
         uses_zstd |= write_row_tiled_idats(
             &mut out,
             height,
@@ -745,7 +755,7 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
             opts.use_filter,
             opts.filter_heuristic,
             opts.level,
-            opts.zstd_dictionary.as_deref(),
+            final_zstd_dict.as_deref(),
             |row_start, row_end| {
                 Ok(raw[row_start * bytes_per_row..row_end * bytes_per_row].to_vec())
             },
