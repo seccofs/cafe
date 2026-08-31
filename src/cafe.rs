@@ -951,6 +951,21 @@ impl Default for DecodeState {
 /// methods, and computes `bytes_per_row` plus the cumulative decompression
 /// budget (CWE-409). Critical chunk — any inconsistency is a hard error.
 fn handle_ihdr_chunk(state: &mut DecodeState, data: &[u8]) -> Result<()> {
+    // SECURITY (CWE-409): IHDR is always the first chunk and appears exactly
+    // once (section 4.1/8.9 of the spec). Unlike every other stateful chunk
+    // (PLTE, eXIF, iCCP, xMPd, zDIC, iDIM, cHDR - all guarded by
+    // `state.X.is_none()`), IHDR had no such guard: a second IHDR would
+    // silently overwrite width/height/bytes_per_row/color_type while
+    // `decompress_budget` (below) stays cached from the *first* IHDR. A
+    // forged file could declare huge dimensions in IHDR #1 (caching a huge
+    // budget), then a tiny IHDR #2 (small effective image), letting
+    // subsequent IDATs decompress far beyond what the tiny effective image
+    // needs - defeating the cumulative decompression-bomb protection.
+    if state.width.is_some() {
+        return Err(CafeError::UnsupportedFeature(
+            "duplicate IHDR chunk: IHDR must appear exactly once, as the first chunk".into(),
+        ));
+    }
     const IHDR_LEN: usize = 14;
     if data.len() < IHDR_LEN {
         return Err(CafeError::TruncatedFile(format!(
@@ -2704,6 +2719,61 @@ mod tests {
         assert!(
             result.is_err(),
             "sum of IDATs beyond IHDR budget must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_decode_adversarial_duplicate_ihdr_budget_bypass() {
+        // SECURITY (CWE-409): a first IHDR declaring huge dimensions caches a
+        // huge decompress_budget; a second IHDR then overwrites width/height
+        // to a tiny effective image, but (before the fix) decompress_budget
+        // stayed cached from the first IHDR - letting IDATs decompress far
+        // beyond what the tiny effective image needs. The decoder must now
+        // reject the second (duplicate) IHDR outright.
+        let mut evil = Vec::new();
+        evil.extend_from_slice(&SIGNATURE);
+
+        let build_ihdr = |w: u32, h: u32| -> Vec<u8> {
+            let mut ihdr = Vec::new();
+            ihdr.extend_from_slice(&w.to_be_bytes());
+            ihdr.extend_from_slice(&h.to_be_bytes());
+            ihdr.push(8); // bit_depth
+            ihdr.push(SAMPLE_FORMAT_UINT);
+            ihdr.push(COLOR_TYPE_RGBA);
+            ihdr.push(COMPRESSION_METHOD_ZSTD_BIT);
+            ihdr.push(FILTER_METHOD_NONE);
+            ihdr.push(INTERLACE_NONE);
+            ihdr
+        };
+
+        // IHDR #1: huge image -> huge decompress_budget would be cached.
+        evil.extend_from_slice(&write_chunk(
+            CHUNK_IHDR,
+            FLAG_RAW,
+            &build_ihdr(20_000, 20_000),
+        ));
+        // IHDR #2: tiny effective image.
+        evil.extend_from_slice(&write_chunk(CHUNK_IHDR, FLAG_RAW, &build_ihdr(4, 4)));
+
+        // Several IDATs, each decompressing to 800 KiB of zeros (highly
+        // compressible, tiny on disk) - far beyond what a 4x4 RGBA image
+        // needs (68 bytes), but within the huge budget from IHDR #1.
+        let piece = vec![0u8; 800 * 1024];
+        let compressed = zstd::encode_all(piece.as_slice(), 3).unwrap();
+        for _ in 0..10 {
+            evil.extend_from_slice(&write_chunk(CHUNK_IDAT, FLAG_ZSTD, &compressed));
+        }
+        evil.extend_from_slice(&write_chunk(CHUNK_IEND, FLAG_RAW, &[]));
+
+        let tmp_in = std::env::temp_dir().join("cafe_evil_duplicate_ihdr.cafe");
+        let tmp_out = std::env::temp_dir().join("cafe_evil_duplicate_ihdr.png");
+        std::fs::write(&tmp_in, &evil).unwrap();
+        let result = decode(tmp_in.to_str().unwrap(), tmp_out.to_str().unwrap());
+        let _ = std::fs::remove_file(&tmp_in);
+        let _ = std::fs::remove_file(&tmp_out);
+        assert!(
+            result.is_err(),
+            "duplicate IHDR (budget-bypass attempt) must be rejected"
         );
     }
 
