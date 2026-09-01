@@ -34,6 +34,7 @@
 //! is available (enforced via `#[target_feature(enable = "avx2")]` on the
 //! `unsafe` implementation functions).
 
+#[cfg(target_arch = "x86_64")]
 use crate::error::CafeError;
 
 /// Applies byte-shuffle using AVX2 PSHUFB for fast vectorized reordering.
@@ -100,6 +101,7 @@ pub(crate) fn undo_byte_shuffle_simd(
 /// `mask[b * pixels_per_lane + p] = p * bpp + b`, i.e. output position
 /// `b*P+p` (grouped by byte-position `b`, pixel `p` within the lane) reads
 /// from AoS input position `p*bpp+b`.
+#[cfg(target_arch = "x86_64")]
 fn build_encode_mask(bpp: usize) -> [i8; 16] {
     let pixels_per_lane = 16 / bpp;
     let mut mask = [0i8; 16];
@@ -117,6 +119,7 @@ fn build_encode_mask(bpp: usize) -> [i8; 16] {
 /// inverse permutation of [`build_encode_mask`]):
 /// `mask[p * bpp + b] = b * pixels_per_lane + p`, i.e. AoS output position
 /// `p*bpp+b` reads from the "grouped by byte-position" input at `b*P+p`.
+#[cfg(target_arch = "x86_64")]
 fn build_decode_mask(bpp: usize) -> [i8; 16] {
     let pixels_per_lane = 16 / bpp;
     let mut mask = [0i8; 16];
@@ -130,6 +133,7 @@ fn build_decode_mask(bpp: usize) -> [i8; 16] {
     mask
 }
 
+#[cfg(target_arch = "x86_64")]
 fn duplicate_mask(mask16: [i8; 16]) -> [i8; 32] {
     let mut mask32 = [0i8; 32];
     mask32[0..16].copy_from_slice(&mask16);

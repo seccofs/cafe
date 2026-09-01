@@ -1,4 +1,4 @@
-//! SIMD (AVX2) optimizations for predictive filters (v1.1+).
+//! SIMD (AVX2 / NEON) optimizations for predictive filters (v1.1+).
 //!
 //! Vectorized implementations of the most common and compute-intensive filters:
 //! - Filter 0 (None): Direct copy
@@ -30,13 +30,37 @@
 //!
 //! # Architecture
 //!
-//! - **x86_64 with AVX2 (256-bit)**: Process 32 bytes per iteration
-//! - **Other architectures / CPUs without AVX2**: Scalar fallback (automatic)
-//! - **Dispatch**: Runtime, via `is_x86_feature_detected!("avx2")`. The AVX2
+//! - **x86_64 with AVX2 (256-bit)**: Process 32 bytes per iteration.
+//!   **Dispatch**: Runtime, via `is_x86_feature_detected!("avx2")`. The AVX2
 //!   code is always compiled into the binary on `target_arch = "x86_64"` (no
 //!   special `RUSTFLAGS` or `-C target-feature` needed at build time) and is
 //!   only executed if the running CPU actually supports AVX2; otherwise the
 //!   scalar fallback runs. This makes a single binary portable across CPUs.
+//! - **aarch64 with NEON (128-bit)**: Process 16 bytes per iteration
+//!   (Filters 1-3 only, for now — see "NEON Coverage" below). **Dispatch**:
+//!   Compile-time only, via `#[cfg(target_arch = "aarch64")]`. Unlike AVX2,
+//!   NEON is a *mandatory* part of the ARMv8-A baseline (every aarch64 CPU
+//!   has it — there is no "NEON-less" ARM64 chip to fall back from), so no
+//!   `is_aarch64_feature_detected!` runtime check is needed or used.
+//! - **Other architectures / CPUs without AVX2**: Scalar fallback (automatic)
+//!
+//! # NEON Coverage (aarch64, v1.3+)
+//!
+//! Only Filters 1 (Sub), 2 (Up) and 3 (Average) currently have NEON kernels
+//! — the three highest-value, simplest-to-verify targets (ported first to
+//! keep the initial aarch64 surface small and easy to audit). Filters 4-14
+//! still use the portable scalar fallback on aarch64; they can be ported
+//! following the same pattern in a follow-up (each AVX2 kernel above has a
+//! fairly direct NEON equivalent: `vld1q_u8`/`vst1q_u8` for load/store,
+//! `vsubq_u8`/`vaddq_u8` for wrapping add/sub, `vmovl_u8`/`vmovn_u16` for
+//! 8→16-bit widen/narrow where overflow-safety requires it).
+//!
+//! Filter 3 (Average)'s NEON kernel is actually *simpler* than its AVX2
+//! counterpart: ARM's `vhaddq_u8` ("halving add") computes
+//! `(a[i] + b[i]) >> 1` for 16 packed `u8` lanes directly in hardware,
+//! carry-safe by construction — no 16-bit widen/narrow round-trip needed
+//! (contrast with `average_epu8_32`, which AVX2 requires precisely because
+//! x86 has no equivalent single-instruction halving add for bytes).
 //!
 //! # Encode vs. Decode Vectorization
 //!
@@ -66,13 +90,22 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
+
+#[cfg(target_arch = "x86_64")]
 const SIMD_WIDTH: usize = 32;
+
+/// NEON processes 128-bit (16-byte) chunks, vs. AVX2's 256-bit (32-byte).
+#[cfg(target_arch = "aarch64")]
+const NEON_WIDTH: usize = 16;
 
 // ============================================================================
 // Filter 1 (Sub): residual[x] = pixel[x] - pixel[x - bpp]
 // ============================================================================
 
-/// Applies Filter 1 (Sub) using AVX2 if the running CPU supports it, otherwise scalar.
+/// Applies Filter 1 (Sub) using AVX2 (x86_64) or NEON (aarch64) if available,
+/// otherwise scalar.
 pub(crate) fn filter_sub_avx2(row: &[u8], bpp: usize) -> Vec<u8> {
     #[cfg(target_arch = "x86_64")]
     {
@@ -80,6 +113,13 @@ pub(crate) fn filter_sub_avx2(row: &[u8], bpp: usize) -> Vec<u8> {
             return unsafe { filter_sub_avx2_impl(row, bpp) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is baseline on aarch64 (ARMv8-A mandates it) — no runtime
+        // feature check needed, unlike AVX2 on x86_64.
+        return unsafe { filter_sub_neon_impl(row, bpp) };
+    }
+    #[allow(unreachable_code)]
     filter_sub_scalar(row, bpp)
 }
 
@@ -115,6 +155,32 @@ unsafe fn filter_sub_avx2_impl(row: &[u8], bpp: usize) -> Vec<u8> {
     filtered
 }
 
+/// NEON implementation of Filter 1 (Sub). `vsubq_u8` computes wrapping
+/// (mod-256) subtraction natively — identical semantics to `wrapping_sub`,
+/// no widening needed (unlike Average).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn filter_sub_neon_impl(row: &[u8], bpp: usize) -> Vec<u8> {
+    let len = row.len();
+    let mut filtered = vec![0u8; len];
+    filtered[0..bpp].copy_from_slice(&row[0..bpp]);
+
+    let mut i = bpp;
+    while i + NEON_WIDTH <= len {
+        let pixels = vld1q_u8(row.as_ptr().add(i));
+        let left = vld1q_u8(row.as_ptr().add(i - bpp));
+        let residual = vsubq_u8(pixels, left);
+        vst1q_u8(filtered.as_mut_ptr().add(i), residual);
+        i += NEON_WIDTH;
+    }
+
+    for j in i..len {
+        filtered[j] = row[j].wrapping_sub(row[j - bpp]);
+    }
+
+    filtered
+}
+
 /// Reverses Filter 1 (Sub). Always scalar: `out[x]` depends on the
 /// just-reconstructed `out[x - bpp]`, which prevents safe vectorization
 /// when `bpp` is smaller than the SIMD width (see module docs).
@@ -131,7 +197,8 @@ pub(crate) fn unfilter_sub_avx2(filtered: &[u8], bpp: usize) -> Vec<u8> {
 // Filter 2 (Up): residual[x] = pixel[x] - pixel_above[x]
 // ============================================================================
 
-/// Applies Filter 2 (Up) using AVX2 if the running CPU supports it, otherwise scalar.
+/// Applies Filter 2 (Up) using AVX2 (x86_64) or NEON (aarch64) if available,
+/// otherwise scalar.
 pub(crate) fn filter_up_avx2(row: &[u8], prev_row: Option<&[u8]>) -> Vec<u8> {
     #[cfg(target_arch = "x86_64")]
     {
@@ -139,6 +206,11 @@ pub(crate) fn filter_up_avx2(row: &[u8], prev_row: Option<&[u8]>) -> Vec<u8> {
             return unsafe { filter_up_avx2_impl(row, prev_row) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { filter_up_neon_impl(row, prev_row) };
+    }
+    #[allow(unreachable_code)]
     filter_up_scalar(row, prev_row)
 }
 
@@ -181,9 +253,39 @@ unsafe fn filter_up_avx2_impl(row: &[u8], prev_row: Option<&[u8]>) -> Vec<u8> {
     filtered
 }
 
-/// Reverses Filter 2 (Up) using AVX2 if the running CPU supports it, otherwise
-/// scalar. Safe to vectorize: `out[x]` only depends on `prev_row[x]`, which is
-/// fully known ahead of time (not on other bytes of `out`).
+/// NEON implementation of Filter 2 (Up). `vsubq_u8` handles wrapping
+/// subtraction natively, matching `wrapping_sub` exactly.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn filter_up_neon_impl(row: &[u8], prev_row: Option<&[u8]>) -> Vec<u8> {
+    let len = row.len();
+    let mut filtered = vec![0u8; len];
+
+    let Some(prev) = prev_row else {
+        filtered.copy_from_slice(row);
+        return filtered;
+    };
+
+    let mut i = 0;
+    while i + NEON_WIDTH <= len {
+        let pixels = vld1q_u8(row.as_ptr().add(i));
+        let above = vld1q_u8(prev.as_ptr().add(i));
+        let residual = vsubq_u8(pixels, above);
+        vst1q_u8(filtered.as_mut_ptr().add(i), residual);
+        i += NEON_WIDTH;
+    }
+
+    for j in i..len {
+        filtered[j] = row[j].wrapping_sub(prev[j]);
+    }
+
+    filtered
+}
+
+/// Reverses Filter 2 (Up) using AVX2 (x86_64) or NEON (aarch64) if available,
+/// otherwise scalar. Safe to vectorize: `out[x]` only depends on
+/// `prev_row[x]`, which is fully known ahead of time (not on other bytes of
+/// `out`).
 pub(crate) fn unfilter_up_avx2(filtered: &[u8], prev_row: Option<&[u8]>) -> Vec<u8> {
     #[cfg(target_arch = "x86_64")]
     {
@@ -191,6 +293,11 @@ pub(crate) fn unfilter_up_avx2(filtered: &[u8], prev_row: Option<&[u8]>) -> Vec<
             return unsafe { unfilter_up_avx2_impl(filtered, prev_row) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { unfilter_up_neon_impl(filtered, prev_row) };
+    }
+    #[allow(unreachable_code)]
     unfilter_up_scalar(filtered, prev_row)
 }
 
@@ -233,13 +340,42 @@ unsafe fn unfilter_up_avx2_impl(filtered: &[u8], prev_row: Option<&[u8]>) -> Vec
     out
 }
 
+/// NEON implementation of `unfilter_up`. `vaddq_u8` handles wrapping addition
+/// natively, matching `wrapping_add` exactly.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn unfilter_up_neon_impl(filtered: &[u8], prev_row: Option<&[u8]>) -> Vec<u8> {
+    let len = filtered.len();
+    let mut out = vec![0u8; len];
+
+    let Some(prev) = prev_row else {
+        out.copy_from_slice(filtered);
+        return out;
+    };
+
+    let mut i = 0;
+    while i + NEON_WIDTH <= len {
+        let residuals = vld1q_u8(filtered.as_ptr().add(i));
+        let above = vld1q_u8(prev.as_ptr().add(i));
+        let reconstructed = vaddq_u8(residuals, above);
+        vst1q_u8(out.as_mut_ptr().add(i), reconstructed);
+        i += NEON_WIDTH;
+    }
+
+    for j in i..len {
+        out[j] = filtered[j].wrapping_add(prev[j]);
+    }
+
+    out
+}
+
 // ============================================================================
 // Filter 3 (Average): residual[x] = pixel[x] - (left + above) / 2
 // ============================================================================
 
-/// Applies Filter 3 (Average) using AVX2 if the running CPU supports it,
-/// otherwise scalar. Safe to vectorize: both operands (`row`, `prev_row`) are
-/// the original, already-known pixel data.
+/// Applies Filter 3 (Average) using AVX2 (x86_64) or NEON (aarch64) if
+/// available, otherwise scalar. Safe to vectorize: both operands (`row`,
+/// `prev_row`) are the original, already-known pixel data.
 pub(crate) fn filter_average_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
     #[cfg(target_arch = "x86_64")]
     {
@@ -247,6 +383,11 @@ pub(crate) fn filter_average_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usiz
             return unsafe { filter_average_avx2_impl(row, prev_row, bpp) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { filter_average_neon_impl(row, prev_row, bpp) };
+    }
+    #[allow(unreachable_code)]
     filter_average_scalar(row, prev_row, bpp)
 }
 
@@ -299,6 +440,56 @@ unsafe fn filter_average_avx2_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usi
         _mm256_storeu_si256(filtered.as_mut_ptr().add(i) as *mut __m256i, residuals);
 
         i += SIMD_WIDTH;
+    }
+
+    for j in i..len {
+        let a = row[j - bpp];
+        let b = prev[j];
+        let pred = ((a as u16 + b as u16) >> 1) as u8;
+        filtered[j] = row[j].wrapping_sub(pred);
+    }
+
+    filtered
+}
+
+/// NEON implementation. Unlike AVX2 (which has no single-instruction halving
+/// add for bytes and must widen to 16-bit lanes to avoid losing the carry
+/// bit — see `average_epu8_32`), ARM NEON's `vhaddq_u8` ("halving add")
+/// computes `(a[i] + b[i]) >> 1` for 16 packed `u8` lanes directly, carry-safe
+/// by construction. No widen/narrow round-trip needed.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn filter_average_neon_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    let len = row.len();
+    let mut filtered = vec![0u8; len];
+
+    let Some(prev) = prev_row else {
+        // No previous row: pred = left >> 1 (b = 0), first `bpp` bytes pred = 0.
+        filtered[0..bpp.min(len)].copy_from_slice(&row[0..bpp.min(len)]);
+        for i in bpp..len {
+            let pred = (row[i - bpp] as u16) >> 1;
+            filtered[i] = row[i].wrapping_sub(pred as u8);
+        }
+        return filtered;
+    };
+
+    // First `bpp` bytes have no left neighbor: pred = above >> 1 (a = 0).
+    for i in 0..bpp.min(len) {
+        let pred = (prev[i] as u16) >> 1;
+        filtered[i] = row[i].wrapping_sub(pred as u8);
+    }
+
+    let mut i = bpp;
+    while i + NEON_WIDTH <= len {
+        let pixels = vld1q_u8(row.as_ptr().add(i));
+        let left = vld1q_u8(row.as_ptr().add(i - bpp));
+        let above = vld1q_u8(prev.as_ptr().add(i));
+
+        let pred = vhaddq_u8(left, above);
+        let residuals = vsubq_u8(pixels, pred);
+        vst1q_u8(filtered.as_mut_ptr().add(i), residuals);
+
+        i += NEON_WIDTH;
     }
 
     for j in i..len {

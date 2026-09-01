@@ -9,13 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Planned (v1.3+)
-- ARM NEON SIMD vectorization for mobile/ARM servers
+### Planned (Future)
+- ARM NEON SIMD for Filters 4-15 and other SIMD modules (`simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs`)
 - Cache-friendly blocking in scalar byte-shuffle fallback
 - Runtime CPU detection for optional SIMD forcing
 - Benchmarking suite with Criterion framework
 - k-means palette quantization algorithm
 - Tone-mapping on encode (SDR → HDR inverse operation)
+
+---
+
+## [1.3.0] - 2026-09-01
+
+### Added
+
+- **ARM NEON SIMD (aarch64)** for Filters 1-3 (Sub, Up, Average) in `src/simd.rs`:
+  - `filter_sub_avx2`, `filter_up_avx2`, `unfilter_up_avx2`, `filter_average_avx2` now dispatch to NEON kernels on aarch64 via compile-time `#[cfg(target_arch = "aarch64")]` (no runtime feature check needed — NEON is mandatory on ARMv8-A, unlike AVX2 which is optional on x86_64)
+  - Public function names/signatures unchanged (`_avx2` suffix retained) to avoid touching call sites in `filter.rs`
+  - Filter 3 (Average) NEON kernel uses `vhaddq_u8` (halving add), simpler than the AVX2 path's widen-to-16-bit/narrow-back-to-8-bit workaround
+  - `unfilter_sub_avx2` and `unfilter_average_avx2` remain scalar-only on all architectures (sequential dependency on the just-reconstructed previous byte prevents safe vectorization)
+
+### Notes
+
+- Filters 4-15 and other SIMD modules (`simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs`) remain AVX2-only for now; aarch64 builds fall back to scalar for those
+- Validated via `cargo check --target aarch64-unknown-linux-gnu --lib` and `cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` (toolchain: `zig cc -target aarch64-linux-gnu` as C cross-compiler for `zstd-sys`)
+- Native x86_64: 273 unit tests + 7 integration tests still passing, zero regressions
 
 ---
 

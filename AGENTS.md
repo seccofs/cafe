@@ -104,9 +104,9 @@ Each block/tile (set of lines in an `IDAT`) chooses a single filter, prefixed by
 | Code | Name | Prediction | Cost | SIMD (v1.1+) |
 |--------|------|----------|-------|------|
 | `0` | None | None | O(1) | ✅ (memcpy) |
-| `1` | Sub | Byte to the left (L) | O(n) | ✅ AVX2 (4-8x) |
-| `2` | Up | Byte above (U) | O(n) | ✅ AVX2 (4-8x) |
-| `3` | Average | (L + U) / 2 | O(n) | ✅ AVX2 (scalar opt) |
+| `1` | Sub | Byte to the left (L) | O(n) | ✅ AVX2 (4-8x) / NEON (v1.3+) |
+| `2` | Up | Byte above (U) | O(n) | ✅ AVX2 (4-8x) / NEON (v1.3+) |
+| `3` | Average | (L + U) / 2 | O(n) | ✅ AVX2 (scalar opt) / NEON (v1.3+, via `vhaddq_u8`) |
 | `4` | Paeth | Left, above, or diagonal (UL) | O(n) | — Scalar |
 | `5` | MED | Median Edge Detector (JPEG-LS) | O(n) | — Scalar |
 | `6` | Gradient | (L + U - UL) mod 256 (JPEG Lossless) | O(n) | — Scalar |
@@ -123,6 +123,7 @@ Each block/tile (set of lines in an `IDAT`) chooses a single filter, prefixed by
 - **Feature gate:** `simd` (default: enabled, can be disabled with `--no-default-features`)
 - **CPU detection:** Automatic at runtime; falls back to scalar on non-AVX2 CPUs
 - **Building:** `cargo build --release` (SIMD on), or `cargo build --release --no-default-features` (SIMD off)
+- **NEON (v1.3+, aarch64):** Filters 1-3 also have ARM NEON kernels (128-bit/16-byte lanes vs. AVX2's 256-bit/32-byte), dispatched at **compile-time** via `#[cfg(target_arch = "aarch64")]` (NEON is baseline on ARMv8-A, no runtime feature check needed, unlike AVX2). Filters 4-15 and the other SIMD modules (`simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs`) are still AVX2-only; aarch64 builds fall back to scalar for those.
 
 **Selection heuristics (encoder decides, not part of spec):**
 - Shannon Entropy: Measures redundancy of patterns in residuals (default, `FilterHeuristic::Entropy`)
@@ -579,7 +580,8 @@ cargo deny check                     # Security and license audit (requires: car
 | v1.0 | IHDR, IDAT, IEND, ZSTD, Filters 0-13 (Shannon Entropy or real compression test), iDIM (tiling), Adam7, even/odd, indexed PLTE, eXIF, jSON, iCCP, xMPd, cHDR, zDIC, sample_format (uint/float/half), bit depths 1-32, security audit | ✅ |
 | v1.1 | Filters 14-15 (TR-Directional WebP Predictor 10 and adaptive Weighted inspired by JPEG-XL), 16 total predictors, MSAD heuristic, real 2D tiling (iDIM) with end-to-end round-trip, **byte-shuffle (Filter method=1) complete encode+decode (bpp ∈ {2,4,8,16})**, **HDR tone-mapping on decode** (EOTF PQ/HLG/sRGB, color primaries conversion via XYZ, Reinhard/Filmic operators), **AVX2 SIMD for Filters 1-3 (4-8x speedup)** | ✅ |
 | **v1.2** | **Aggressive SIMD Acceleration (AVX2 x86_64)**: Pack/Unpack 1/2/4-bit samples (8-16x), Sample expansion/reduction 8→16/32 (4-6x), **Byte-shuffle blocking** (10-20% cache improvement), **Improved Filter 3 Average** (4-6x), **203 tests** (197 unit + 6 integration roundtrip), **Zero TODOs/FIXMEs**, **Comprehensive benchmarks** (Criterion-ready), Feature-gated SIMD with CPU detection | ✅ |
-| Future | NEON SIMD (ARM), additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
+| **v1.3** | **ARM NEON SIMD (aarch64)**: Filters 1-3 (Sub, Up, Average) ported to NEON intrinsics (`vld1q_u8`/`vst1q_u8`/`vsubq_u8`/`vaddq_u8`/`vhaddq_u8`), compile-time dispatch via `#[cfg(target_arch = "aarch64")]` (no runtime check needed, NEON is ARMv8-A baseline), 273 unit tests + 6 integration tests still passing on x86_64, cross-compile validated via `cargo check --target aarch64-unknown-linux-gnu` | ✅ (Filters 1-3 only) |
+| Future | NEON for Filters 4-15 and other SIMD modules (`simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs`), additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
 
 ---
 
@@ -646,7 +648,7 @@ cargo build --release --no-default-features
 ### High-Potential Areas
 
 1. **SIMD for sub-byte packing** — Extend AVX2 to `pack/unpack_samples_row` (currently scalar)
-2. **NEON SIMD (ARM)** — Implement filters 1-3 for ARM64 (Raspberry Pi, mobile, Apple Silicon)
+2. **NEON SIMD (ARM) for Filters 4-15** — Filters 1-3 already have NEON kernels (v1.3); extend to Paeth, MED, Gradient, directional filters, etc. for ARM64 (Raspberry Pi, mobile, Apple Silicon)
 3. **Advanced 2D tiling** — iDIM with per-tile IDAT already implemented (row-major and Z-order); evolve with preview/progressive streaming
 4. **Optimized interlace** — Adam7 and even/odd already supported; optimize progressiveness and SIMD of passes
 5. **Optimized indexed palette** — Currently uses nearest-neighbor; could use k-means
@@ -692,7 +694,20 @@ cargo doc --open
 
 ---
 
-**Last updated:** August 10, 2026 | **Project version:** v1.2.0 | **Major SIMD Acceleration Phase (Aug 10/2026):**
+**Last updated:** September 1, 2026 | **Project version:** v1.2.1 | **ARM NEON SIMD Phase (Sep 1/2026):**
+
+### v1.3.0 - ARM NEON SIMD (aarch64)
+
+**NEON Vectorization (Filters 1-3, `src/simd.rs`):**
+- `filter_sub_avx2` / `filter_up_avx2` / `unfilter_up_avx2` / `filter_average_avx2` now dispatch to NEON kernels on aarch64, compile-time gated via `#[cfg(target_arch = "aarch64")]` (no runtime feature check needed — NEON is mandatory on ARMv8-A, unlike AVX2 which is optional on x86_64)
+- Public function names/signatures unchanged (`_avx2` suffix kept) to avoid touching call sites in `filter.rs`
+- Filter 3 (Average) NEON kernel uses `vhaddq_u8` (halving add), simpler than the AVX2 path's widen-to-16-bit/narrow-back-to-8-bit workaround
+- `unfilter_sub_avx2` and `unfilter_average_avx2` remain scalar-only on all architectures (sequential dependency on the just-reconstructed previous byte prevents safe vectorization)
+- Filters 4-15 and other SIMD modules (`simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs`) remain AVX2-only for now; aarch64 builds fall back to scalar for those
+
+**Validation:**
+- Native x86_64: `cargo build --lib`, `cargo test --lib` (273 tests), `cargo test --test integration_roundtrip` (7 tests), `cargo clippy -- -D warnings` all pass with zero regressions
+- Cross-compile: `cargo check --target aarch64-unknown-linux-gnu --lib` and `cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` pass cleanly (toolchain: `zig cc -target aarch64-linux-gnu` as the C cross-compiler for `zstd-sys`)
 
 ### v1.2.0 - SIMD Optimization Release
 

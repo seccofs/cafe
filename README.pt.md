@@ -267,7 +267,7 @@ Contribuições são bem-vindas! Áreas com potencial:
 - [x] SIMD no empacotamento sub-byte (1/2/4-bit pack/unpack) — *completo em v1.2* (AVX2, 8-16x)
 - [x] SIMD na conversão de amostras (8→16/32, 16/32→8) — *completo em v1.2* (AVX2, 4-6x)
 - [x] 203 testes completos (197 unit + 6 integration roundtrip) — *completo em v1.2*
-- [ ] Suporte NEON (SIMD ARM)
+- [x] **Suporte NEON (SIMD ARM)** — *completo em v1.3* para os Filtros 1-3 (Sub, Up, Average); Filtros 4-15 e outros módulos SIMD ainda pendentes
 
 ---
 
@@ -279,7 +279,8 @@ Contribuições são bem-vindas! Áreas com potencial:
 | **v1.1** | Filtros 14-15: TR-Directional (WebP Predictor 10) e Weighted adaptativo (inspirado no JPEG-XL) — 16 preditores no total; heurística MSAD; tiling 2D real (iDIM) com round-trip end-to-end; byte-shuffle encode/decode; **otimização AVX2 SIMD (Filtros 1-3)**; HDR tone-mapping | ✅ Completo |
 | **v1.2** | **Aceleração SIMD Agressiva (AVX2 x86_64)**: Pack/Unpack 1/2/4-bit (8-16x), Expansão/redução de amostras (4-6x), Byte-shuffle com blocking (10-20%), Filter 3 melhorado (4-6x); **252 testes** (197 unit + 6 integration roundtrip + 49 SIMD); **Zero TODOs/FIXMEs**; Benchmarks Criterion; Feature-gated SIMD com detecção de CPU | ✅ Completo |
 | **v1.2.1** | Refinamentos e despachante de operador para seleção de tone-mapping | ✅ Completo |
-| **Futuro** | NEON SIMD (ARM), compressores adicionais, operador de tone-mapping selecionável via CLI | 🔮 Planejado |
+| **v1.3** | **NEON SIMD ARM (aarch64)**: Filtros 1-3 (Sub, Up, Average) portados para NEON, dispatch em compile-time, sem checagem de feature em runtime (NEON é baseline no ARMv8-A) | ✅ Completo (Filtros 1-3) |
+| **Futuro** | NEON para Filtros 4-15 e outros módulos SIMD, compressores adicionais, operador de tone-mapping selecionável via CLI | 🔮 Planejado |
 
 ---
 
