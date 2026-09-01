@@ -104,26 +104,26 @@ Each block/tile (set of lines in an `IDAT`) chooses a single filter, prefixed by
 | Code | Name | Prediction | Cost | SIMD (v1.1+) |
 |--------|------|----------|-------|------|
 | `0` | None | None | O(1) | ✅ (memcpy) |
-| `1` | Sub | Byte to the left (L) | O(n) | ✅ AVX2 (4-8x) / NEON (v1.3+) |
-| `2` | Up | Byte above (U) | O(n) | ✅ AVX2 (4-8x) / NEON (v1.3+) |
-| `3` | Average | (L + U) / 2 | O(n) | ✅ AVX2 (scalar opt) / NEON (v1.3+, via `vhaddq_u8`) |
-| `4` | Paeth | Left, above, or diagonal (UL) | O(n) | — Scalar |
-| `5` | MED | Median Edge Detector (JPEG-LS) | O(n) | — Scalar |
-| `6` | Gradient | (L + U - UL) mod 256 (JPEG Lossless) | O(n) | — Scalar |
-| `7` | Simple Median | Simple median of L, U, UL | O(n) | — Scalar |
-| `8` | 2nd Order | (2L - LL + 2U - UU) / 2 with clamp | O(n), uses LL, UU | — Scalar |
-| `9`-`12` | 4-way Directional | Combinations of L, U, UL with weights | O(n) | — Scalar |
-| `13` | Context-Based | Detects local edge, chooses dynamically | O(n) | — Scalar |
-| `14` | TR-Directional | Bilinear average (L, UL, U, TR) — WebP Predictor 10 | O(n), uses TR | — Scalar |
-| `15` | Weighted (adaptive) | Adaptive weighted average of L, U, UL, TR — inspired by JPEG-XL | O(n), state per block | — Scalar |
+| `1` | Sub | Byte to the left (L) | O(n) | ✅ AVX2 (4-8x) / NEON |
+| `2` | Up | Byte above (U) | O(n) | ✅ AVX2 (4-8x) / NEON |
+| `3` | Average | (L + U) / 2 | O(n) | ✅ AVX2 (scalar opt) / NEON (via `vhaddq_u8`) |
+| `4` | Paeth | Left, above, or diagonal (UL) | O(n) | ✅ AVX2 / NEON (16-bit widen + blend) |
+| `5` | MED | Median Edge Detector (JPEG-LS) | O(n) | ✅ AVX2 / NEON (unsigned min/max) |
+| `6` | Gradient | (L + U - UL) mod 256 (JPEG Lossless) | O(n) | ✅ AVX2 / NEON |
+| `7` | Simple Median | Simple median of L, U, UL | O(n) | ✅ AVX2 / NEON (unsigned min/max) |
+| `8` | 2nd Order | (2L - LL + 2U - UU) / 2 with clamp | O(n), uses LL, UU | ✅ AVX2 / NEON (16-bit widen) |
+| `9`-`12` | 4-way Directional | Combinations of L, U, UL with weights | O(n) | ✅ AVX2 / NEON (16-bit widen) |
+| `13` | Context-Based | Detects local edge, chooses dynamically | O(n) | ✅ AVX2 / NEON (16-bit widen + blend) |
+| `14` | TR-Directional | Bilinear average (L, UL, U, TR) — WebP Predictor 10 | O(n), uses TR | ✅ AVX2 / NEON (via `vhaddq_u8`) |
+| `15` | Weighted (adaptive) | Adaptive weighted average of L, U, UL, TR — inspired by JPEG-XL | O(n), state per block | — Scalar (sequential state) |
 
 **SIMD Optimization (v1.1+):**
-- Filters 1 (Sub), 2 (Up), 3 (Average) use **AVX2 intrinsics** on x86_64 CPUs
-- Processes 32 bytes per SIMD iteration (4-8x speedup expected)
+- Filters 1-14 use **AVX2 intrinsics** on x86_64 CPUs and **ARM NEON intrinsics** on aarch64 CPUs (Filter 15 is scalar-only on every architecture — sequential adaptive-state dependency)
+- Processes 32 bytes per SIMD iteration on AVX2, 16 bytes per iteration on NEON (4-8x speedup expected)
 - **Feature gate:** `simd` (default: enabled, can be disabled with `--no-default-features`)
-- **CPU detection:** Automatic at runtime; falls back to scalar on non-AVX2 CPUs
+- **CPU detection:** AVX2 is detected automatically at runtime (falls back to scalar on non-AVX2 x86_64 CPUs); NEON is dispatched at **compile-time** via `#[cfg(target_arch = "aarch64")]` (NEON is mandatory on ARMv8-A, no runtime feature check needed)
 - **Building:** `cargo build --release` (SIMD on), or `cargo build --release --no-default-features` (SIMD off)
-- **NEON (v1.3+, aarch64):** Filters 1-3 also have ARM NEON kernels (128-bit/16-byte lanes vs. AVX2's 256-bit/32-byte), dispatched at **compile-time** via `#[cfg(target_arch = "aarch64")]` (NEON is baseline on ARMv8-A, no runtime feature check needed, unlike AVX2). Filters 4-15 and the other SIMD modules (`simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs`) are still AVX2-only; aarch64 builds fall back to scalar for those.
+- **NEON coverage (v1.3+, aarch64):** All 14 vectorized filters have NEON kernels. The other SIMD modules (`simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs`) are still AVX2-only; aarch64 builds fall back to scalar for those.
 
 **Selection heuristics (encoder decides, not part of spec):**
 - Shannon Entropy: Measures redundancy of patterns in residuals (default, `FilterHeuristic::Entropy`)
@@ -580,8 +580,8 @@ cargo deny check                     # Security and license audit (requires: car
 | v1.0 | IHDR, IDAT, IEND, ZSTD, Filters 0-13 (Shannon Entropy or real compression test), iDIM (tiling), Adam7, even/odd, indexed PLTE, eXIF, jSON, iCCP, xMPd, cHDR, zDIC, sample_format (uint/float/half), bit depths 1-32, security audit | ✅ |
 | v1.1 | Filters 14-15 (TR-Directional WebP Predictor 10 and adaptive Weighted inspired by JPEG-XL), 16 total predictors, MSAD heuristic, real 2D tiling (iDIM) with end-to-end round-trip, **byte-shuffle (Filter method=1) complete encode+decode (bpp ∈ {2,4,8,16})**, **HDR tone-mapping on decode** (EOTF PQ/HLG/sRGB, color primaries conversion via XYZ, Reinhard/Filmic operators), **AVX2 SIMD for Filters 1-3 (4-8x speedup)** | ✅ |
 | **v1.2** | **Aggressive SIMD Acceleration (AVX2 x86_64)**: Pack/Unpack 1/2/4-bit samples (8-16x), Sample expansion/reduction 8→16/32 (4-6x), **Byte-shuffle blocking** (10-20% cache improvement), **Improved Filter 3 Average** (4-6x), **203 tests** (197 unit + 6 integration roundtrip), **Zero TODOs/FIXMEs**, **Comprehensive benchmarks** (Criterion-ready), Feature-gated SIMD with CPU detection | ✅ |
-| **v1.3** | **ARM NEON SIMD (aarch64)**: Filters 1-3 (Sub, Up, Average) ported to NEON intrinsics (`vld1q_u8`/`vst1q_u8`/`vsubq_u8`/`vaddq_u8`/`vhaddq_u8`), compile-time dispatch via `#[cfg(target_arch = "aarch64")]` (no runtime check needed, NEON is ARMv8-A baseline), 273 unit tests + 6 integration tests still passing on x86_64, cross-compile validated via `cargo check --target aarch64-unknown-linux-gnu` | ✅ (Filters 1-3 only) |
-| Future | NEON for Filters 4-15 and other SIMD modules (`simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs`), additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
+| **v1.3** | **ARM NEON SIMD (aarch64)**: all 14 vectorized filters (Sub, Up, Average, Gradient, 4-way Directional, Paeth, MED, Simple Median, 2nd Order, Context-Based, TR-Directional) ported to NEON intrinsics, compile-time dispatch via `#[cfg(target_arch = "aarch64")]` (no runtime check needed, NEON is ARMv8-A baseline), 273 unit tests + 7 integration tests still passing on x86_64, cross-compile validated via `cargo check`/`cargo clippy --target aarch64-unknown-linux-gnu` | ✅ (Filters 1-14) |
+| Future | NEON for other SIMD modules (`simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs`), additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
 
 ---
 
@@ -648,7 +648,7 @@ cargo build --release --no-default-features
 ### High-Potential Areas
 
 1. **SIMD for sub-byte packing** — Extend AVX2 to `pack/unpack_samples_row` (currently scalar)
-2. **NEON SIMD (ARM) for Filters 4-15** — Filters 1-3 already have NEON kernels (v1.3); extend to Paeth, MED, Gradient, directional filters, etc. for ARM64 (Raspberry Pi, mobile, Apple Silicon)
+2. **NEON SIMD (ARM) for other modules** — Filters 1-14 already have NEON kernels (v1.3); extend the same pattern to `simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs` for ARM64 (Raspberry Pi, mobile, Apple Silicon)
 3. **Advanced 2D tiling** — iDIM with per-tile IDAT already implemented (row-major and Z-order); evolve with preview/progressive streaming
 4. **Optimized interlace** — Adam7 and even/odd already supported; optimize progressiveness and SIMD of passes
 5. **Optimized indexed palette** — Currently uses nearest-neighbor; could use k-means
@@ -708,6 +708,23 @@ cargo doc --open
 **Validation:**
 - Native x86_64: `cargo build --lib`, `cargo test --lib` (273 tests), `cargo test --test integration_roundtrip` (7 tests), `cargo clippy -- -D warnings` all pass with zero regressions
 - Cross-compile: `cargo check --target aarch64-unknown-linux-gnu --lib` and `cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` pass cleanly (toolchain: `zig cc -target aarch64-linux-gnu` as the C cross-compiler for `zstd-sys`)
+
+### v1.3.0 (cont.) - ARM NEON SIMD extended to Filters 4-14
+
+Ported incrementally, one filter at a time, each verified (native build + cross-compile check/clippy) before moving to the next:
+
+- **Filters 9-12 (4-way Directional)**: new shared `directional_chunk_neon`/`filter_directional_neon_body` helpers (NEON analogue of `directional_chunk_avx2`/`filter_directional_avx2_body`), plus reusable widen/narrow helpers `widen_u8x16_to_u16x8_pair`/`narrow_u16x8_pair_to_u8x16`. Filter 12's exact `/5` uses a widening multiply (`vmull_u16`) + narrowing shift (`vshrn_n_u32`) instead of AVX2's `_mm256_mulhi_epu16` (NEON has no direct 16x16→high-16 multiply).
+- **Filter 6 (Gradient)**: pure 8-bit wrapping arithmetic (`vaddq_u8`/`vsubq_u8`), no widening needed — same as the scalar formula.
+- **Filters 4 (Paeth) and 13 (Context-Based)**: 16-bit-widened branchless blends via `vbslq_u16` (bitwise select), replacing AVX2's `blendv_epi8`; `<=` comparisons built the same way as AVX2 (`!(a > b)`, no native NEON `<=` opcode either).
+- **Filters 5 (MED) and 7 (Simple Median)**: pure unsigned-byte `vminq_u8`/`vmaxq_u8`, no widening — new `filter_byte_chunk_neon_body` helper added since these don't fit the widened `filter_directional_neon_body` signature (NEON's distinct `uint8x16_t`/`uint16x8_t` types, unlike AVX2's uniform `__m256i`, required a separate non-widening body). MED's `c >= max(a,b)`/`c <= min(a,b)` use NEON's native `vcgeq_u8`/`vcleq_u8` directly (simpler than AVX2's `max_epu8(x,y)==x` trick, since NEON has real unsigned comparison intrinsics).
+- **Filter 8 (2nd Order)**: 16-bit widening of `a`/`b`/`ll`/`uu` (4 neighbors), 8-lane (not 16-lane) NEON chunks since the AVX2 half-chunk width matches; `vshrq_n_s16` (arithmetic shift) has the same truncate-toward-`-infinity` semantics as AVX2's `_mm256_srai_epi16`.
+- **Filter 14 (TR-Directional)**: three nested `vhaddq_u8` (halving add) calls, simpler than AVX2's widen-based `average_epu8_32` composition — same simplification already used for Filter 3.
+- Filter 15 (Weighted) confirmed to remain scalar-only on every architecture (sequential adaptive-state dependency, unchanged from v1.1).
+- Public function names/signatures unchanged (`_avx2` suffix kept everywhere) to avoid touching call sites in `filter.rs`.
+
+**Validation (repeated after each filter, full suite re-run at the end):**
+- Native x86_64: `cargo build --lib`, `cargo test --lib` (273 tests), `cargo test --test integration_roundtrip` (7 tests), `cargo clippy --lib -- -D warnings`, `cargo fmt --check` all pass with zero regressions
+- Cross-compile: `cargo clean -p cafe --target aarch64-unknown-linux-gnu` followed by `cargo check --target aarch64-unknown-linux-gnu --lib` and `cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` (clean, not incremental, to force full re-analysis) pass with zero warnings
 
 ### v1.2.0 - SIMD Optimization Release
 

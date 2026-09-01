@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Planned (Future)
-- ARM NEON SIMD for Filters 4-15 and other SIMD modules (`simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs`)
+- ARM NEON SIMD for other SIMD modules (`simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs`)
 - Cache-friendly blocking in scalar byte-shuffle fallback
 - Runtime CPU detection for optional SIMD forcing
 - Benchmarking suite with Criterion framework
@@ -28,11 +28,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Public function names/signatures unchanged (`_avx2` suffix retained) to avoid touching call sites in `filter.rs`
   - Filter 3 (Average) NEON kernel uses `vhaddq_u8` (halving add), simpler than the AVX2 path's widen-to-16-bit/narrow-back-to-8-bit workaround
   - `unfilter_sub_avx2` and `unfilter_average_avx2` remain scalar-only on all architectures (sequential dependency on the just-reconstructed previous byte prevents safe vectorization)
+- **ARM NEON SIMD (aarch64) extended to Filters 4-14** in `src/simd.rs`, ported incrementally and verified one filter at a time:
+  - Filters 9-12 (4-way Directional): new `directional_chunk_neon`/`filter_directional_neon_body` helpers plus reusable `widen_u8x16_to_u16x8_pair`/`narrow_u16x8_pair_to_u8x16`; Filter 12's exact `/5` uses `vmull_u16` + `vshrn_n_u32` (NEON has no `_mm256_mulhi_epu16` equivalent)
+  - Filter 6 (Gradient): pure 8-bit wrapping arithmetic, no widening needed
+  - Filters 4 (Paeth) and 13 (Context-Based): 16-bit-widened branchless blends via `vbslq_u16`, replacing AVX2's `blendv_epi8`
+  - Filters 5 (MED) and 7 (Simple Median): pure unsigned-byte `vminq_u8`/`vmaxq_u8` via new `filter_byte_chunk_neon_body` helper (no widening); MED uses NEON's native `vcgeq_u8`/`vcleq_u8`
+  - Filter 8 (2nd Order): 16-bit widening of 4 neighbors (`a`/`b`/`ll`/`uu`), 8-lane NEON chunks
+  - Filter 14 (TR-Directional): three nested `vhaddq_u8` calls, simpler than AVX2's widen-based composition
+  - Filter 15 (Weighted) confirmed scalar-only on every architecture (sequential adaptive-state dependency)
+  - Public function names/signatures unchanged (`_avx2` suffix retained everywhere)
 
 ### Notes
 
-- Filters 4-15 and other SIMD modules (`simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs`) remain AVX2-only for now; aarch64 builds fall back to scalar for those
-- Validated via `cargo check --target aarch64-unknown-linux-gnu --lib` and `cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` (toolchain: `zig cc -target aarch64-linux-gnu` as C cross-compiler for `zstd-sys`)
+- Other SIMD modules (`simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs`) remain AVX2-only for now; aarch64 builds fall back to scalar for those
+- Validated via `cargo check --target aarch64-unknown-linux-gnu --lib` and `cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` (toolchain: `zig cc -target aarch64-linux-gnu` as C cross-compiler for `zstd-sys`), re-run after each filter and once more at the end
 - Native x86_64: 273 unit tests + 7 integration tests still passing, zero regressions
 
 ---

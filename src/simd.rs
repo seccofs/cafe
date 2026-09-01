@@ -37,7 +37,7 @@
 //!   only executed if the running CPU actually supports AVX2; otherwise the
 //!   scalar fallback runs. This makes a single binary portable across CPUs.
 //! - **aarch64 with NEON (128-bit)**: Process 16 bytes per iteration
-//!   (Filters 1-3 only, for now — see "NEON Coverage" below). **Dispatch**:
+//!   (Filters 1-14 — see "NEON Coverage" below). **Dispatch**:
 //!   Compile-time only, via `#[cfg(target_arch = "aarch64")]`. Unlike AVX2,
 //!   NEON is a *mandatory* part of the ARMv8-A baseline (every aarch64 CPU
 //!   has it — there is no "NEON-less" ARM64 chip to fall back from), so no
@@ -46,21 +46,32 @@
 //!
 //! # NEON Coverage (aarch64, v1.3+)
 //!
-//! Only Filters 1 (Sub), 2 (Up) and 3 (Average) currently have NEON kernels
-//! — the three highest-value, simplest-to-verify targets (ported first to
-//! keep the initial aarch64 surface small and easy to audit). Filters 4-14
-//! still use the portable scalar fallback on aarch64; they can be ported
-//! following the same pattern in a follow-up (each AVX2 kernel above has a
-//! fairly direct NEON equivalent: `vld1q_u8`/`vst1q_u8` for load/store,
-//! `vsubq_u8`/`vaddq_u8` for wrapping add/sub, `vmovl_u8`/`vmovn_u16` for
-//! 8→16-bit widen/narrow where overflow-safety requires it).
+//! All vectorized filters (1-14) have NEON kernels; only Filter 15
+//! (Weighted) remains scalar-only on every architecture (sequential
+//! adaptive-state dependency, see above). Filters 1-3 were ported first
+//! (highest-value, simplest-to-verify targets); Filters 4-14 followed
+//! incrementally, one at a time, each verified via
+//! `cargo check --target aarch64-unknown-linux-gnu` + clippy before moving
+//! to the next. Each AVX2 kernel has a fairly direct NEON equivalent:
+//! `vld1q_u8`/`vst1q_u8` for load/store, `vsubq_u8`/`vaddq_u8` for wrapping
+//! add/sub, `vmovl_u8`/`vqmovn_u16` for 8→16-bit widen/narrow where
+//! overflow-safety requires it (shared via `widen_u8x16_to_u16x8_pair`/
+//! `narrow_u16x8_pair_to_u8x16`), `vminq_u8`/`vmaxq_u8` for the unwidened
+//! min/max filters (MED, Simple Median), and `vbslq_u8`/`vbslq_u16`
+//! (bitwise select) in place of AVX2's `blendv` for the branchy predictors
+//! (Paeth, Context-Based, MED).
 //!
-//! Filter 3 (Average)'s NEON kernel is actually *simpler* than its AVX2
-//! counterpart: ARM's `vhaddq_u8` ("halving add") computes
-//! `(a[i] + b[i]) >> 1` for 16 packed `u8` lanes directly in hardware,
-//! carry-safe by construction — no 16-bit widen/narrow round-trip needed
-//! (contrast with `average_epu8_32`, which AVX2 requires precisely because
-//! x86 has no equivalent single-instruction halving add for bytes).
+//! Filter 3 (Average) and Filter 14 (TR-Directional)'s NEON kernels are
+//! actually *simpler* than their AVX2 counterparts: ARM's `vhaddq_u8`
+//! ("halving add") computes `(a[i] + b[i]) >> 1` for 16 packed `u8` lanes
+//! directly in hardware, carry-safe by construction — no 16-bit widen/narrow
+//! round-trip needed (contrast with `average_epu8_32`, which AVX2 requires
+//! precisely because x86 has no equivalent single-instruction halving add
+//! for bytes). Filter 12 (4-way Diagonal /, exact `/5`) is the one exception
+//! where NEON needs *more* work than AVX2: lacking an equivalent to
+//! `_mm256_mulhi_epu16` (direct high-16-bits-of-16x16-multiply), the
+//! fixed-point reciprocal trick is instead done via widening multiply
+//! (`vmull_u16`) to 32 bits followed by a narrowing shift (`vshrn_n_u32`).
 //!
 //! # Encode vs. Decode Vectorization
 //!
@@ -559,6 +570,28 @@ unsafe fn average_epu8_32(a: __m256i, b: __m256i) -> __m256i {
     narrow_epu16_pair_to_epu8_32(pred_lo16, pred_hi16)
 }
 
+/// Widens a full 16-byte NEON chunk (`uint8x16_t`) into a pair of 8 x `u16`
+/// lane groups (`(lo, hi)` covering bytes 0-7 and 8-15), the NEON equivalent
+/// of `widen_epu8_32_to_epu16_pair` — except NEON's native chunk is already
+/// 16 bytes (vs. AVX2's 32), so there is no outer 128-bit-half split first.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn widen_u8x16_to_u16x8_pair(v: uint8x16_t) -> (uint16x8_t, uint16x8_t) {
+    (vmovl_u8(vget_low_u8(v)), vmovl_u8(vget_high_u8(v)))
+}
+
+/// Inverse of `widen_u8x16_to_u16x8_pair`: narrows a `(lo, hi)` pair of 8 x
+/// `u16` lane groups back into a single 16-byte `u8` chunk via `vqmovn_u16`
+/// (saturating narrow — values `> 255` clamp to `255`, matching
+/// `_mm_packus_epi16`'s saturation semantics on the AVX2 side; every
+/// predictor here guarantees in-range values anyway, so saturation is a
+/// no-op in practice except for Filter 8's clamp, which relies on it).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn narrow_u16x8_pair_to_u8x16(lo: uint16x8_t, hi: uint16x8_t) -> uint8x16_t {
+    vcombine_u8(vqmovn_u16(lo), vqmovn_u16(hi))
+}
+
 /// Reverses Filter 3 (Average). Always scalar: `out[x]` depends on the
 /// just-reconstructed `out[x - bpp]`, which prevents safe vectorization
 /// when `bpp` is smaller than the SIMD width (see module docs).
@@ -581,9 +614,10 @@ pub(crate) fn unfilter_average_avx2(
 // Filter 6 (Gradient): residual[x] = pixel[x] - (left + above - diagonal)
 // ============================================================================
 
-/// Applies Filter 6 (Gradient) using AVX2 if the running CPU supports it,
-/// otherwise scalar. Pure mod-256 arithmetic (`wrapping_add`/`wrapping_sub`),
-/// so it needs no 16-bit widening, unlike Average.
+/// Applies Filter 6 (Gradient) using AVX2 (x86_64) or NEON (aarch64) if
+/// available, otherwise scalar. Pure mod-256 arithmetic
+/// (`wrapping_add`/`wrapping_sub`), so it needs no 16-bit widening, unlike
+/// Average.
 pub(crate) fn filter_gradient_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
     #[cfg(target_arch = "x86_64")]
     {
@@ -591,6 +625,11 @@ pub(crate) fn filter_gradient_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usi
             return unsafe { filter_gradient_avx2_impl(row, prev_row, bpp) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { filter_gradient_neon_impl(row, prev_row, bpp) };
+    }
+    #[allow(unreachable_code)]
     filter_gradient_scalar(row, prev_row, bpp)
 }
 
@@ -651,6 +690,50 @@ unsafe fn filter_gradient_avx2_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: us
     filtered
 }
 
+/// NEON implementation of Filter 6 (Gradient). `vaddq_u8`/`vsubq_u8` compute
+/// wrapping (mod-256) add/sub natively, matching the scalar
+/// `wrapping_add`/`wrapping_sub` exactly — no widening needed.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn filter_gradient_neon_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    let len = row.len();
+    let mut filtered = vec![0u8; len];
+
+    let Some(prev) = prev_row else {
+        // No previous row: b = c = 0, so pred = a (first `bpp` bytes pred = 0).
+        return filter_sub_neon_impl(row, bpp);
+    };
+
+    // First `bpp` bytes have no left/diagonal neighbor: pred = above (b).
+    for i in 0..bpp.min(len) {
+        filtered[i] = row[i].wrapping_sub(prev[i]);
+    }
+
+    let mut i = bpp;
+    while i + NEON_WIDTH <= len {
+        let pixels = vld1q_u8(row.as_ptr().add(i));
+        let left = vld1q_u8(row.as_ptr().add(i - bpp));
+        let above = vld1q_u8(prev.as_ptr().add(i));
+        let diag = vld1q_u8(prev.as_ptr().add(i - bpp));
+
+        let pred = vsubq_u8(vaddq_u8(left, above), diag);
+        let residual = vsubq_u8(pixels, pred);
+        vst1q_u8(filtered.as_mut_ptr().add(i), residual);
+
+        i += NEON_WIDTH;
+    }
+
+    for j in i..len {
+        let a = row[j - bpp];
+        let b = prev[j];
+        let c = prev[j - bpp];
+        let pred = a.wrapping_add(b).wrapping_sub(c);
+        filtered[j] = row[j].wrapping_sub(pred);
+    }
+
+    filtered
+}
+
 // ============================================================================
 // Filters 9-12 (4-way Directional): weighted averages of left/above/diagonal
 // ============================================================================
@@ -674,6 +757,11 @@ pub(crate) fn filter_4way_h_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usize
             return unsafe { filter_4way_h_avx2_impl(row, prev_row, bpp) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { filter_4way_h_neon_impl(row, prev_row, bpp) };
+    }
+    #[allow(unreachable_code)]
     filter_4way_scalar(row, prev_row, bpp, |a, b, _c| {
         ((a as u16 * 3 + b as u16) / 4) as u8
     })
@@ -687,6 +775,11 @@ pub(crate) fn filter_4way_v_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usize
             return unsafe { filter_4way_v_avx2_impl(row, prev_row, bpp) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { filter_4way_v_neon_impl(row, prev_row, bpp) };
+    }
+    #[allow(unreachable_code)]
     filter_4way_scalar(row, prev_row, bpp, |a, b, _c| {
         ((a as u16 + b as u16 * 3) / 4) as u8
     })
@@ -700,6 +793,11 @@ pub(crate) fn filter_4way_d1_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usiz
             return unsafe { filter_4way_d1_avx2_impl(row, prev_row, bpp) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { filter_4way_d1_neon_impl(row, prev_row, bpp) };
+    }
+    #[allow(unreachable_code)]
     filter_4way_scalar(row, prev_row, bpp, |a, b, c| {
         ((a as u16 + b as u16 + c as u16 * 2) / 4) as u8
     })
@@ -713,6 +811,11 @@ pub(crate) fn filter_4way_d2_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usiz
             return unsafe { filter_4way_d2_avx2_impl(row, prev_row, bpp) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { filter_4way_d2_neon_impl(row, prev_row, bpp) };
+    }
+    #[allow(unreachable_code)]
     filter_4way_scalar(row, prev_row, bpp, |a, b, c| {
         ((a as u16 * 2 + b as u16 * 2 + c as u16) / 5) as u8
     })
@@ -896,6 +999,150 @@ unsafe fn filter_4way_d2_avx2_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usi
     )
 }
 
+/// Computes `weighted_sum_shift(left, above, diag)` for a full 16-byte NEON
+/// chunk, via `widen_u8x16_to_u16x8_pair`/`narrow_u16x8_pair_to_u8x16` — the
+/// NEON equivalent of `directional_chunk_avx2`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn directional_chunk_neon(
+    left: uint8x16_t,
+    above: uint8x16_t,
+    diag: uint8x16_t,
+    weighted_sum_shift: impl Fn(uint16x8_t, uint16x8_t, uint16x8_t) -> uint16x8_t,
+) -> uint8x16_t {
+    let (a_lo, a_hi) = widen_u8x16_to_u16x8_pair(left);
+    let (b_lo, b_hi) = widen_u8x16_to_u16x8_pair(above);
+    let (c_lo, c_hi) = widen_u8x16_to_u16x8_pair(diag);
+
+    let pred_lo = weighted_sum_shift(a_lo, b_lo, c_lo);
+    let pred_hi = weighted_sum_shift(a_hi, b_hi, c_hi);
+
+    narrow_u16x8_pair_to_u8x16(pred_lo, pred_hi)
+}
+
+/// NEON equivalent of `filter_directional_avx2_body`, shared by the four
+/// 4-way directional filters' NEON kernels.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn filter_directional_neon_body(
+    row: &[u8],
+    prev_row: Option<&[u8]>,
+    bpp: usize,
+    pred_fn: impl Fn(u8, u8, u8) -> u8,
+    weighted_sum_shift: impl Fn(uint16x8_t, uint16x8_t, uint16x8_t) -> uint16x8_t,
+) -> Vec<u8> {
+    let len = row.len();
+    let mut filtered = vec![0u8; len];
+
+    let Some(prev) = prev_row else {
+        for i in 0..len {
+            let a = if i >= bpp { row[i - bpp] } else { 0 };
+            filtered[i] = row[i].wrapping_sub(pred_fn(a, 0, 0));
+        }
+        return filtered;
+    };
+
+    for i in 0..bpp.min(len) {
+        filtered[i] = row[i].wrapping_sub(pred_fn(0, prev[i], 0));
+    }
+
+    let mut i = bpp;
+    while i + NEON_WIDTH <= len {
+        let pixels = vld1q_u8(row.as_ptr().add(i));
+        let left = vld1q_u8(row.as_ptr().add(i - bpp));
+        let above = vld1q_u8(prev.as_ptr().add(i));
+        let diag = vld1q_u8(prev.as_ptr().add(i - bpp));
+
+        let pred = directional_chunk_neon(left, above, diag, &weighted_sum_shift);
+        let residual = vsubq_u8(pixels, pred);
+        vst1q_u8(filtered.as_mut_ptr().add(i), residual);
+
+        i += NEON_WIDTH;
+    }
+
+    for j in i..len {
+        let a = row[j - bpp];
+        let b = prev[j];
+        let c = prev[j - bpp];
+        filtered[j] = row[j].wrapping_sub(pred_fn(a, b, c));
+    }
+
+    filtered
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn filter_4way_h_neon_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    filter_directional_neon_body(
+        row,
+        prev_row,
+        bpp,
+        |a, b, _c| ((a as u16 * 3 + b as u16) / 4) as u8,
+        |a, b, _c| vshrq_n_u16(vaddq_u16(vshlq_n_u16(a, 1), vaddq_u16(a, b)), 2),
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn filter_4way_v_neon_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    filter_directional_neon_body(
+        row,
+        prev_row,
+        bpp,
+        |a, b, _c| ((a as u16 + b as u16 * 3) / 4) as u8,
+        |a, b, _c| vshrq_n_u16(vaddq_u16(a, vaddq_u16(vshlq_n_u16(b, 1), b)), 2),
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn filter_4way_d1_neon_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    filter_directional_neon_body(
+        row,
+        prev_row,
+        bpp,
+        |a, b, c| ((a as u16 + b as u16 + c as u16 * 2) / 4) as u8,
+        |a, b, c| vshrq_n_u16(vaddq_u16(vaddq_u16(a, b), vshlq_n_u16(c, 1)), 2),
+    )
+}
+
+/// Computes `floor(sum / 5)` for 8 packed `u16` lanes (`sum` up to 1275,
+/// see `filter_4way_d2_avx2_impl`), via the same fixed-point reciprocal
+/// multiply as the AVX2 path, but NEON has no direct "high half of 16x16
+/// multiply" instruction (`_mm256_mulhi_epu16`'s equivalent), so the
+/// multiply is done at 32-bit precision instead: split into two 4-lane
+/// halves, widening multiply (`vmull_u16`) each by the reciprocal constant,
+/// then narrow back down with a 16-bit right-shift (`vshrn_n_u32`, valid for
+/// shift amounts 1-16), which discards the low 16 bits of the 32-bit
+/// product — i.e. exactly `(sum * 13108) >> 16`, identical to the AVX2
+/// formula.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn div5_u16x8_neon(sum: uint16x8_t) -> uint16x8_t {
+    const RECIPROCAL_DIV5: u16 = 13108;
+    let recip = vdup_n_u16(RECIPROCAL_DIV5);
+    let sum_lo = vget_low_u16(sum);
+    let sum_hi = vget_high_u16(sum);
+    let prod_lo = vmull_u16(sum_lo, recip);
+    let prod_hi = vmull_u16(sum_hi, recip);
+    vcombine_u16(vshrn_n_u32(prod_lo, 16), vshrn_n_u32(prod_hi, 16))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn filter_4way_d2_neon_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    filter_directional_neon_body(
+        row,
+        prev_row,
+        bpp,
+        |a, b, c| ((a as u16 * 2 + b as u16 * 2 + c as u16) / 5) as u8,
+        |a, b, c| {
+            let sum = vaddq_u16(vaddq_u16(vshlq_n_u16(a, 1), vshlq_n_u16(b, 1)), c);
+            div5_u16x8_neon(sum)
+        },
+    )
+}
+
 // ============================================================================
 // Filter 14 (TR-Directional): bilinear average of left/above/diag/top-right
 // ============================================================================
@@ -915,6 +1162,11 @@ pub(crate) fn filter_tr_directional_avx2(
             return unsafe { filter_tr_directional_avx2_impl(row, prev_row, bpp) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { filter_tr_directional_neon_impl(row, prev_row, bpp) };
+    }
+    #[allow(unreachable_code)]
     filter_tr_directional_scalar(row, prev_row, bpp)
 }
 
@@ -1002,6 +1254,72 @@ unsafe fn filter_tr_directional_avx2_impl(
     filtered
 }
 
+/// NEON equivalent of `filter_tr_directional_avx2_impl`, using `vhaddq_u8`
+/// (halving add) directly instead of AVX2's widen-to-16-bit `average_epu8_32`
+/// (see `filter_average_neon_impl`'s doc comment for why NEON doesn't need
+/// the widen/narrow round-trip).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn filter_tr_directional_neon_impl(
+    row: &[u8],
+    prev_row: Option<&[u8]>,
+    bpp: usize,
+) -> Vec<u8> {
+    let len = row.len();
+    let mut filtered = vec![0u8; len];
+
+    let Some(prev) = prev_row else {
+        // No previous row: b = d = 0 everywhere (c is also 0 for the first
+        // `bpp` bytes, same as the general case). pred = avg2(avg2(a, 0), 0),
+        // matching the scalar reference exactly.
+        let avg2 = |x: u8, y: u8| ((x as u16 + y as u16) >> 1) as u8;
+        for i in 0..len {
+            let a = if i >= bpp { row[i - bpp] } else { 0 };
+            let pred = avg2(avg2(a, 0), 0);
+            filtered[i] = row[i].wrapping_sub(pred);
+        }
+        return filtered;
+    };
+
+    // First bpp bytes: a = c = 0 (no left/diagonal neighbor yet).
+    let avg2 = |x: u8, y: u8| ((x as u16 + y as u16) >> 1) as u8;
+    for i in 0..bpp.min(len) {
+        let b = prev[i];
+        let d = if i + bpp < len { prev[i + bpp] } else { 0 };
+        let pred = avg2(avg2(0, 0), avg2(b, d));
+        filtered[i] = row[i].wrapping_sub(pred);
+    }
+
+    let mut i = bpp;
+    while i + bpp + NEON_WIDTH <= len {
+        let pixels = vld1q_u8(row.as_ptr().add(i));
+        let left = vld1q_u8(row.as_ptr().add(i - bpp));
+        let above = vld1q_u8(prev.as_ptr().add(i));
+        let diag = vld1q_u8(prev.as_ptr().add(i - bpp));
+        let tr = vld1q_u8(prev.as_ptr().add(i + bpp));
+
+        let avg_left_diag = vhaddq_u8(left, diag);
+        let avg_above_tr = vhaddq_u8(above, tr);
+        let pred = vhaddq_u8(avg_left_diag, avg_above_tr);
+
+        let residual = vsubq_u8(pixels, pred);
+        vst1q_u8(filtered.as_mut_ptr().add(i), residual);
+
+        i += NEON_WIDTH;
+    }
+
+    for j in i..len {
+        let a = row[j - bpp];
+        let b = prev[j];
+        let c = prev[j - bpp];
+        let d = if j + bpp < len { prev[j + bpp] } else { 0 };
+        let pred = avg2(avg2(a, c), avg2(b, d));
+        filtered[j] = row[j].wrapping_sub(pred);
+    }
+
+    filtered
+}
+
 // ============================================================================
 // Filter 7 (Simple Median): pred = median(left, above, diagonal)
 // ============================================================================
@@ -1021,6 +1339,11 @@ pub(crate) fn filter_simple_median_avx2(
             return unsafe { filter_simple_median_avx2_impl(row, prev_row, bpp) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { filter_simple_median_neon_impl(row, prev_row, bpp) };
+    }
+    #[allow(unreachable_code)]
     filter_4way_scalar(row, prev_row, bpp, simple_median_pred)
 }
 
@@ -1051,6 +1374,84 @@ unsafe fn filter_simple_median_avx2_impl(
     })
 }
 
+/// NEON equivalent of `simple_median_chunk_avx2`: `median(a,b,c) =
+/// max(min(a,b), min(max(a,b), c))`, using `vminq_u8`/`vmaxq_u8` directly on
+/// unsigned bytes (no widening needed).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn simple_median_chunk_neon(a: uint8x16_t, b: uint8x16_t, c: uint8x16_t) -> uint8x16_t {
+    let mn_ab = vminq_u8(a, b);
+    let mx_ab = vmaxq_u8(a, b);
+    let mn_mxab_c = vminq_u8(mx_ab, c);
+    vmaxq_u8(mn_ab, mn_mxab_c)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn filter_simple_median_neon_impl(
+    row: &[u8],
+    prev_row: Option<&[u8]>,
+    bpp: usize,
+) -> Vec<u8> {
+    filter_byte_chunk_neon_body(row, prev_row, bpp, simple_median_pred, |a, b, c| {
+        simple_median_chunk_neon(a, b, c)
+    })
+}
+
+/// NEON equivalent of AVX2's `filter_directional_avx2_body` for kernels that
+/// operate directly on unwidened `u8` lanes (no 16-bit intermediate needed,
+/// e.g. Simple Median and MED, both built purely from `min`/`max`). AVX2
+/// reuses `filter_directional_avx2_body` for these too, since `__m256i`
+/// doesn't distinguish 8-bit vs. 16-bit lanes; NEON's distinct
+/// `uint8x16_t`/`uint16x8_t` types require a separate, narrower body here.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn filter_byte_chunk_neon_body(
+    row: &[u8],
+    prev_row: Option<&[u8]>,
+    bpp: usize,
+    pred_fn: impl Fn(u8, u8, u8) -> u8,
+    chunk_pred_fn: impl Fn(uint8x16_t, uint8x16_t, uint8x16_t) -> uint8x16_t,
+) -> Vec<u8> {
+    let len = row.len();
+    let mut filtered = vec![0u8; len];
+
+    let Some(prev) = prev_row else {
+        for i in 0..len {
+            let a = if i >= bpp { row[i - bpp] } else { 0 };
+            filtered[i] = row[i].wrapping_sub(pred_fn(a, 0, 0));
+        }
+        return filtered;
+    };
+
+    for i in 0..bpp.min(len) {
+        filtered[i] = row[i].wrapping_sub(pred_fn(0, prev[i], 0));
+    }
+
+    let mut i = bpp;
+    while i + NEON_WIDTH <= len {
+        let pixels = vld1q_u8(row.as_ptr().add(i));
+        let left = vld1q_u8(row.as_ptr().add(i - bpp));
+        let above = vld1q_u8(prev.as_ptr().add(i));
+        let diag = vld1q_u8(prev.as_ptr().add(i - bpp));
+
+        let pred = chunk_pred_fn(left, above, diag);
+        let residual = vsubq_u8(pixels, pred);
+        vst1q_u8(filtered.as_mut_ptr().add(i), residual);
+
+        i += NEON_WIDTH;
+    }
+
+    for j in i..len {
+        let a = row[j - bpp];
+        let b = prev[j];
+        let c = prev[j - bpp];
+        filtered[j] = row[j].wrapping_sub(pred_fn(a, b, c));
+    }
+
+    filtered
+}
+
 // ============================================================================
 // Filter 5 (MED / Median Edge Detector): JPEG-LS / FFV1 predictor
 // ============================================================================
@@ -1067,6 +1468,11 @@ pub(crate) fn filter_med_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -
             return unsafe { filter_med_avx2_impl(row, prev_row, bpp) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { filter_med_neon_impl(row, prev_row, bpp) };
+    }
+    #[allow(unreachable_code)]
     filter_4way_scalar(row, prev_row, bpp, med_pred)
 }
 
@@ -1107,6 +1513,34 @@ unsafe fn filter_med_avx2_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) 
     })
 }
 
+/// NEON equivalent of `med_chunk_avx2`. Unlike AVX2 (no native unsigned byte
+/// `cmpgt`, requiring the `max_epu8(x, y) == x` trick), NEON has direct
+/// unsigned comparison intrinsics (`vcgeq_u8`/`vcleq_u8`), so `c >= max(a,b)`
+/// and `c <= min(a,b)` are expressed straightforwardly.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn med_chunk_neon(a: uint8x16_t, b: uint8x16_t, c: uint8x16_t) -> uint8x16_t {
+    let mx = vmaxq_u8(a, b);
+    let mn = vminq_u8(a, b);
+    let c_ge_mx = vcgeq_u8(c, mx);
+    let c_le_mn = vcleq_u8(c, mn);
+
+    let else_val = vsubq_u8(vaddq_u8(a, b), c); // wrapping a+b-c
+
+    // Priority matches `med_pred`: c>=max(a,b) branch first, then c<=min(a,b),
+    // else the wrapping sum.
+    let result_else_or_le = vbslq_u8(c_le_mn, mx, else_val);
+    vbslq_u8(c_ge_mx, mn, result_else_or_le)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn filter_med_neon_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    filter_byte_chunk_neon_body(row, prev_row, bpp, med_pred, |a, b, c| {
+        med_chunk_neon(a, b, c)
+    })
+}
+
 // ============================================================================
 // Filter 4 (Paeth) and Filter 13 (Context-Based): 16-bit-widened, half-chunk
 // (16 bytes) AVX2 kernels, wrapped to process a full 32-byte SIMD chunk via
@@ -1125,6 +1559,11 @@ pub(crate) fn filter_paeth_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usize)
             return unsafe { filter_paeth_avx2_impl(row, prev_row, bpp) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { filter_paeth_neon_impl(row, prev_row, bpp) };
+    }
+    #[allow(unreachable_code)]
     filter_4way_scalar(row, prev_row, bpp, paeth_pred)
 }
 
@@ -1180,6 +1619,54 @@ unsafe fn filter_paeth_avx2_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usize
     })
 }
 
+/// NEON equivalent of `paeth_half_avx2`'s widen/abs/blend logic, operating on
+/// one already-widened 8-lane `u16` half (the full 16-byte chunk is widened
+/// into two such halves by `directional_chunk_neon`, called from within
+/// `filter_directional_neon_body`, so there's no separate "half-chunk" split
+/// needed here — NEON's native 128-bit width already matches AVX2's half).
+/// Uses `vbslq_u16` (bitwise select) instead of AVX2's `blendv`, and
+/// compares with `vcgtq_s16`/`vmvnq_u16` (`<=` has no direct NEON opcode
+/// either, so it's built the same way as AVX2: `!(pa > pb)`).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn paeth_lane_neon(a16: uint16x8_t, b16: uint16x8_t, c16: uint16x8_t) -> uint16x8_t {
+    // Reinterpret as signed for the subtractions/abs (values stay in
+    // `[0, 510]`/`[-255, 255]` range, well within i16, so the bit pattern
+    // round-trips losslessly through `vreinterpretq_s16_u16`).
+    let a_s = vreinterpretq_s16_u16(a16);
+    let b_s = vreinterpretq_s16_u16(b16);
+    let c_s = vreinterpretq_s16_u16(c16);
+
+    let p = vsubq_s16(vaddq_s16(a_s, b_s), c_s);
+    let pa = vabsq_s16(vsubq_s16(p, a_s));
+    let pb = vabsq_s16(vsubq_s16(p, b_s));
+    let pc = vabsq_s16(vsubq_s16(p, c_s));
+
+    // pa <= pb  <=>  !(pa > pb); pa <= pc <=> !(pa > pc).
+    let pa_gt_pb = vcgtq_s16(pa, pb);
+    let pa_gt_pc = vcgtq_s16(pa, pc);
+    let use_a = vandq_u16(vmvnq_u16(pa_gt_pb), vmvnq_u16(pa_gt_pc));
+
+    let pb_gt_pc = vcgtq_s16(pb, pc);
+    // use_b only considered when use_a doesn't already win (matches the
+    // scalar `else if` priority exactly).
+    let use_b = vbicq_u16(vmvnq_u16(pb_gt_pc), use_a);
+
+    let result_bc = vbslq_u16(use_b, b16, c16);
+    vbslq_u16(use_a, a16, result_bc)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn filter_paeth_neon_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    filter_directional_neon_body(row, prev_row, bpp, paeth_pred, |a, b, c| {
+        // `filter_directional_neon_body` supplies u16x8 halves directly
+        // (widened by `directional_chunk_neon`), so call the lane-level
+        // helper, not the full-chunk `paeth_chunk_neon`.
+        paeth_lane_neon(a, b, c)
+    })
+}
+
 /// Applies Filter 13 (Context-Based) using AVX2 if the running CPU supports
 /// it, otherwise scalar. Widens `a`/`b`/`c` to 16-bit lanes to compute
 /// `dh = |a - c|`, `dv = |b - c|` without underflow, then blends by priority
@@ -1191,6 +1678,11 @@ pub(crate) fn filter_context_avx2(row: &[u8], prev_row: Option<&[u8]>, bpp: usiz
             return unsafe { filter_context_avx2_impl(row, prev_row, bpp) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { filter_context_neon_impl(row, prev_row, bpp) };
+    }
+    #[allow(unreachable_code)]
     filter_4way_scalar(row, prev_row, bpp, context_pred)
 }
 
@@ -1232,6 +1724,36 @@ unsafe fn context_half_avx2(a: __m128i, b: __m128i, c: __m128i) -> __m128i {
 unsafe fn filter_context_avx2_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
     filter_half_chunk_avx2_body(row, prev_row, bpp, context_pred, |a, b, c| {
         context_half_avx2(a, b, c)
+    })
+}
+
+/// NEON equivalent of `context_half_avx2`'s widen/abs/blend logic, operating
+/// on one already-widened 8-lane `u16` half (see `paeth_lane_neon` for why
+/// no separate half-chunk split is needed on NEON).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn context_lane_neon(a16: uint16x8_t, b16: uint16x8_t, c16: uint16x8_t) -> uint16x8_t {
+    let a_s = vreinterpretq_s16_u16(a16);
+    let b_s = vreinterpretq_s16_u16(b16);
+    let c_s = vreinterpretq_s16_u16(c16);
+
+    let dh = vabsq_s16(vsubq_s16(a_s, c_s));
+    let dv = vabsq_s16(vsubq_s16(b_s, c_s));
+
+    let dh_gt_dv = vcgtq_s16(dh, dv);
+    let dv_gt_dh = vcgtq_s16(dv, dh);
+    let avg = vshrq_n_u16(vaddq_u16(a16, b16), 1); // a,b >= 0, no carry loss
+
+    // Priority matches `context_pred`: dh>dv -> a; elif dv>dh -> b; else avg.
+    let base = vbslq_u16(dv_gt_dh, b16, avg);
+    vbslq_u16(dh_gt_dv, a16, base)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn filter_context_neon_impl(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> Vec<u8> {
+    filter_directional_neon_body(row, prev_row, bpp, context_pred, |a, b, c| {
+        context_lane_neon(a, b, c)
     })
 }
 
@@ -1311,6 +1833,11 @@ pub(crate) fn filter_2ndorder_avx2(
             return unsafe { filter_2ndorder_avx2_impl(row, prev_row, prev_prev_row, bpp) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { filter_2ndorder_neon_impl(row, prev_row, prev_prev_row, bpp) };
+    }
+    #[allow(unreachable_code)]
     filter_2ndorder_scalar(row, prev_row, prev_prev_row, bpp)
 }
 
@@ -1409,6 +1936,93 @@ unsafe fn filter_2ndorder_avx2_impl(
         let pred = second_order_half_avx2(left, above, ll, uu);
         let residual = _mm_sub_epi8(pixels, pred);
         _mm_storeu_si128(filtered.as_mut_ptr().add(i) as *mut __m128i, residual);
+
+        i += HALF_WIDTH;
+    }
+
+    for j in i..len {
+        let a = row[j - bpp];
+        let b = prev[j];
+        let ll = row[j - 2 * bpp];
+        let uu = uu_row.map(|p| p[j]).unwrap_or(0);
+        filtered[j] = row[j].wrapping_sub(second_order_pred(a, b, ll, uu));
+    }
+
+    filtered
+}
+
+/// NEON equivalent of `second_order_half_avx2`. `vshrq_n_s16` (arithmetic
+/// right shift by 1) has the same truncate-toward-`-infinity` semantics as
+/// AVX2's `_mm256_srai_epi16`, so the same clamp-after-saturating-narrow
+/// argument for bit-exactness with the scalar `/2` applies unchanged (see
+/// `second_order_half_avx2`'s doc comment).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn second_order_half_neon(
+    a: uint8x8_t,
+    b: uint8x8_t,
+    ll: uint8x8_t,
+    uu: uint8x8_t,
+) -> uint8x8_t {
+    let a16 = vreinterpretq_s16_u16(vmovl_u8(a));
+    let b16 = vreinterpretq_s16_u16(vmovl_u8(b));
+    let ll16 = vreinterpretq_s16_u16(vmovl_u8(ll));
+    let uu16 = vreinterpretq_s16_u16(vmovl_u8(uu));
+
+    let pred_h = vsubq_s16(vshlq_n_s16(a16, 1), ll16);
+    let pred_v = vsubq_s16(vshlq_n_s16(b16, 1), uu16);
+    let sum = vaddq_s16(pred_h, pred_v);
+    let shifted = vshrq_n_s16(sum, 1);
+
+    vqmovun_s16(shifted)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn filter_2ndorder_neon_impl(
+    row: &[u8],
+    prev_row: Option<&[u8]>,
+    prev_prev_row: Option<&[u8]>,
+    bpp: usize,
+) -> Vec<u8> {
+    let len = row.len();
+    let mut filtered = vec![0u8; len];
+
+    let Some(prev) = prev_row else {
+        for i in 0..len {
+            let a = if i >= bpp { row[i - bpp] } else { 0 };
+            let ll = if i >= 2 * bpp { row[i - 2 * bpp] } else { 0 };
+            filtered[i] = row[i].wrapping_sub(second_order_pred(a, 0, ll, 0));
+        }
+        return filtered;
+    };
+    let uu_row = prev_prev_row;
+
+    // First 2*bpp bytes have no `ll` (and possibly no `a`) neighbor: handle
+    // scalar, matching the general zero-fill convention exactly.
+    for i in 0..(2 * bpp).min(len) {
+        let a = if i >= bpp { row[i - bpp] } else { 0 };
+        let b = prev[i];
+        let ll = if i >= 2 * bpp { row[i - 2 * bpp] } else { 0 };
+        let uu = uu_row.map(|p| p[i]).unwrap_or(0);
+        filtered[i] = row[i].wrapping_sub(second_order_pred(a, b, ll, uu));
+    }
+
+    const HALF_WIDTH: usize = 8;
+    let mut i = 2 * bpp;
+    while i + HALF_WIDTH <= len {
+        let pixels = vld1_u8(row.as_ptr().add(i));
+        let left = vld1_u8(row.as_ptr().add(i - bpp));
+        let above = vld1_u8(prev.as_ptr().add(i));
+        let ll = vld1_u8(row.as_ptr().add(i - 2 * bpp));
+        let uu = match uu_row {
+            Some(p) => vld1_u8(p.as_ptr().add(i)),
+            None => vdup_n_u8(0),
+        };
+
+        let pred = second_order_half_neon(left, above, ll, uu);
+        let residual = vsub_u8(pixels, pred);
+        vst1_u8(filtered.as_mut_ptr().add(i), residual);
 
         i += HALF_WIDTH;
     }

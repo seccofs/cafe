@@ -264,7 +264,7 @@ Contributions welcome! High-potential areas:
 - [x] Automatic ZSTD dictionary training — *complete in v1.1* (`--auto-dict`)
 - [x] Indexed palette with median-cut — *complete in v1.1* (`--palette-algorithm`)
 - [x] **SIMD in sub-byte packing** — *complete in v1.2.1* (pack/unpack 1/2/4-bit, 8-16x speedup, integrated into encode/decode pipeline)
-- [x] **NEON support (ARM SIMD)** — *complete in v1.3* for Filters 1-3 (Sub, Up, Average); Filters 4-15 and other SIMD modules still pending
+- [x] **NEON support (ARM SIMD)** — *complete in v1.3* for Filters 1-14; other SIMD modules (pack/unpack, sample conversion) still pending
 
 ---
 
@@ -276,8 +276,8 @@ Contributions welcome! High-potential areas:
 | **v1.1** | Filters 14-15: TR-Directional (WebP Predictor 10) and adaptive Weighted (inspired by JPEG-XL) — 16 total predictors; MSAD heuristic; real 2D tiling (iDIM) with end-to-end round-trip; byte-shuffle encode/decode; **AVX2 SIMD optimization (Filters 1-3)** | ✅ Complete |
 | **v1.2** | **Aggressive SIMD Acceleration (AVX2 x86_64)**: Pack/Unpack 1/2/4-bit (8-16x), Sample expansion/reduction (4-6x), Byte-shuffle with blocking (10-20%), Filter 3 enhanced (4-6x); **252 comprehensive tests** (197 unit + 6 integration roundtrip + 49 SIMD), **Zero TODOs/FIXMEs**, Feature-gated SIMD with CPU detection | ✅ Complete |
 | **v1.2.1** | Refinements and operator dispatcher for tone-mapping selection | ✅ Complete |
-| **v1.3** | **ARM NEON SIMD (aarch64)**: Filters 1-3 (Sub, Up, Average) ported to NEON, compile-time dispatch, no runtime feature check needed (NEON is ARMv8-A baseline) | ✅ Complete (Filters 1-3) |
-| **Future** | NEON for Filters 4-15 and other SIMD modules, additional compressors, enhanced progressive streaming | 🔮 Planned |
+| **v1.3** | **ARM NEON SIMD (aarch64)**: all 14 vectorized filters ported to NEON, compile-time dispatch, no runtime feature check needed (NEON is ARMv8-A baseline) | ✅ Complete (Filters 1-14) |
+| **Future** | NEON for other SIMD modules (pack/unpack, sample conversion), additional compressors, enhanced progressive streaming | 🔮 Planned |
 
 ---
 

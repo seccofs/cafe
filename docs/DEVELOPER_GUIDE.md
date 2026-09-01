@@ -106,26 +106,26 @@ Each block/tile (set of lines in an `IDAT`) chooses a single filter, prefixed by
 | Code | Name | Prediction | Cost | SIMD (v1.1+) |
 |--------|------|----------|-------|------|
 | `0` | None | None | O(1) | ✅ (memcpy) |
-| `1` | Sub | Left byte (L) | O(n) | ✅ AVX2 (4-8x) / NEON (v1.3+) |
-| `2` | Up | Above byte (U) | O(n) | ✅ AVX2 (4-8x) / NEON (v1.3+) |
-| `3` | Average | (L + U) / 2 | O(n) | ✅ AVX2 (scalar opt) / NEON (v1.3+, via `vhaddq_u8`) |
-| `4` | Paeth | Left, above, or diagonal (UL) | O(n) | — Scalar |
-| `5` | MED | Median Edge Detector (JPEG-LS) | O(n) | — Scalar |
-| `6` | Gradient | (L + U - UL) mod 256 (JPEG Lossless) | O(n) | — Scalar |
-| `7` | Simple Median | Simple median of L, U, UL | O(n) | — Scalar |
-| `8` | 2nd Order | (2L - LL + 2U - UU) / 2 with clamp | O(n), uses LL, UU | — Scalar |
-| `9`-`12` | 4-way Directional | Combinations of L, U, UL with weights | O(n) | — Scalar |
-| `13` | Context-Based | Detects local edge, chooses dynamically | O(n) | — Scalar |
-| `14` | TR-Directional | Bilinear average (L, UL, U, TR) — WebP Predictor 10 | O(n), uses TR | — Scalar |
-| `15` | Weighted (adaptive) | Adaptive weighted average of L, U, UL, TR — inspired by JPEG-XL | O(n), state per block | — Scalar |
+| `1` | Sub | Left byte (L) | O(n) | ✅ AVX2 (4-8x) / NEON |
+| `2` | Up | Above byte (U) | O(n) | ✅ AVX2 (4-8x) / NEON |
+| `3` | Average | (L + U) / 2 | O(n) | ✅ AVX2 (scalar opt) / NEON (via `vhaddq_u8`) |
+| `4` | Paeth | Left, above, or diagonal (UL) | O(n) | ✅ AVX2 / NEON (16-bit widen + blend) |
+| `5` | MED | Median Edge Detector (JPEG-LS) | O(n) | ✅ AVX2 / NEON (unsigned min/max) |
+| `6` | Gradient | (L + U - UL) mod 256 (JPEG Lossless) | O(n) | ✅ AVX2 / NEON |
+| `7` | Simple Median | Simple median of L, U, UL | O(n) | ✅ AVX2 / NEON (unsigned min/max) |
+| `8` | 2nd Order | (2L - LL + 2U - UU) / 2 with clamp | O(n), uses LL, UU | ✅ AVX2 / NEON (16-bit widen) |
+| `9`-`12` | 4-way Directional | Combinations of L, U, UL with weights | O(n) | ✅ AVX2 / NEON (16-bit widen) |
+| `13` | Context-Based | Detects local edge, chooses dynamically | O(n) | ✅ AVX2 / NEON (16-bit widen + blend) |
+| `14` | TR-Directional | Bilinear average (L, UL, U, TR) — WebP Predictor 10 | O(n), uses TR | ✅ AVX2 / NEON (via `vhaddq_u8`) |
+| `15` | Weighted (adaptive) | Adaptive weighted average of L, U, UL, TR — inspired by JPEG-XL | O(n), state per block | — Scalar (sequential state) |
 
 **SIMD Optimization (v1.1+):**
-- Filters 1 (Sub), 2 (Up), 3 (Average) use **AVX2 intrinsics** on x86_64 CPUs when available
-- Processes 32 bytes per SIMD iteration (16 samples × 2 bytes, or 32 bytes × 1 channel, etc.)
-- **Automatic CPU feature detection**: If AVX2 not available, falls back to scalar
+- Filters 1-14 use **AVX2 intrinsics** on x86_64 CPUs and **ARM NEON intrinsics** on aarch64 CPUs when available (Filter 15 is scalar-only on every architecture)
+- Processes 32 bytes per SIMD iteration on AVX2, 16 bytes per iteration on NEON
+- **Automatic CPU feature detection**: If AVX2 not available, falls back to scalar (NEON is dispatched at compile-time instead, since it's mandatory on ARMv8-A)
 - **Configurable via feature gate**: `cargo build --no-default-features` disables SIMD
-- Expected speedup: **4-8x** on these three filters
-- **NEON (v1.3+, aarch64):** Filters 1-3 also have ARM NEON kernels, dispatched at **compile-time** via `#[cfg(target_arch = "aarch64")]` (no runtime feature check needed — NEON is baseline on ARMv8-A). Filters 4-15 and other SIMD modules remain AVX2-only for now.
+- Expected speedup: **4-8x** on these filters
+- **NEON coverage (v1.3+, aarch64):** All 14 vectorized filters have NEON kernels, dispatched at **compile-time** via `#[cfg(target_arch = "aarch64")]` (no runtime feature check needed — NEON is baseline on ARMv8-A). The other SIMD modules (`simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs`) remain AVX2-only for now.
 
 **Selection heuristics (encoder decides, not part of spec):**
 - Shannon Entropy: Measures pattern redundancy in residuals (default, `FilterHeuristic::Entropy`)
@@ -573,8 +573,8 @@ cargo fmt --check                   # Verify formatting
 |--------|---|---|
 | v1.0 | IHDR, IDAT, IEND, ZSTD, Filters 0-13 (Shannon Entropy or real compression test), iDIM (tiling), Adam7, even/odd, indexed PLTE, eXIF, jSON, iCCP, xMPd, cHDR, zDIC, sample_format (uint/float/half), bit depths 1-32, security audit | ✅ |
 | v1.1 | Filters 14-15 (TR-Directional WebP Predictor 10 and adaptive Weighted inspired by JPEG-XL), 16 total predictors, MSAD heuristic, real 2D tiling (iDIM) with end-to-end round-trip, byte-shuffle (Filter method=1, encode+decode), HDR tone-mapping on decode, **AVX2 SIMD for Filters 1-3** (4-8x speedup) | ✅ |
-| **v1.3** | **ARM NEON SIMD (aarch64)**: Filters 1-3 (Sub, Up, Average) ported to NEON, compile-time dispatch via `#[cfg(target_arch = "aarch64")]` (no runtime check needed, NEON is ARMv8-A baseline) | ✅ (Filters 1-3 only) |
-| Future | NEON for Filters 4-15 and other SIMD modules, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR) | ⏳ |
+| **v1.3** | **ARM NEON SIMD (aarch64)**: all 14 vectorized filters ported to NEON, compile-time dispatch via `#[cfg(target_arch = "aarch64")]` (no runtime check needed, NEON is ARMv8-A baseline) | ✅ (Filters 1-14) |
+| Future | NEON for other SIMD modules, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR) | ⏳ |
 
 ---
 
@@ -633,7 +633,7 @@ RUSTFLAGS="-C target-feature=+avx2" cargo build --release
 ### High-Potential Areas
 
 1. **SIMD for sub-byte packing** — Extend AVX2 to `pack/unpack_samples_row` (currently scalar)
-2. **NEON SIMD (ARM) for Filters 4-15** — Filters 1-3 already have NEON kernels (v1.3); extend to Paeth, MED, Gradient, directional filters, etc. for ARM64 (Raspberry Pi, mobile, Apple Silicon)
+2. **NEON SIMD (ARM) for other modules** — Filters 1-14 already have NEON kernels (v1.3); extend the same pattern to `simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs` for ARM64 (Raspberry Pi, mobile, Apple Silicon)
 3. **Real 2D tiling (iDIM)** — Implemented; evolve with preview/progressive streaming
 4. **Optimized interlace** — Adam7 and even/odd already supported; optimize progressiveness and SIMD of passes
 5. **Optimized indexed palette** — Currently uses nearest-neighbor; could use k-means
