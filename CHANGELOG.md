@@ -10,13 +10,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Planned (Future)
-- Real ARM hardware/emulated validation (QEMU/Docker) for NEON kernels
+- Real ARM hardware validation on physical devices (Raspberry Pi, mobile, Apple Silicon) beyond QEMU emulation
 - CI step for aarch64 cross-compile check
 - Cache-friendly blocking in scalar byte-shuffle fallback
 - Runtime CPU detection for optional SIMD forcing
 - Benchmarking suite with Criterion framework
 - k-means palette quantization algorithm
 - Tone-mapping on encode (SDR → HDR inverse operation)
+
+---
+
+## [1.4.1] - 2026-09-01
+
+### Fixed
+
+- **NEON index-calculation bug in `simd_quantize.rs`** (`find_closest_rgba_neon`/`find_closest_rgb_neon`), found via real aarch64 execution under QEMU emulation (Docker `--platform linux/arm64`) — the first time the NEON code paths were actually *run* rather than just type-checked/cross-compiled. The high half of each 8-entry SIMD chunk (`half=1`) computed its lane index as `(i + half * 4) + lane_offsets_hi` where `lane_offsets_hi = [4,5,6,7]`, but the base `i + half * 4` already included that `+4` shift — double-counting it and reporting indices 4 too high (distance was always correct, only the index was wrong). Fixed by reusing `lane_offsets_lo = [0,1,2,3]` for both halves, since the within-chunk base already accounts for which half is being processed.
+- This bug was invisible to `cargo check`/`cargo clippy --target aarch64-unknown-linux-gnu` (type-checking only, doesn't execute NEON intrinsics) and had been present since the NEON port of `simd_quantize.rs` in v1.4.0.
+
+### Notes
+
+- Validated via native aarch64 execution (QEMU user-mode emulation, `rust:1-bookworm` Docker image): `cargo test --lib` — 268/268 passed (4 previously-failing tests now pass: `test_find_closest_rgba_matches_scalar_reference_various_sizes`, `test_find_closest_rgb_matches_scalar_reference_various_sizes`, `test_max_palette_size_256_exhaustive_index_coverage`, `test_roundtrip_adam7_indexed`), `cargo test --test integration_roundtrip` — 7/7 passed, `cargo clippy --lib -- -D warnings` — zero warnings
+- Re-verified native x86_64 (273 unit tests + 7 integration tests) and cross-compile (`cargo check`/`clippy --target aarch64-unknown-linux-gnu`) after the fix — zero regressions
 
 ---
 

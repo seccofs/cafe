@@ -367,10 +367,10 @@ unsafe fn find_closest_rgba_neon(
     let vg = vdupq_n_s32(g as i32);
     let vb = vdupq_n_s32(b as i32);
     let va = vdupq_n_s32(a as i32);
+    // Reused for both halves: base index already includes the +4 shift for
+    // the high half, so only the [0,1,2,3] within-half offset is needed.
     let offsets_lo = [0i32, 1, 2, 3];
-    let offsets_hi = [4i32, 5, 6, 7];
     let lane_offsets_lo = vld1q_s32(offsets_lo.as_ptr());
-    let lane_offsets_hi = vld1q_s32(offsets_hi.as_ptr());
 
     let mut best_key = vdupq_n_s32(i32::MAX);
 
@@ -396,9 +396,9 @@ unsafe fn find_closest_rgba_neon(
         let vea_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(ea16)));
         let vea_hi = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(ea16)));
 
-        for (half, (er, eg, eb, ea), lane_offsets) in [
-            (0, (ver_lo, veg_lo, veb_lo, vea_lo), lane_offsets_lo),
-            (1, (ver_hi, veg_hi, veb_hi, vea_hi), lane_offsets_hi),
+        for (half, (er, eg, eb, ea)) in [
+            (0, (ver_lo, veg_lo, veb_lo, vea_lo)),
+            (1, (ver_hi, veg_hi, veb_hi, vea_hi)),
         ] {
             let dr = vsubq_s32(vr, er);
             let dg = vsubq_s32(vg, eg);
@@ -411,7 +411,11 @@ unsafe fn find_closest_rgba_neon(
                 vaddq_s32(vmulq_s32(db, db), vmulq_s32(da, da)),
             );
 
-            let idx_vec = vaddq_s32(vdupq_n_s32((i + half * 4) as i32), lane_offsets);
+            // `lane_offsets_lo` ([0,1,2,3]) is reused for both halves: the
+            // base `i + half * 4` already accounts for the +4 shift of the
+            // high half, so adding `lane_offsets_hi` ([4,5,6,7]) here would
+            // double-count it and produce indices 4 too high.
+            let idx_vec = vaddq_s32(vdupq_n_s32((i + half * 4) as i32), lane_offsets_lo);
             let key = vorrq_s32(vshlq_n_s32(dist, 8), idx_vec);
             best_key = vminq_s32(best_key, key);
         }
@@ -454,10 +458,10 @@ unsafe fn find_closest_rgb_neon(
     let vr = vdupq_n_s32(r as i32);
     let vg = vdupq_n_s32(g as i32);
     let vb = vdupq_n_s32(b as i32);
+    // Reused for both halves: base index already includes the +4 shift for
+    // the high half, so only the [0,1,2,3] within-half offset is needed.
     let offsets_lo = [0i32, 1, 2, 3];
-    let offsets_hi = [4i32, 5, 6, 7];
     let lane_offsets_lo = vld1q_s32(offsets_lo.as_ptr());
-    let lane_offsets_hi = vld1q_s32(offsets_hi.as_ptr());
 
     let mut best_key = vdupq_n_s32(i32::MAX);
 
@@ -478,10 +482,7 @@ unsafe fn find_closest_rgb_neon(
         let veb_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(eb16)));
         let veb_hi = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(eb16)));
 
-        for (half, (er, eg, eb), lane_offsets) in [
-            (0, (ver_lo, veg_lo, veb_lo), lane_offsets_lo),
-            (1, (ver_hi, veg_hi, veb_hi), lane_offsets_hi),
-        ] {
+        for (half, (er, eg, eb)) in [(0, (ver_lo, veg_lo, veb_lo)), (1, (ver_hi, veg_hi, veb_hi))] {
             let dr = vsubq_s32(vr, er);
             let dg = vsubq_s32(vg, eg);
             let db = vsubq_s32(vb, eb);
@@ -492,7 +493,11 @@ unsafe fn find_closest_rgb_neon(
                 vaddq_s32(vmulq_s32(dg, dg), vmulq_s32(db, db)),
             );
 
-            let idx_vec = vaddq_s32(vdupq_n_s32((i + half * 4) as i32), lane_offsets);
+            // `lane_offsets_lo` ([0,1,2,3]) is reused for both halves: the
+            // base `i + half * 4` already accounts for the +4 shift of the
+            // high half, so adding `lane_offsets_hi` ([4,5,6,7]) here would
+            // double-count it and produce indices 4 too high.
+            let idx_vec = vaddq_s32(vdupq_n_s32((i + half * 4) as i32), lane_offsets_lo);
             let key = vorrq_s32(vshlq_n_s32(dist, 8), idx_vec);
             best_key = vminq_s32(best_key, key);
         }

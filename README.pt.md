@@ -281,7 +281,8 @@ Contribuições são bem-vindas! Áreas com potencial:
 | **v1.2.1** | Refinamentos e despachante de operador para seleção de tone-mapping | ✅ Completo |
 | **v1.3** | **NEON SIMD ARM (aarch64)**: todos os 14 filtros vetorizados portados para NEON, dispatch em compile-time, sem checagem de feature em runtime (NEON é baseline no ARMv8-A) | ✅ Completo (Filtros 1-14) |
 | **v1.4** | **NEON SIMD ARM estendido a todos os módulos restantes**: pack/unpack, conversão de amostras, byte-shuffle, quantização de paleta — nenhum módulo SIMD é mais exclusivo de AVX2 | ✅ Completo |
-| **Futuro** | Validação real em hardware/emulação ARM (QEMU/Docker), etapa de CI para cross-compile aarch64, compressores adicionais, operador de tone-mapping selecionável via CLI | 🔮 Planejado |
+| **v1.4.1** | **Validação real de execução ARM (emulação QEMU)**: suíte de testes completa rodada nativamente em aarch64 pela primeira vez — encontrado e corrigido um bug real de cálculo de índice no NEON que apenas checagem de cross-compile não conseguiria detectar | ✅ Completo |
+| **Futuro** | Etapa de CI para cross-compile aarch64, validação real em hardware ARM físico, compressores adicionais, operador de tone-mapping selecionável via CLI | 🔮 Planejado |
 
 ---
 

@@ -575,7 +575,8 @@ cargo fmt --check                   # Verify formatting
 | v1.1 | Filters 14-15 (TR-Directional WebP Predictor 10 and adaptive Weighted inspired by JPEG-XL), 16 total predictors, MSAD heuristic, real 2D tiling (iDIM) with end-to-end round-trip, byte-shuffle (Filter method=1, encode+decode), HDR tone-mapping on decode, **AVX2 SIMD for Filters 1-3** (4-8x speedup) | ✅ |
 | **v1.3** | **ARM NEON SIMD (aarch64)**: all 14 vectorized filters ported to NEON, compile-time dispatch via `#[cfg(target_arch = "aarch64")]` (no runtime check needed, NEON is ARMv8-A baseline) | ✅ (Filters 1-14) |
 | **v1.4** | **ARM NEON SIMD extended to all remaining modules**: `simd_packing.rs`, `simd_sample_conversion.rs`, `simd_shuffle.rs`, `simd_quantize.rs` — no SIMD module is AVX2-only anymore | ✅ |
-| Future | Real hardware/emulated ARM validation (QEMU/Docker), CI step for aarch64 cross-compile check, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR) | ⏳ |
+| **v1.4.1** | **Real ARM execution validation (QEMU emulation)**: ran the full test suite natively on aarch64 for the first time — found and fixed a real NEON index-calculation bug in `simd_quantize.rs` that cross-compilation alone could never have caught | ✅ |
+| Future | CI step for aarch64 cross-compile check, real hardware validation on physical ARM devices, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR) | ⏳ |
 
 ---
 
@@ -634,7 +635,7 @@ RUSTFLAGS="-C target-feature=+avx2" cargo build --release
 ### High-Potential Areas
 
 1. **SIMD for sub-byte packing** — Extend AVX2 to `pack/unpack_samples_row` (currently scalar)
-2. **Real ARM hardware/emulated validation** — NEON kernels for all SIMD modules are complete (v1.3-v1.4) and validated via `cargo check`/`clippy --target aarch64-unknown-linux-gnu`, but never actually executed; run the test suite under QEMU user-mode emulation or real ARM64 hardware (Raspberry Pi, mobile, Apple Silicon) to catch any intrinsic-semantics mismatch cross-compilation can't detect
+2. **Real ARM hardware validation on physical devices** — QEMU emulation (v1.4.1) already caught and fixed one real NEON bug; running the suite on actual ARM64 hardware (Raspberry Pi, mobile, Apple Silicon) would add confidence beyond emulation (e.g. timing-sensitive or alignment-sensitive behavior QEMU might not reproduce exactly)
 3. **Real 2D tiling (iDIM)** — Implemented; evolve with preview/progressive streaming
 4. **Optimized interlace** — Adam7 and even/odd already supported; optimize progressiveness and SIMD of passes
 5. **Optimized indexed palette** — Currently uses nearest-neighbor; could use k-means

@@ -582,7 +582,8 @@ cargo deny check                     # Security and license audit (requires: car
 | **v1.2** | **Aggressive SIMD Acceleration (AVX2 x86_64)**: Pack/Unpack 1/2/4-bit samples (8-16x), Sample expansion/reduction 8→16/32 (4-6x), **Byte-shuffle blocking** (10-20% cache improvement), **Improved Filter 3 Average** (4-6x), **203 tests** (197 unit + 6 integration roundtrip), **Zero TODOs/FIXMEs**, **Comprehensive benchmarks** (Criterion-ready), Feature-gated SIMD with CPU detection | ✅ |
 | **v1.3** | **ARM NEON SIMD (aarch64)**: all 14 vectorized filters (Sub, Up, Average, Gradient, 4-way Directional, Paeth, MED, Simple Median, 2nd Order, Context-Based, TR-Directional) ported to NEON intrinsics, compile-time dispatch via `#[cfg(target_arch = "aarch64")]` (no runtime check needed, NEON is ARMv8-A baseline), 273 unit tests + 7 integration tests still passing on x86_64, cross-compile validated via `cargo check`/`cargo clippy --target aarch64-unknown-linux-gnu` | ✅ (Filters 1-14) |
 | **v1.4** | **ARM NEON SIMD extended to all remaining modules**: `simd_packing.rs` (1/2/4-bit pack/unpack), `simd_sample_conversion.rs` (8↔16-bit expand/reduce, RGBA→luma8), `simd_shuffle.rs` (byte-shuffle via `vqtbl1q_u8`), `simd_quantize.rs` (nearest-palette search via widened `i32` distance + `vminvq_s32` reduction) — no SIMD module is AVX2-only anymore, 273 unit tests + 7 integration tests still passing on x86_64, cross-compile validated via `cargo check`/`cargo clippy --target aarch64-unknown-linux-gnu` | ✅ |
-| Future | Real hardware/emulated ARM validation (QEMU/Docker), CI step for aarch64 cross-compile check, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
+| **v1.4.1** | **Real ARM execution validation (QEMU emulation via Docker)**: ran the full test suite natively on aarch64 for the first time (not just `cargo check`/`clippy` cross-compile) — found and fixed a real index-calculation bug in `simd_quantize.rs`'s NEON path that cross-compilation could never have caught (see "v1.4.1" notes below) | ✅ |
+| Future | CI step for aarch64 cross-compile check, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
 
 ---
 
@@ -649,7 +650,7 @@ cargo build --release --no-default-features
 ### High-Potential Areas
 
 1. **SIMD for sub-byte packing** — Extend AVX2 to `pack/unpack_samples_row` (currently scalar)
-2. **Real ARM hardware/emulated validation** — NEON kernels for all SIMD modules are complete (v1.3-v1.4) and validated via `cargo check`/`clippy --target aarch64-unknown-linux-gnu`, but never actually executed; run the test suite under QEMU user-mode emulation or real ARM64 hardware (Raspberry Pi, mobile, Apple Silicon) to catch any intrinsic-semantics mismatch cross-compilation can't detect
+2. **Real ARM hardware validation on physical devices** — QEMU emulation (v1.4.1) already caught and fixed one real NEON bug (see "v1.4.1" notes below); running the suite on actual ARM64 hardware (Raspberry Pi, mobile, Apple Silicon) would add confidence beyond emulation (e.g. timing-sensitive or alignment-sensitive behavior QEMU might not reproduce exactly)
 3. **Advanced 2D tiling** — iDIM with per-tile IDAT already implemented (row-major and Z-order); evolve with preview/progressive streaming
 4. **Optimized interlace** — Adam7 and even/odd already supported; optimize progressiveness and SIMD of passes
 5. **Optimized indexed palette** — Currently uses nearest-neighbor; could use k-means
@@ -695,7 +696,7 @@ cargo doc --open
 
 ---
 
-**Last updated:** September 1, 2026 | **Project version:** v1.4.0 | **ARM NEON SIMD Phase (Sep 1/2026):**
+**Last updated:** September 1, 2026 | **Project version:** v1.4.1 | **ARM NEON SIMD Phase (Sep 1/2026):**
 
 ### v1.3.0 - ARM NEON SIMD (aarch64)
 
@@ -740,6 +741,20 @@ Ported module by module (`simd_packing.rs` → `simd_sample_conversion.rs` → `
 **Validation (repeated after each module, full suite re-run at the end):**
 - Native x86_64: `cargo build --lib`, `cargo test --lib` (273 tests), `cargo test --test integration_roundtrip` (7 tests), `cargo clippy --lib -- -D warnings`, `cargo fmt --check` all pass with zero regressions
 - Cross-compile: `cargo clean -p cafe --target aarch64-unknown-linux-gnu` followed by `cargo check --target aarch64-unknown-linux-gnu --lib` and `cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` (clean, not incremental) pass with zero warnings
+
+### v1.4.1 - Real ARM execution validation (QEMU emulation via Docker)
+
+Up through v1.4, all aarch64 validation was `cargo check`/`clippy --target aarch64-unknown-linux-gnu` — the code type-checked and lint-passed, but the NEON intrinsics had **never actually executed**. This phase ran the real test suite on native aarch64 via QEMU user-mode emulation (Docker Desktop's `--platform linux/arm64`, `rust:1-bookworm` image), closing that gap:
+
+- **Setup**: `docker run --platform linux/arm64 rust:1-bookworm` transparently runs aarch64 binaries via QEMU on an x86_64 host; the container's own `gcc` (aarch64-native) builds `zstd-sys`'s C code directly — no cross-compiler needed inside the container (unlike the host-side `cargo check` cross-compile, which does need the `zig cc` wrapper). Docker Desktop's corporate-proxy env vars (`HTTP_PROXY`/`HTTPS_PROXY` baked into the image/daemon config) had to be overridden to empty strings per `docker run`/`docker exec` invocation, otherwise `cargo` couldn't reach crates.io from inside the container.
+- **Bug found**: `cargo test --lib` under emulation failed 4 tests, all originating from `simd_quantize.rs`'s NEON path (`find_closest_rgba_neon`/`find_closest_rgb_neon`): the reported *distance* was always correct, but the reported *index* was off by exactly `+4` for matches found in the high half of an 8-entry chunk. Root cause: the per-half index computation `vaddq_s32(vdupq_n_s32((i + half * 4) as i32), lane_offsets)` used `lane_offsets_hi = [4,5,6,7]` for the high half (`half=1`) — but the base `i + half * 4` *already* added that `+4` shift, so the `+4..+7` offset was applied twice, double-counting it into `+8..+11`. Fix: always use `lane_offsets_lo = [0,1,2,3]` for both halves, since the within-chunk base already accounts for which half is being processed (`lane_offsets_hi` and its backing array removed as now-unused).
+- **Why cross-compilation couldn't catch this**: `cargo check`/`clippy` only type-check the code — they don't execute NEON intrinsics, so a logic bug in index arithmetic (as opposed to a type/lint error) is invisible without actually running the instructions. This is precisely the risk flagged as an open item in the v1.3/v1.4 "Welcome Contributions" section, and why this validation phase existed.
+- **Test coverage note**: the 4 failing tests (`test_find_closest_rgba_matches_scalar_reference_various_sizes`, `test_find_closest_rgb_matches_scalar_reference_various_sizes`, `test_max_palette_size_256_exhaustive_index_coverage`, `tests::test_roundtrip_adam7_indexed`) already existed prior to this phase (written during the original NEON port) and correctly compare NEON output against a scalar reference — they simply couldn't run on x86_64 CI, only on real/emulated aarch64.
+
+**Validation:**
+- Native aarch64 (QEMU emulation): `cargo build --lib` (~3m47s cold), `cargo test --lib` — **268/268 passed** (5 fewer than x86_64's 273: architecture-specific AVX2-vs-scalar comparison tests don't apply to aarch64), `cargo test --test integration_roundtrip` — **7/7 passed**, `cargo clippy --lib -- -D warnings` — zero warnings, all run from a cold `/usr/local/cargo/registry` volume (first run compiles the full dependency tree, ~4-7 min per command; a named Docker volume persists the registry cache across runs)
+- Native x86_64 (re-verified after the fix): `cargo test --lib` (273 tests), `cargo test --test integration_roundtrip` (7 tests), `cargo clippy --lib -- -D warnings`, `cargo fmt --check` all still pass with zero regressions
+- Cross-compile (re-verified after the fix): `cargo clean -p cafe --target aarch64-unknown-linux-gnu` followed by `cargo check`/`cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` pass with zero warnings
 
 ### v1.2.0 - SIMD Optimization Release
 
