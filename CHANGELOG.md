@@ -11,12 +11,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Planned (Future)
 - Real ARM hardware validation on physical devices (Raspberry Pi, mobile, Apple Silicon) beyond QEMU emulation
-- CI step for aarch64 cross-compile check
 - Cache-friendly blocking in scalar byte-shuffle fallback
 - Runtime CPU detection for optional SIMD forcing
 - Benchmarking suite with Criterion framework
 - k-means palette quantization algorithm
 - Tone-mapping on encode (SDR → HDR inverse operation)
+
+---
+
+## [1.4.2] - 2026-09-01
+
+### Added
+
+- **CI: ARM64 Cross-Compile Check job** — new `aarch64-cross-compile` job in `.github/workflows/ci.yml`, running on every push/PR alongside the existing `build`, `clippy`, `fmt`, and `security-audit` jobs:
+  - Installs the `aarch64-unknown-linux-gnu` Rust target plus the `clippy` component via `dtolnay/rust-toolchain@stable`
+  - Installs `gcc-aarch64-linux-gnu` via `apt-get` (Ubuntu runner ships a native GNU cross-toolchain, so no `zig cc` wrapper is needed in CI, unlike local cross-compilation)
+  - Sets `CC_aarch64_unknown_linux_gnu` and `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER` to `aarch64-linux-gnu-gcc` so `zstd-sys`'s C code and the final binary link correctly for the target
+  - Runs `cargo check --target aarch64-unknown-linux-gnu --lib` and `cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` (library only, not tests — real aarch64 test execution is validated manually via QEMU per v1.4.1, not on every CI run, to keep CI fast)
+  - Uses `Swatinem/rust-cache@v2` keyed on the target triple to cache the aarch64 dependency build across runs
+
+### Notes
+
+- Validated locally by reproducing the exact CI commands inside a `rust:1-bookworm` Docker container (`apt-get install gcc-aarch64-linux-gnu`, same env vars, same `cargo check`/`clippy` invocations) — both pass cleanly with zero warnings
+- Workflow YAML syntax validated with `rhysd/actionlint` (via Docker) — no errors
+- This closes the CI gap flagged in v1.3/v1.4: aarch64 regressions (type/lint errors, not runtime logic bugs like the one found in v1.4.1) will now be caught automatically on every push/PR instead of requiring a manual cross-compile check
 
 ---
 

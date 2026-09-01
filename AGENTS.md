@@ -583,7 +583,8 @@ cargo deny check                     # Security and license audit (requires: car
 | **v1.3** | **ARM NEON SIMD (aarch64)**: all 14 vectorized filters (Sub, Up, Average, Gradient, 4-way Directional, Paeth, MED, Simple Median, 2nd Order, Context-Based, TR-Directional) ported to NEON intrinsics, compile-time dispatch via `#[cfg(target_arch = "aarch64")]` (no runtime check needed, NEON is ARMv8-A baseline), 273 unit tests + 7 integration tests still passing on x86_64, cross-compile validated via `cargo check`/`cargo clippy --target aarch64-unknown-linux-gnu` | ✅ (Filters 1-14) |
 | **v1.4** | **ARM NEON SIMD extended to all remaining modules**: `simd_packing.rs` (1/2/4-bit pack/unpack), `simd_sample_conversion.rs` (8↔16-bit expand/reduce, RGBA→luma8), `simd_shuffle.rs` (byte-shuffle via `vqtbl1q_u8`), `simd_quantize.rs` (nearest-palette search via widened `i32` distance + `vminvq_s32` reduction) — no SIMD module is AVX2-only anymore, 273 unit tests + 7 integration tests still passing on x86_64, cross-compile validated via `cargo check`/`cargo clippy --target aarch64-unknown-linux-gnu` | ✅ |
 | **v1.4.1** | **Real ARM execution validation (QEMU emulation via Docker)**: ran the full test suite natively on aarch64 for the first time (not just `cargo check`/`clippy` cross-compile) — found and fixed a real index-calculation bug in `simd_quantize.rs`'s NEON path that cross-compilation could never have caught (see "v1.4.1" notes below) | ✅ |
-| Future | CI step for aarch64 cross-compile check, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
+| **v1.4.2** | **CI: ARM64 Cross-Compile Check job** — new `aarch64-cross-compile` job in `.github/workflows/ci.yml` runs `cargo check`/`cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` on every push/PR (Ubuntu runner + `gcc-aarch64-linux-gnu` cross-compiler, no `zig cc` needed since `apt` provides a native GNU cross-toolchain in CI), preventing future aarch64 regressions from merging unnoticed | ✅ |
+| Future | Real hardware validation on physical ARM devices, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
 
 ---
 
@@ -696,7 +697,7 @@ cargo doc --open
 
 ---
 
-**Last updated:** September 1, 2026 | **Project version:** v1.4.1 | **ARM NEON SIMD Phase (Sep 1/2026):**
+**Last updated:** September 1, 2026 | **Project version:** v1.4.2 | **ARM NEON SIMD Phase (Sep 1/2026):**
 
 ### v1.3.0 - ARM NEON SIMD (aarch64)
 
@@ -755,6 +756,22 @@ Up through v1.4, all aarch64 validation was `cargo check`/`clippy --target aarch
 - Native aarch64 (QEMU emulation): `cargo build --lib` (~3m47s cold), `cargo test --lib` — **268/268 passed** (5 fewer than x86_64's 273: architecture-specific AVX2-vs-scalar comparison tests don't apply to aarch64), `cargo test --test integration_roundtrip` — **7/7 passed**, `cargo clippy --lib -- -D warnings` — zero warnings, all run from a cold `/usr/local/cargo/registry` volume (first run compiles the full dependency tree, ~4-7 min per command; a named Docker volume persists the registry cache across runs)
 - Native x86_64 (re-verified after the fix): `cargo test --lib` (273 tests), `cargo test --test integration_roundtrip` (7 tests), `cargo clippy --lib -- -D warnings`, `cargo fmt --check` all still pass with zero regressions
 - Cross-compile (re-verified after the fix): `cargo clean -p cafe --target aarch64-unknown-linux-gnu` followed by `cargo check`/`cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` pass with zero warnings
+
+### v1.4.2 - CI: ARM64 Cross-Compile Check job
+
+Closes the last open item from the 5-step ARM NEON plan: automating the aarch64 cross-compile check in CI so future regressions can't merge unnoticed (previously it was a manual, ad-hoc step run locally before each NEON-related commit).
+
+- **New job**: `aarch64-cross-compile` added to `.github/workflows/ci.yml`, running independently alongside the existing `build`, `clippy`, `fmt`, and `security-audit` jobs on every push/PR.
+- **Toolchain setup**: `dtolnay/rust-toolchain@stable` with `targets: aarch64-unknown-linux-gnu` and `components: clippy` installs the Rust side; `apt-get install -y gcc-aarch64-linux-gnu` installs the C cross-compiler needed by `zstd-sys`'s build script. Unlike local development (which uses a `zig cc` wrapper batch script, since Windows has no native GNU cross-toolchain readily available), Ubuntu CI runners can install a real `gcc-aarch64-linux-gnu` package directly via `apt`, which is simpler and more standard for CI.
+- **Env vars**: `CC_aarch64_unknown_linux_gnu` and `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER` both set to `aarch64-linux-gnu-gcc`, matching the pattern already used for local cross-compilation (just with a different underlying compiler binary).
+- **Commands**: `cargo check --target aarch64-unknown-linux-gnu --lib` and `cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` — deliberately `--lib` only (not `--all-targets`/tests), since executing real aarch64 tests requires QEMU emulation (already done manually in v1.4.1) and would slow down every CI run for a check whose main goal is catching type/lint errors, not runtime logic bugs.
+- **Caching**: `Swatinem/rust-cache@v2` keyed on `aarch64-unknown-linux-gnu` so the aarch64 dependency tree doesn't need a full rebuild on every run.
+- **Scope note**: this CI job catches the same class of bugs as the local `cargo check`/`clippy --target aarch64-unknown-linux-gnu` commands used throughout v1.3/v1.4 (type errors, lint warnings) — it does **not** catch runtime logic bugs like the index-calculation bug found in v1.4.1, which required actually executing the NEON intrinsics. Real hardware/QEMU validation remains a manual, periodic step (see "Welcome Contributions" #2).
+
+**Validation:**
+- Workflow YAML syntax checked with `rhysd/actionlint` (via Docker, `docker run --rm -v <repo>:/repo rhysd/actionlint`) — zero errors/warnings.
+- CI logic reproduced locally end-to-end inside a `rust:1-bookworm` Docker container (same `apt-get install gcc-aarch64-linux-gnu`, same env vars, same two `cargo` commands) to confirm the exact commands the CI job will run actually succeed: both `cargo check --target aarch64-unknown-linux-gnu --lib` and `cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` complete cleanly with zero warnings against the current `cafe v1.2.1` crate.
+- This validation only exercises the job's shell commands in isolation (not a full GitHub Actions run, which requires pushing to trigger); the workflow triggers (`on: push`/`pull_request`) and job dependencies were reviewed manually against the rest of `ci.yml` to confirm no interference with existing jobs.
 
 ### v1.2.0 - SIMD Optimization Release
 

@@ -576,7 +576,8 @@ cargo fmt --check                   # Verify formatting
 | **v1.3** | **ARM NEON SIMD (aarch64)**: all 14 vectorized filters ported to NEON, compile-time dispatch via `#[cfg(target_arch = "aarch64")]` (no runtime check needed, NEON is ARMv8-A baseline) | ✅ (Filters 1-14) |
 | **v1.4** | **ARM NEON SIMD extended to all remaining modules**: `simd_packing.rs`, `simd_sample_conversion.rs`, `simd_shuffle.rs`, `simd_quantize.rs` — no SIMD module is AVX2-only anymore | ✅ |
 | **v1.4.1** | **Real ARM execution validation (QEMU emulation)**: ran the full test suite natively on aarch64 for the first time — found and fixed a real NEON index-calculation bug in `simd_quantize.rs` that cross-compilation alone could never have caught | ✅ |
-| Future | CI step for aarch64 cross-compile check, real hardware validation on physical ARM devices, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR) | ⏳ |
+| **v1.4.2** | **CI: ARM64 Cross-Compile Check job** — new `aarch64-cross-compile` job in `.github/workflows/ci.yml` runs `cargo check`/`cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` on every push/PR (Ubuntu runner + `gcc-aarch64-linux-gnu`), preventing future aarch64 regressions from merging unnoticed | ✅ |
+| Future | Real hardware validation on physical ARM devices, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR) | ⏳ |
 
 ---
 

@@ -279,7 +279,8 @@ Contributions welcome! High-potential areas:
 | **v1.3** | **ARM NEON SIMD (aarch64)**: all 14 vectorized filters ported to NEON, compile-time dispatch, no runtime feature check needed (NEON is ARMv8-A baseline) | ✅ Complete (Filters 1-14) |
 | **v1.4** | **ARM NEON SIMD extended to all remaining modules**: pack/unpack, sample conversion, byte-shuffle, palette quantization — no SIMD module is AVX2-only anymore | ✅ Complete |
 | **v1.4.1** | **Real ARM execution validation (QEMU emulation)**: full test suite run natively on aarch64 for the first time — found and fixed a real NEON index-calculation bug that cross-compile checks alone couldn't catch | ✅ Complete |
-| **Future** | CI step for aarch64 cross-compile check, real hardware validation on physical ARM devices, additional compressors, enhanced progressive streaming | 🔮 Planned |
+| **v1.4.2** | **CI: ARM64 cross-compile check** — new `aarch64-cross-compile` job runs `cargo check`/`clippy --target aarch64-unknown-linux-gnu` on every push/PR, preventing future aarch64 regressions from merging unnoticed | ✅ Complete |
+| **Future** | Real hardware validation on physical ARM devices, additional compressors, enhanced progressive streaming | 🔮 Planned |
 
 ---
 
