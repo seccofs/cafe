@@ -264,7 +264,7 @@ Contributions welcome! High-potential areas:
 - [x] Automatic ZSTD dictionary training — *complete in v1.1* (`--auto-dict`)
 - [x] Indexed palette with median-cut — *complete in v1.1* (`--palette-algorithm`)
 - [x] **SIMD in sub-byte packing** — *complete in v1.2.1* (pack/unpack 1/2/4-bit, 8-16x speedup, integrated into encode/decode pipeline)
-- [x] **NEON support (ARM SIMD)** — *complete in v1.3* for Filters 1-14; other SIMD modules (pack/unpack, sample conversion) still pending
+- [x] **NEON support (ARM SIMD)** — *complete in v1.3-v1.4*: Filters 1-14 (v1.3) plus pack/unpack, sample conversion, byte-shuffle, and palette quantization (v1.4) — no SIMD module is AVX2-only anymore
 
 ---
 
@@ -277,7 +277,8 @@ Contributions welcome! High-potential areas:
 | **v1.2** | **Aggressive SIMD Acceleration (AVX2 x86_64)**: Pack/Unpack 1/2/4-bit (8-16x), Sample expansion/reduction (4-6x), Byte-shuffle with blocking (10-20%), Filter 3 enhanced (4-6x); **252 comprehensive tests** (197 unit + 6 integration roundtrip + 49 SIMD), **Zero TODOs/FIXMEs**, Feature-gated SIMD with CPU detection | ✅ Complete |
 | **v1.2.1** | Refinements and operator dispatcher for tone-mapping selection | ✅ Complete |
 | **v1.3** | **ARM NEON SIMD (aarch64)**: all 14 vectorized filters ported to NEON, compile-time dispatch, no runtime feature check needed (NEON is ARMv8-A baseline) | ✅ Complete (Filters 1-14) |
-| **Future** | NEON for other SIMD modules (pack/unpack, sample conversion), additional compressors, enhanced progressive streaming | 🔮 Planned |
+| **v1.4** | **ARM NEON SIMD extended to all remaining modules**: pack/unpack, sample conversion, byte-shuffle, palette quantization — no SIMD module is AVX2-only anymore | ✅ Complete |
+| **Future** | Real hardware/emulated ARM validation (QEMU/Docker), CI step for aarch64 cross-compile check, additional compressors, enhanced progressive streaming | 🔮 Planned |
 
 ---
 

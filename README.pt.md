@@ -267,7 +267,7 @@ Contribuições são bem-vindas! Áreas com potencial:
 - [x] SIMD no empacotamento sub-byte (1/2/4-bit pack/unpack) — *completo em v1.2* (AVX2, 8-16x)
 - [x] SIMD na conversão de amostras (8→16/32, 16/32→8) — *completo em v1.2* (AVX2, 4-6x)
 - [x] 203 testes completos (197 unit + 6 integration roundtrip) — *completo em v1.2*
-- [x] **Suporte NEON (SIMD ARM)** — *completo em v1.3* para os Filtros 1-14; outros módulos SIMD (pack/unpack, conversão de amostras) ainda pendentes
+- [x] **Suporte NEON (SIMD ARM)** — *completo em v1.3-v1.4*: Filtros 1-14 (v1.3) mais pack/unpack, conversão de amostras, byte-shuffle e quantização de paleta (v1.4) — nenhum módulo SIMD é mais exclusivo de AVX2
 
 ---
 
@@ -280,7 +280,8 @@ Contribuições são bem-vindas! Áreas com potencial:
 | **v1.2** | **Aceleração SIMD Agressiva (AVX2 x86_64)**: Pack/Unpack 1/2/4-bit (8-16x), Expansão/redução de amostras (4-6x), Byte-shuffle com blocking (10-20%), Filter 3 melhorado (4-6x); **252 testes** (197 unit + 6 integration roundtrip + 49 SIMD); **Zero TODOs/FIXMEs**; Benchmarks Criterion; Feature-gated SIMD com detecção de CPU | ✅ Completo |
 | **v1.2.1** | Refinamentos e despachante de operador para seleção de tone-mapping | ✅ Completo |
 | **v1.3** | **NEON SIMD ARM (aarch64)**: todos os 14 filtros vetorizados portados para NEON, dispatch em compile-time, sem checagem de feature em runtime (NEON é baseline no ARMv8-A) | ✅ Completo (Filtros 1-14) |
-| **Futuro** | NEON para outros módulos SIMD (pack/unpack, conversão de amostras), compressores adicionais, operador de tone-mapping selecionável via CLI | 🔮 Planejado |
+| **v1.4** | **NEON SIMD ARM estendido a todos os módulos restantes**: pack/unpack, conversão de amostras, byte-shuffle, quantização de paleta — nenhum módulo SIMD é mais exclusivo de AVX2 | ✅ Completo |
+| **Futuro** | Validação real em hardware/emulação ARM (QEMU/Docker), etapa de CI para cross-compile aarch64, compressores adicionais, operador de tone-mapping selecionável via CLI | 🔮 Planejado |
 
 ---
 

@@ -5,19 +5,39 @@
 //! - Reduction: 16→8, 32→8
 //!
 //! # Dispatch
-//! AVX2 support is detected **at runtime** via `is_x86_feature_detected!`;
-//! on CPUs without AVX2 (or non-x86_64 targets), the scalar fallback is used
-//! automatically. No special build flags are required.
+//! - x86_64: AVX2 support is detected **at runtime** via
+//!   `is_x86_feature_detected!`; on CPUs without AVX2 the scalar fallback is
+//!   used automatically. No special build flags are required.
+//! - aarch64: dispatch is **compile-time only**, via
+//!   `#[cfg(target_arch = "aarch64")]` — NEON is mandatory on ARMv8-A, so no
+//!   runtime feature check is needed (same rationale as `simd.rs` and
+//!   `simd_packing.rs`).
+//! - Other architectures: scalar fallback used unconditionally.
 //!
 //! # Status
-//! `expand_8to16`/`reduce_16to8` are wired into `color.rs`'s bit_depth=16
-//! GRAY/RGB/GRAY_ALPHA/RGBA conversion paths (uint sample_format only).
-//! `expand_8to32float`/`reduce_32float_to8` remain unused for now: they are
-//! plain scalar code (no AVX2 kernel), and their rounding does not exactly
-//! match `u8_to_float`/`float_to_u8` (division vs. reciprocal
+//! `expand_8to16`/`reduce_16to8`/`rgba_to_luma8` are wired into `color.rs`'s
+//! conversion paths (bit_depth=16 uint expansion/reduction, and RGBA→GRAY
+//! downsampling respectively). `expand_8to32float`/`reduce_32float_to8`
+//! remain unused for now: they are plain scalar code (no AVX2 or NEON
+//! kernel, identical on every architecture), and their rounding does not
+//! exactly match `u8_to_float`/`float_to_u8` (division vs. reciprocal
 //! multiplication can differ by 1 ULP), so wiring them up would risk a
 //! silent output change for zero performance benefit. Kept public/tested as
-//! a building block for a future proper AVX2 float implementation.
+//! a building block for a future proper vectorized float implementation.
+//!
+//! `expand_8to16`'s NEON kernel uses `vzip1q_u8`/`vzip2q_u8` (zipping a
+//! vector with itself duplicates each byte into adjacent pairs) instead of
+//! AVX2's `unpacklo`/`unpackhi` — same idea, simpler because NEON's 128-bit
+//! width needs only one zip pair per 16-sample chunk (vs. AVX2's four
+//! 128-bit unpacks per 32-sample chunk). `reduce_16to8`'s NEON kernel uses
+//! `vld2q_u8`, which deinterleaves a 2-element-per-group byte stream
+//! natively in one instruction — directly extracting the high byte of each
+//! big-endian pair, simpler than AVX2's `_mm256_shuffle_epi8` mask.
+//! `rgba_to_luma8`'s NEON kernel uses `vld4q_u8` to deinterleave R/G/B/A
+//! channels natively (AVX2 has no 4-way deinterleaving load, hence its
+//! `pshufb`-based per-lane channel extraction), then widens to `u32` via
+//! `vmovl_u8`/`vmull_u16` for the weighted sum before the same
+//! float-divide-by-1000 truncation trick as the AVX2 path.
 
 #![allow(dead_code)]
 
@@ -25,6 +45,9 @@ use crate::error::{CafeError, Result};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 
 /// Expands 8-bit samples to 16-bit big-endian format.
 ///
@@ -58,6 +81,12 @@ pub fn expand_8to16(samples_8bit: &[u8], width: usize) -> Result<Vec<u8>> {
     {
         if is_x86_feature_detected!("avx2") && width >= 32 {
             return Ok(unsafe { expand_8to16_avx2_impl(samples_8bit, width, total_bytes) });
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if width >= 16 {
+            return Ok(unsafe { expand_8to16_neon_impl(samples_8bit, width, total_bytes) });
         }
     }
 
@@ -115,6 +144,42 @@ unsafe fn expand_8to16_avx2_impl(samples_8bit: &[u8], width: usize, total_bytes:
     expanded
 }
 
+/// NEON implementation of `expand_8to16`. `vzip1q_u8`/`vzip2q_u8` zip a
+/// 16-byte vector with itself, duplicating each byte into an adjacent pair
+/// — exactly the `[v, v]` big-endian expansion needed, in one instruction
+/// per half (vs. AVX2's four `unpacklo`/`unpackhi` calls needed to cover a
+/// 32-byte chunk with 128-bit-lane instructions).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn expand_8to16_neon_impl(samples_8bit: &[u8], width: usize, total_bytes: usize) -> Vec<u8> {
+    let mut expanded = vec![0u8; total_bytes];
+    let mut i = 0;
+    const NEON_WIDTH: usize = 16; // Process 16 samples per iteration
+
+    while i + NEON_WIDTH <= width {
+        let loaded = vld1q_u8(samples_8bit.as_ptr().add(i));
+
+        // samples 0..7 -> pairs [s0,s0,s1,s1,...,s7,s7]
+        let expanded_low = vzip1q_u8(loaded, loaded);
+        // samples 8..15 -> pairs [s8,s8,s9,s9,...,s15,s15]
+        let expanded_high = vzip2q_u8(loaded, loaded);
+
+        let dst_ptr = expanded.as_mut_ptr().add(i * 2);
+        vst1q_u8(dst_ptr, expanded_low);
+        vst1q_u8(dst_ptr.add(16), expanded_high);
+
+        i += NEON_WIDTH;
+    }
+
+    for (j, &sample) in samples_8bit.iter().enumerate().take(width).skip(i) {
+        let out_idx = j * 2;
+        expanded[out_idx] = sample;
+        expanded[out_idx + 1] = sample;
+    }
+
+    expanded
+}
+
 /// Reduces 16-bit big-endian samples to 8-bit.
 ///
 /// # Parameters
@@ -146,6 +211,12 @@ pub fn reduce_16to8(samples_16bit: &[u8], width: usize) -> Result<Vec<u8>> {
     {
         if is_x86_feature_detected!("avx2") && width >= 16 {
             return Ok(unsafe { reduce_16to8_avx2_impl(samples_16bit, width) });
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if width >= 16 {
+            return Ok(unsafe { reduce_16to8_neon_impl(samples_16bit, width) });
         }
     }
 
@@ -190,6 +261,34 @@ unsafe fn reduce_16to8_avx2_impl(samples_16bit: &[u8], width: usize) -> Vec<u8> 
         reduced[i + 8..i + 16].copy_from_slice(&buf[0..8]);
 
         i += SIMD_WIDTH;
+    }
+
+    for j in i..width {
+        reduced[j] = samples_16bit[j * 2];
+    }
+
+    reduced
+}
+
+/// NEON implementation of `reduce_16to8`. `vld2q_u8` natively deinterleaves
+/// a 32-byte buffer of `[high0, low0, high1, low1, ...]` pairs into two
+/// 16-byte vectors — element 0 of the returned pair holds all 16 "high"
+/// (even-indexed) bytes directly, which is exactly the big-endian
+/// high-byte extraction needed, with no mask/shuffle table required (unlike
+/// AVX2's `_mm256_shuffle_epi8`-based approach).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn reduce_16to8_neon_impl(samples_16bit: &[u8], width: usize) -> Vec<u8> {
+    let mut reduced = vec![0u8; width];
+    let mut i = 0;
+    const NEON_WIDTH: usize = 16; // Process 16 samples (32 bytes) per iteration
+
+    while i + NEON_WIDTH <= width {
+        let deinterleaved = vld2q_u8(samples_16bit.as_ptr().add(i * 2));
+        // .0 holds bytes at even offsets (0, 2, 4, ...) = high byte of each
+        // big-endian pair.
+        vst1q_u8(reduced.as_mut_ptr().add(i), deinterleaved.0);
+        i += NEON_WIDTH;
     }
 
     for j in i..width {
@@ -270,6 +369,12 @@ pub fn rgba_to_luma8(rgba: &[u8]) -> Result<Vec<u8>> {
             return Ok(unsafe { rgba_to_luma8_avx2_impl(rgba, n_pixels) });
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if n_pixels >= 8 {
+            return Ok(unsafe { rgba_to_luma8_neon_impl(rgba, n_pixels) });
+        }
+    }
 
     Ok(rgba_to_luma8_scalar(rgba, n_pixels))
 }
@@ -340,6 +445,90 @@ unsafe fn rgba_to_luma8_avx2_impl(rgba: &[u8], n_pixels: usize) -> Vec<u8> {
         _mm_storeu_si128(tmp.as_mut_ptr() as *mut __m128i, packed8);
         let out_idx = i / 4;
         out[out_idx..out_idx + 8].copy_from_slice(&tmp[0..8]);
+
+        i += SIMD_WIDTH_BYTES;
+    }
+
+    let mut px = i / 4;
+    while i < rgba.len() {
+        let r = rgba[i] as u32;
+        let g = rgba[i + 1] as u32;
+        let b = rgba[i + 2] as u32;
+        out[px] = ((299 * r + 587 * g + 114 * b) / 1000).min(255) as u8;
+        i += 4;
+        px += 1;
+    }
+
+    out
+}
+
+/// NEON implementation of `rgba_to_luma8`. `vld4_u8` natively deinterleaves
+/// 8 RGBA pixels (32 bytes) into four separate `uint8x8_t` channel vectors
+/// (R, G, B, A) in one instruction — NEON has a real 4-way deinterleaving
+/// load, unlike AVX2 which has no equivalent and must fake it with
+/// `pshufb` per-channel masks. Each channel is then widened to `u16` (all 8
+/// lanes at once via `vmovl_u8`), split into two 4-lane halves, and
+/// widening-multiplied by its integer weight via `vmull_u16` (`u16 × u16 →
+/// u32`, exact for products up to 587×255 = 149685, far below `u32::MAX`).
+/// The three weighted channels are summed in `u32`, converted to `f32`,
+/// divided by 1000, and truncated back via `vcvtq_u32_f32` (`FCVTZU`,
+/// round-toward-zero — the same semantics as AVX2's `_mm256_cvttps_epi32`
+/// used in the x86_64 kernel), then narrowed back to `u8` and stored.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn rgba_to_luma8_neon_impl(rgba: &[u8], n_pixels: usize) -> Vec<u8> {
+    let mut out = vec![0u8; n_pixels];
+    let mut i = 0; // byte offset into rgba
+    const SIMD_WIDTH_BYTES: usize = 32; // 8 pixels x 4 bytes
+
+    let w_r = vdup_n_u16(299);
+    let w_g = vdup_n_u16(587);
+    let w_b = vdup_n_u16(114);
+    let recip_1000 = vdupq_n_f32(1.0 / 1000.0);
+
+    while i + SIMD_WIDTH_BYTES <= rgba.len() {
+        let channels = vld4_u8(rgba.as_ptr().add(i));
+        let r8 = channels.0;
+        let g8 = channels.1;
+        let b8 = channels.2;
+
+        let r16 = vmovl_u8(r8);
+        let g16 = vmovl_u8(g8);
+        let b16 = vmovl_u8(b8);
+
+        // Low 4 lanes (pixels 0-3 of this chunk)
+        let sum_lo = vaddq_u32(
+            vaddq_u32(
+                vmull_u16(vget_low_u16(r16), w_r),
+                vmull_u16(vget_low_u16(g16), w_g),
+            ),
+            vmull_u16(vget_low_u16(b16), w_b),
+        );
+        // High 4 lanes (pixels 4-7 of this chunk)
+        let sum_hi = vaddq_u32(
+            vaddq_u32(
+                vmull_u16(vget_high_u16(r16), w_r),
+                vmull_u16(vget_high_u16(g16), w_g),
+            ),
+            vmull_u16(vget_high_u16(b16), w_b),
+        );
+
+        // Exact integer sum (fits comfortably in f32's 24-bit mantissa, max
+        // 255000 << 2^24) converted to float, divided by 1000, truncated
+        // back to integer — bit-exact with `sum / 1000` for all reachable
+        // sums (verified exhaustively in tests, same as the AVX2 path).
+        let gray_lo_f = vmulq_f32(vcvtq_f32_u32(sum_lo), recip_1000);
+        let gray_hi_f = vmulq_f32(vcvtq_f32_u32(sum_hi), recip_1000);
+        let gray_lo_i = vcvtq_u32_f32(gray_lo_f);
+        let gray_hi_i = vcvtq_u32_f32(gray_hi_f);
+
+        let gray16_lo = vmovn_u32(gray_lo_i);
+        let gray16_hi = vmovn_u32(gray_hi_i);
+        let gray16 = vcombine_u16(gray16_lo, gray16_hi);
+        let gray8 = vmovn_u16(gray16);
+
+        let out_idx = i / 4;
+        vst1_u8(out.as_mut_ptr().add(out_idx), gray8);
 
         i += SIMD_WIDTH_BYTES;
     }

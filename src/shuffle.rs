@@ -7,16 +7,18 @@
 //! Example: [b0_p0, b1_p0, b0_p1, b1_p1, ...]
 //!       →  [b0_p0, b0_p1, b0_p2, ..., b1_p0, b1_p1, ...]
 //!
-//! # SIMD Optimization (v1.2.1+)
+//! # SIMD Optimization (v1.2.1+, NEON added v1.4+)
 //! On x86_64, byte-shuffle automatically dispatches to a vectorized
 //! implementation in `simd_shuffle.rs` at **runtime** when the running CPU
 //! supports AVX2 (`is_x86_feature_detected!("avx2")`), for 2-3x speedup.
-//! Falls back gracefully to scalar+blocking on CPUs without AVX2 and on
-//! non-x86_64 architectures. No special build flags are required.
+//! On aarch64, it dispatches unconditionally (compile-time only) to a NEON
+//! implementation — NEON is mandatory on ARMv8-A. Falls back gracefully to
+//! scalar+blocking on x86_64 CPUs without AVX2 and on other architectures.
+//! No special build flags are required.
 
 use crate::error::{CafeError, Result};
 
-#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
 use crate::simd_shuffle;
 
 /// Applies byte-shuffle for better compression of multi-byte samples.
@@ -75,7 +77,12 @@ pub(crate) fn apply_byte_shuffle(
             return simd_shuffle::apply_byte_shuffle_simd(raw, bpp, width, height);
         }
     }
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    {
+        return simd_shuffle::apply_byte_shuffle_simd(raw, bpp, width, height);
+    }
 
+    #[allow(unreachable_code)]
     apply_byte_shuffle_scalar(raw, bpp, pixels)
 }
 
@@ -147,7 +154,12 @@ pub(crate) fn undo_byte_shuffle(
             return simd_shuffle::undo_byte_shuffle_simd(shuffled, bpp, width, height);
         }
     }
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    {
+        return simd_shuffle::undo_byte_shuffle_simd(shuffled, bpp, width, height);
+    }
 
+    #[allow(unreachable_code)]
     undo_byte_shuffle_scalar(shuffled, bpp, pixels)
 }
 

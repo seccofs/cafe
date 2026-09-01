@@ -123,7 +123,7 @@ Each block/tile (set of lines in an `IDAT`) chooses a single filter, prefixed by
 - **Feature gate:** `simd` (default: enabled, can be disabled with `--no-default-features`)
 - **CPU detection:** AVX2 is detected automatically at runtime (falls back to scalar on non-AVX2 x86_64 CPUs); NEON is dispatched at **compile-time** via `#[cfg(target_arch = "aarch64")]` (NEON is mandatory on ARMv8-A, no runtime feature check needed)
 - **Building:** `cargo build --release` (SIMD on), or `cargo build --release --no-default-features` (SIMD off)
-- **NEON coverage (v1.3+, aarch64):** All 14 vectorized filters have NEON kernels. The other SIMD modules (`simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs`) are still AVX2-only; aarch64 builds fall back to scalar for those.
+- **NEON coverage (v1.3+, aarch64):** All 14 vectorized filters have NEON kernels. All other SIMD modules (`simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs`) also have NEON kernels as of v1.4 — no module is AVX2-only anymore.
 
 **Selection heuristics (encoder decides, not part of spec):**
 - Shannon Entropy: Measures redundancy of patterns in residuals (default, `FilterHeuristic::Entropy`)
@@ -581,7 +581,8 @@ cargo deny check                     # Security and license audit (requires: car
 | v1.1 | Filters 14-15 (TR-Directional WebP Predictor 10 and adaptive Weighted inspired by JPEG-XL), 16 total predictors, MSAD heuristic, real 2D tiling (iDIM) with end-to-end round-trip, **byte-shuffle (Filter method=1) complete encode+decode (bpp ∈ {2,4,8,16})**, **HDR tone-mapping on decode** (EOTF PQ/HLG/sRGB, color primaries conversion via XYZ, Reinhard/Filmic operators), **AVX2 SIMD for Filters 1-3 (4-8x speedup)** | ✅ |
 | **v1.2** | **Aggressive SIMD Acceleration (AVX2 x86_64)**: Pack/Unpack 1/2/4-bit samples (8-16x), Sample expansion/reduction 8→16/32 (4-6x), **Byte-shuffle blocking** (10-20% cache improvement), **Improved Filter 3 Average** (4-6x), **203 tests** (197 unit + 6 integration roundtrip), **Zero TODOs/FIXMEs**, **Comprehensive benchmarks** (Criterion-ready), Feature-gated SIMD with CPU detection | ✅ |
 | **v1.3** | **ARM NEON SIMD (aarch64)**: all 14 vectorized filters (Sub, Up, Average, Gradient, 4-way Directional, Paeth, MED, Simple Median, 2nd Order, Context-Based, TR-Directional) ported to NEON intrinsics, compile-time dispatch via `#[cfg(target_arch = "aarch64")]` (no runtime check needed, NEON is ARMv8-A baseline), 273 unit tests + 7 integration tests still passing on x86_64, cross-compile validated via `cargo check`/`cargo clippy --target aarch64-unknown-linux-gnu` | ✅ (Filters 1-14) |
-| Future | NEON for other SIMD modules (`simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs`), additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
+| **v1.4** | **ARM NEON SIMD extended to all remaining modules**: `simd_packing.rs` (1/2/4-bit pack/unpack), `simd_sample_conversion.rs` (8↔16-bit expand/reduce, RGBA→luma8), `simd_shuffle.rs` (byte-shuffle via `vqtbl1q_u8`), `simd_quantize.rs` (nearest-palette search via widened `i32` distance + `vminvq_s32` reduction) — no SIMD module is AVX2-only anymore, 273 unit tests + 7 integration tests still passing on x86_64, cross-compile validated via `cargo check`/`cargo clippy --target aarch64-unknown-linux-gnu` | ✅ |
+| Future | Real hardware/emulated ARM validation (QEMU/Docker), CI step for aarch64 cross-compile check, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
 
 ---
 
@@ -648,7 +649,7 @@ cargo build --release --no-default-features
 ### High-Potential Areas
 
 1. **SIMD for sub-byte packing** — Extend AVX2 to `pack/unpack_samples_row` (currently scalar)
-2. **NEON SIMD (ARM) for other modules** — Filters 1-14 already have NEON kernels (v1.3); extend the same pattern to `simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs` for ARM64 (Raspberry Pi, mobile, Apple Silicon)
+2. **Real ARM hardware/emulated validation** — NEON kernels for all SIMD modules are complete (v1.3-v1.4) and validated via `cargo check`/`clippy --target aarch64-unknown-linux-gnu`, but never actually executed; run the test suite under QEMU user-mode emulation or real ARM64 hardware (Raspberry Pi, mobile, Apple Silicon) to catch any intrinsic-semantics mismatch cross-compilation can't detect
 3. **Advanced 2D tiling** — iDIM with per-tile IDAT already implemented (row-major and Z-order); evolve with preview/progressive streaming
 4. **Optimized interlace** — Adam7 and even/odd already supported; optimize progressiveness and SIMD of passes
 5. **Optimized indexed palette** — Currently uses nearest-neighbor; could use k-means
@@ -694,7 +695,7 @@ cargo doc --open
 
 ---
 
-**Last updated:** September 1, 2026 | **Project version:** v1.2.1 | **ARM NEON SIMD Phase (Sep 1/2026):**
+**Last updated:** September 1, 2026 | **Project version:** v1.4.0 | **ARM NEON SIMD Phase (Sep 1/2026):**
 
 ### v1.3.0 - ARM NEON SIMD (aarch64)
 
@@ -703,7 +704,7 @@ cargo doc --open
 - Public function names/signatures unchanged (`_avx2` suffix kept) to avoid touching call sites in `filter.rs`
 - Filter 3 (Average) NEON kernel uses `vhaddq_u8` (halving add), simpler than the AVX2 path's widen-to-16-bit/narrow-back-to-8-bit workaround
 - `unfilter_sub_avx2` and `unfilter_average_avx2` remain scalar-only on all architectures (sequential dependency on the just-reconstructed previous byte prevents safe vectorization)
-- Filters 4-15 and other SIMD modules (`simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs`) remain AVX2-only for now; aarch64 builds fall back to scalar for those
+- At this point in the NEON phase, Filters 4-15 and the other SIMD modules (`simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs`) were still AVX2-only; see "v1.3.0 (cont.)" and "v1.4.0" sections below for their subsequent NEON ports
 
 **Validation:**
 - Native x86_64: `cargo build --lib`, `cargo test --lib` (273 tests), `cargo test --test integration_roundtrip` (7 tests), `cargo clippy -- -D warnings` all pass with zero regressions
@@ -725,6 +726,20 @@ Ported incrementally, one filter at a time, each verified (native build + cross-
 **Validation (repeated after each filter, full suite re-run at the end):**
 - Native x86_64: `cargo build --lib`, `cargo test --lib` (273 tests), `cargo test --test integration_roundtrip` (7 tests), `cargo clippy --lib -- -D warnings`, `cargo fmt --check` all pass with zero regressions
 - Cross-compile: `cargo clean -p cafe --target aarch64-unknown-linux-gnu` followed by `cargo check --target aarch64-unknown-linux-gnu --lib` and `cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` (clean, not incremental, to force full re-analysis) pass with zero warnings
+
+### v1.4.0 - ARM NEON SIMD extended to all remaining modules
+
+Ported module by module (`simd_packing.rs` → `simd_sample_conversion.rs` → `simd_shuffle.rs` → `simd_quantize.rs`), each fully validated (native build/test + cross-compile clean check/clippy) before moving to the next:
+
+- **`simd_packing.rs` (1/2/4-bit pack/unpack)** — "Full symmetry" approach: dedicated `_neon_impl` functions added even for the two functions that already had no real vectorization gain in the AVX2 version (2/4-bit pack: load-vectorized but pack scalar; 1/2/4-bit unpack: fully scalar), to keep the dispatch pattern consistent across the module. `pack_1bit_samples_neon_impl` is the one genuinely vectorized kernel: bit-gather via `vtstq_u8` + `vandq_u8` against MSB-first bit weights `[128,64,...,1]`, then `vaddv_u8` horizontal sum — no `reverse_bits()` workaround needed (unlike the AVX2 path, which has to reverse bit order to match `movemask` semantics). `pack_2bit`/`pack_4bit` NEON kernels load via NEON but pack scalar; `unpack_1bit/2bit/4bit` NEON kernels are scalar loops kept only for dispatch symmetry.
+- **`simd_sample_conversion.rs` (8↔16-bit expand/reduce, RGBA→luma8)** — `expand_8to16_neon_impl` uses `vzip1q_u8`/`vzip2q_u8` (zipping a vector with itself duplicates each byte into an adjacent pair in one instruction per half, vs. 4 unpack ops on AVX2). `reduce_16to8_neon_impl` uses `vld2q_u8` (native 2-way deinterleave extracts the high byte of big-endian pairs directly, no mask/shuffle needed). `rgba_to_luma8_neon_impl` uses `vld4_u8` (native 4-way deinterleave splits R/G/B/A across 8 pixels per iteration), widening `vmovl_u8`+`vmull_u16` for the weighted sum in `u32`, `vcvtq_f32_u32`/`vcvtq_u32_f32` for the ÷1000 with truncation matching AVX2's `_mm256_cvttps_epi32`, and `vmovn_u32`+`vmovn_u16` to narrow back down. `expand_8to32float`/`reduce_32float_to8` are intentionally left scalar-only on every architecture (already unused/dead code in production; not wired into any call site, no behavior change needed).
+- **`simd_shuffle.rs` (byte-shuffle, Filter Method=1)** — `apply_byte_shuffle_neon_impl`/`undo_byte_shuffle_neon_impl` use `vqtbl1q_u8` (128-bit table lookup, direct NEON analogue of `PSHUFB`, but processes half as many pixels per iteration as AVX2's 256-bit lanes since there's no 256-bit table-lookup instruction in NEON). `build_encode_mask`/`build_decode_mask` broadened from `x86_64`-only to `any(target_arch = "x86_64", target_arch = "aarch64")` since they're arch-agnostic and shared between both AVX2 and NEON paths — only `duplicate_mask` (specific to AVX2's 256-bit lane duplication) stays x86_64-only. **Bug fix**: `src/shuffle.rs` only imported/called into `simd_shuffle` under `#[cfg(target_arch = "x86_64")]`, which would have left the new NEON implementation dead code, never actually called; fixed to include `aarch64` in both the import and the dispatch call sites.
+- **`simd_quantize.rs` (nearest-palette search)** — `find_closest_rgba_neon`/`find_closest_rgb_neon` reuse the same packed-key reduction trick as AVX2 (`key = (dist << 8) | idx`, so a single integer min also yields the winning index), widening `u8`→`u16`→`i32` via `vmovl_u8`+`vmovl_u16`+`vreinterpretq_s32_u32`, computing the squared Euclidean distance in `i32` (`vsubq_s32`+`vmulq_s32`+`vaddq_s32`, no overflow risk: max is `4×255² = 260100`), packing via `vshlq_n_s32`+`vorrq_s32`, and reducing 8 lanes (as two 4-lane halves combined with `vminq_s32`) down to a scalar via `vminvq_s32` — NEON's native horizontal-minimum reduction, simpler than AVX2's shuffle-based equivalent.
+- No SIMD module is AVX2-only anymore: `simd.rs` (Filters 1-14), `simd_packing.rs`, `simd_sample_conversion.rs`, `simd_shuffle.rs`, and `simd_quantize.rs` all now dispatch to NEON on aarch64 at compile-time, mirroring the AVX2 runtime-detected paths on x86_64.
+
+**Validation (repeated after each module, full suite re-run at the end):**
+- Native x86_64: `cargo build --lib`, `cargo test --lib` (273 tests), `cargo test --test integration_roundtrip` (7 tests), `cargo clippy --lib -- -D warnings`, `cargo fmt --check` all pass with zero regressions
+- Cross-compile: `cargo clean -p cafe --target aarch64-unknown-linux-gnu` followed by `cargo check --target aarch64-unknown-linux-gnu --lib` and `cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` (clean, not incremental) pass with zero warnings
 
 ### v1.2.0 - SIMD Optimization Release
 

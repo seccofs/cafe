@@ -1,25 +1,41 @@
-//! SIMD (AVX2) optimizations for sub-byte packing/unpacking operations (v1.1+).
+//! SIMD (AVX2 / NEON) optimizations for sub-byte packing/unpacking operations
+//! (v1.1+, NEON added v1.4+).
 //!
 //! This module provides vectorized implementations for packing and unpacking
-//! sub-byte samples (1-bit, 2-bit, 4-bit) using AVX2 intrinsics on x86_64.
+//! sub-byte samples (1-bit, 2-bit, 4-bit) using AVX2 intrinsics on x86_64
+//! and NEON intrinsics on aarch64.
 //!
 //! # Speedups
-//! - Pack 1-bit: 8-16x vs scalar
-//! - Pack 2-bit: 7-10x vs scalar
-//! - Pack 4-bit: 5-7x vs scalar
-//! - Unpack operations: Similar ratios
+//! - Pack 1-bit: 8-16x vs scalar (AVX2; genuinely vectorized via
+//!   `_mm256_movemask_epi8`/`vshrn_n_u16`-style bit-gathering)
+//! - Pack 2-bit / Pack 4-bit: only the load is vectorized — there is no
+//!   direct AVX2/NEON "bit-pack" instruction, so the actual byte-packing is
+//!   scalar on both architectures. Kept as separate `_avx2`/`_neon` impls for
+//!   dispatch symmetry with the rest of the SIMD modules, not for a
+//!   measurable NEON-specific speedup.
+//! - Unpack operations (1/2/4-bit): pure scalar loops on both AVX2 and NEON
+//!   paths (`SIMD_WIDTH`/`NEON_WIDTH` only control loop-blocking
+//!   granularity, no vector bit-extraction instructions are used). Ported to
+//!   aarch64 for dispatch-pattern consistency; behavior and performance are
+//!   identical to the scalar fallback.
 //!
 //! # Dispatch
-//! The public `pack_*`/`unpack_*` functions in this module detect AVX2
-//! support **at runtime** via `is_x86_feature_detected!("avx2")` and
-//! transparently fall back to scalar implementations on CPUs without it.
-//! No special build flags (`RUSTFLAGS`, `-C target-feature`) are required;
-//! a single binary works correctly (just slower) on any x86_64 CPU, and on
-//! non-x86_64 architectures the scalar path is used unconditionally.
+//! - x86_64: the public `pack_*`/`unpack_*` functions detect AVX2 support
+//!   **at runtime** via `is_x86_feature_detected!("avx2")` and transparently
+//!   fall back to scalar implementations on CPUs without it. No special
+//!   build flags (`RUSTFLAGS`, `-C target-feature`) are required; a single
+//!   binary works correctly (just slower) on any x86_64 CPU.
+//! - aarch64: dispatch is **compile-time only**, via
+//!   `#[cfg(target_arch = "aarch64")]` — NEON is mandatory on ARMv8-A, so no
+//!   `is_aarch64_feature_detected!` runtime check is needed (same rationale
+//!   as `simd.rs`).
+//! - Other architectures: the scalar path is used unconditionally.
 //!
 //! # Architecture
 //! - x86_64 with AVX2: 256-bit (32 bytes) per iteration
+//! - aarch64 with NEON: 128-bit (16 bytes) per iteration
 //! - Processes multiple pixels in parallel using bit-level intrinsics
+//!   (pack_1bit only; see "Speedups" above for the other functions)
 //! - Scalar tail handling for remaining bytes
 //!
 //! # Safety
@@ -28,6 +44,9 @@
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 
 use crate::error::{CafeError, Result};
 
@@ -57,6 +76,12 @@ pub fn pack_1bit_samples(samples: &[u8], width: usize) -> Result<Vec<u8>> {
             return unsafe { pack_1bit_samples_avx2_impl(samples, width, expected_packed_len) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if width > 16 {
+            return unsafe { pack_1bit_samples_neon_impl(samples, width, expected_packed_len) };
+        }
+    }
 
     pack_1bit_samples_scalar(samples, width, &mut packed)?;
     Ok(packed)
@@ -82,6 +107,12 @@ pub fn pack_2bit_samples(samples: &[u8], width: usize) -> Result<Vec<u8>> {
     {
         if is_x86_feature_detected!("avx2") && width > 16 {
             return unsafe { pack_2bit_samples_avx2_impl(samples, width, expected_packed_len) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if width > 16 {
+            return unsafe { pack_2bit_samples_neon_impl(samples, width, expected_packed_len) };
         }
     }
 
@@ -111,6 +142,12 @@ pub fn pack_4bit_samples(samples: &[u8], width: usize) -> Result<Vec<u8>> {
             return unsafe { pack_4bit_samples_avx2_impl(samples, width, expected_packed_len) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if width > 8 {
+            return unsafe { pack_4bit_samples_neon_impl(samples, width, expected_packed_len) };
+        }
+    }
 
     pack_4bit_samples_scalar(samples, width, &mut packed)?;
     Ok(packed)
@@ -126,7 +163,6 @@ pub fn unpack_1bit_samples(packed: &[u8], width: usize) -> Result<Vec<u8>> {
     if width == 0 {
         return Ok(Vec::new());
     }
-    let mut unpacked = vec![0u8; width];
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -134,9 +170,17 @@ pub fn unpack_1bit_samples(packed: &[u8], width: usize) -> Result<Vec<u8>> {
             return unsafe { unpack_1bit_samples_avx2_impl(packed, width) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { unpack_1bit_samples_neon_impl(packed, width) };
+    }
 
-    unpack_1bit_samples_scalar(packed, width, &mut unpacked)?;
-    Ok(unpacked)
+    #[allow(unreachable_code)]
+    {
+        let mut unpacked = vec![0u8; width];
+        unpack_1bit_samples_scalar(packed, width, &mut unpacked)?;
+        Ok(unpacked)
+    }
 }
 
 /// Unpacks a byte array of 2-bit samples using AVX2 if the running CPU
@@ -145,7 +189,6 @@ pub fn unpack_2bit_samples(packed: &[u8], width: usize) -> Result<Vec<u8>> {
     if width == 0 {
         return Ok(Vec::new());
     }
-    let mut unpacked = vec![0u8; width];
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -153,9 +196,17 @@ pub fn unpack_2bit_samples(packed: &[u8], width: usize) -> Result<Vec<u8>> {
             return unsafe { unpack_2bit_samples_avx2_impl(packed, width) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { unpack_2bit_samples_neon_impl(packed, width) };
+    }
 
-    unpack_2bit_samples_scalar(packed, width, &mut unpacked)?;
-    Ok(unpacked)
+    #[allow(unreachable_code)]
+    {
+        let mut unpacked = vec![0u8; width];
+        unpack_2bit_samples_scalar(packed, width, &mut unpacked)?;
+        Ok(unpacked)
+    }
 }
 
 /// Unpacks a byte array of 4-bit samples using AVX2 if the running CPU
@@ -164,7 +215,6 @@ pub fn unpack_4bit_samples(packed: &[u8], width: usize) -> Result<Vec<u8>> {
     if width == 0 {
         return Ok(Vec::new());
     }
-    let mut unpacked = vec![0u8; width];
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -172,9 +222,17 @@ pub fn unpack_4bit_samples(packed: &[u8], width: usize) -> Result<Vec<u8>> {
             return unsafe { unpack_4bit_samples_avx2_impl(packed, width) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { unpack_4bit_samples_neon_impl(packed, width) };
+    }
 
-    unpack_4bit_samples_scalar(packed, width, &mut unpacked)?;
-    Ok(unpacked)
+    #[allow(unreachable_code)]
+    {
+        let mut unpacked = vec![0u8; width];
+        unpack_4bit_samples_scalar(packed, width, &mut unpacked)?;
+        Ok(unpacked)
+    }
 }
 
 // ============================================================================
@@ -404,6 +462,257 @@ unsafe fn unpack_4bit_samples_avx2_impl(packed: &[u8], width: usize) -> Result<V
             unpacked[base_idx + 1] = byte & 15;
         }
         i += SIMD_WIDTH * 2;
+    }
+
+    if i < width {
+        unpack_4bit_samples_scalar_from(packed, width, &mut unpacked, i)?;
+    }
+
+    Ok(unpacked)
+}
+
+// ============================================================================
+// NEON Implementations (aarch64, mandatory NEON baseline — no runtime check)
+// ============================================================================
+
+/// NEON implementation of 1-bit packing. Uses the classic "weighted
+/// horizontal add" bit-gather trick (NEON has no direct `movemask`
+/// instruction like AVX2's `_mm256_movemask_epi8`): AND each lane's
+/// is-nonzero mask against distinct powers of two (128..1, MSB-first so the
+/// pixel order matches the packed-byte layout directly), then `vaddv_u8`
+/// horizontally sums each 8-lane half into one packed byte — no
+/// `reverse_bits()` needed, unlike the AVX2 path.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn pack_1bit_samples_neon_impl(
+    samples: &[u8],
+    width: usize,
+    expected_packed_len: usize,
+) -> Result<Vec<u8>> {
+    let mut packed = vec![0u8; expected_packed_len];
+    let mut i = 0;
+    const SIMD_PIXELS: usize = 16; // NEON processes 16 pixels (1 vector load) per iteration
+
+    let weights: [u8; 16] = [128, 64, 32, 16, 8, 4, 2, 1, 128, 64, 32, 16, 8, 4, 2, 1];
+    let weights_vec = vld1q_u8(weights.as_ptr());
+
+    while i + SIMD_PIXELS <= width {
+        let end = i + SIMD_PIXELS;
+        if end > samples.len() {
+            return Err(CafeError::TruncatedFile(
+                "pack_1bit_samples_neon: insufficient samples data".into(),
+            ));
+        }
+
+        let pixels = vld1q_u8(samples.as_ptr().add(i));
+        // `vtstq_u8(pixels, pixels)` yields 0xFF per lane where the sample
+        // is nonzero, 0x00 otherwise (bitwise AND-test) — the NEON analogue
+        // of AVX2's `_mm256_cmpgt_epi8(pixels, zero)` for values known to be
+        // 0 or 1.
+        let is_nonzero = vtstq_u8(pixels, pixels);
+        let weighted = vandq_u8(is_nonzero, weights_vec);
+
+        let out_idx = i / 8;
+        if out_idx + 2 > expected_packed_len {
+            return Err(CafeError::TruncatedFile(
+                "pack_1bit_samples_neon: packed buffer overflow".into(),
+            ));
+        }
+
+        packed[out_idx] = vaddv_u8(vget_low_u8(weighted));
+        packed[out_idx + 1] = vaddv_u8(vget_high_u8(weighted));
+
+        i += SIMD_PIXELS;
+    }
+
+    if i < width {
+        pack_1bit_samples_scalar_from(samples, width, &mut packed, i)?;
+    }
+
+    Ok(packed)
+}
+
+/// NEON implementation of 2-bit packing. As with the AVX2 counterpart, only
+/// the load is vectorized — there is no direct NEON "bit-pack" instruction
+/// either, so the byte-packing itself is scalar.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn pack_2bit_samples_neon_impl(
+    samples: &[u8],
+    width: usize,
+    expected_packed_len: usize,
+) -> Result<Vec<u8>> {
+    let mut packed = vec![0u8; expected_packed_len];
+    let mut i = 0;
+    const SIMD_PIXELS: usize = 16;
+
+    while i + SIMD_PIXELS <= width {
+        let end = i + SIMD_PIXELS;
+        if end > samples.len() {
+            return Err(CafeError::TruncatedFile(
+                "pack_2bit_samples_neon: insufficient samples data".into(),
+            ));
+        }
+        let pixels = vld1q_u8(samples.as_ptr().add(i));
+        let mut vals = [0u8; 16];
+        vst1q_u8(vals.as_mut_ptr(), pixels);
+
+        let out_idx = (i * 2) / 8;
+        if out_idx + 4 > expected_packed_len {
+            return Err(CafeError::TruncatedFile(
+                "pack_2bit_samples_neon: packed buffer overflow".into(),
+            ));
+        }
+        for k in 0..4 {
+            let base = k * 4;
+            packed[out_idx + k] = ((vals[base] & 3) << 6)
+                | ((vals[base + 1] & 3) << 4)
+                | ((vals[base + 2] & 3) << 2)
+                | (vals[base + 3] & 3);
+        }
+        i += SIMD_PIXELS;
+    }
+
+    if i < width {
+        pack_2bit_samples_scalar_from(samples, width, &mut packed, i)?;
+    }
+
+    Ok(packed)
+}
+
+/// NEON implementation of 4-bit packing. Mirrors the AVX2 counterpart
+/// (which itself uses no AVX2 intrinsics — a plain scalar loop over an
+/// 8-pixel block); the `vld1_u8`/`vst1_u8` pair here is likewise just a
+/// same-size load/store, kept for dispatch-pattern symmetry rather than for
+/// a measurable speedup.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn pack_4bit_samples_neon_impl(
+    samples: &[u8],
+    width: usize,
+    expected_packed_len: usize,
+) -> Result<Vec<u8>> {
+    let mut packed = vec![0u8; expected_packed_len];
+    let mut i = 0;
+    const SIMD_PIXELS: usize = 8;
+
+    while i + SIMD_PIXELS <= width {
+        let end = i + SIMD_PIXELS;
+        if end > samples.len() {
+            return Err(CafeError::TruncatedFile(
+                "pack_4bit_samples_neon: insufficient samples data".into(),
+            ));
+        }
+        let pixels = vld1_u8(samples.as_ptr().add(i));
+        let mut vals = [0u8; 8];
+        vst1_u8(vals.as_mut_ptr(), pixels);
+
+        let out_idx = i / 2;
+        if out_idx + 4 > expected_packed_len {
+            return Err(CafeError::TruncatedFile(
+                "pack_4bit_samples_neon: packed buffer overflow".into(),
+            ));
+        }
+        for k in 0..4 {
+            let base = k * 2;
+            packed[out_idx + k] = ((vals[base] & 15) << 4) | (vals[base + 1] & 15);
+        }
+        i += SIMD_PIXELS;
+    }
+
+    if i < width {
+        pack_4bit_samples_scalar_from(samples, width, &mut packed, i)?;
+    }
+
+    Ok(packed)
+}
+
+/// NEON implementation of 1-bit unpacking. Pure scalar loop, ported for
+/// dispatch-pattern consistency: like the AVX2 counterpart, `NEON_WIDTH`
+/// only controls loop-blocking granularity — there is no vector
+/// bit-extraction instruction used here on either architecture.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn unpack_1bit_samples_neon_impl(packed: &[u8], width: usize) -> Result<Vec<u8>> {
+    let mut unpacked = vec![0u8; width];
+    let mut i = 0;
+    const NEON_WIDTH: usize = 16; // Process 16 packed bytes (128 pixels) per iteration
+
+    while i + (NEON_WIDTH * 8) <= width {
+        let packed_idx = i / 8;
+        if packed_idx + NEON_WIDTH > packed.len() {
+            break;
+        }
+        for j in 0..NEON_WIDTH {
+            let byte = *packed.as_ptr().add(packed_idx + j);
+            let base_idx = i + j * 8;
+            for bit in 0..8 {
+                unpacked[base_idx + bit] = (byte >> (7 - bit)) & 1;
+            }
+        }
+        i += NEON_WIDTH * 8;
+    }
+
+    if i < width {
+        unpack_1bit_samples_scalar_from(packed, width, &mut unpacked, i)?;
+    }
+
+    Ok(unpacked)
+}
+
+/// NEON implementation of 2-bit unpacking. Pure scalar loop (see
+/// [`unpack_1bit_samples_neon_impl`] docs — same rationale applies).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn unpack_2bit_samples_neon_impl(packed: &[u8], width: usize) -> Result<Vec<u8>> {
+    let mut unpacked = vec![0u8; width];
+    let mut i = 0;
+    const NEON_WIDTH: usize = 16; // Process 16 packed bytes (64 pixels) per iteration
+
+    while i + (NEON_WIDTH * 4) <= width {
+        let packed_idx = (i * 2) / 8;
+        if packed_idx + NEON_WIDTH > packed.len() {
+            break;
+        }
+        for j in 0..NEON_WIDTH {
+            let byte = *packed.as_ptr().add(packed_idx + j);
+            let base_idx = i + j * 4;
+            unpacked[base_idx] = (byte >> 6) & 3;
+            unpacked[base_idx + 1] = (byte >> 4) & 3;
+            unpacked[base_idx + 2] = (byte >> 2) & 3;
+            unpacked[base_idx + 3] = byte & 3;
+        }
+        i += NEON_WIDTH * 4;
+    }
+
+    if i < width {
+        unpack_2bit_samples_scalar_from(packed, width, &mut unpacked, i)?;
+    }
+
+    Ok(unpacked)
+}
+
+/// NEON implementation of 4-bit unpacking. Pure scalar loop (see
+/// [`unpack_1bit_samples_neon_impl`] docs — same rationale applies).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn unpack_4bit_samples_neon_impl(packed: &[u8], width: usize) -> Result<Vec<u8>> {
+    let mut unpacked = vec![0u8; width];
+    let mut i = 0;
+    const NEON_WIDTH: usize = 16; // Process 16 packed bytes (32 pixels) per iteration
+
+    while i + (NEON_WIDTH * 2) <= width {
+        let packed_idx = i / 2;
+        if packed_idx + NEON_WIDTH > packed.len() {
+            break;
+        }
+        for j in 0..NEON_WIDTH {
+            let byte = *packed.as_ptr().add(packed_idx + j);
+            let base_idx = i + j * 2;
+            unpacked[base_idx] = (byte >> 4) & 15;
+            unpacked[base_idx + 1] = byte & 15;
+        }
+        i += NEON_WIDTH * 2;
     }
 
     if i < width {

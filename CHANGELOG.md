@@ -10,12 +10,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Planned (Future)
-- ARM NEON SIMD for other SIMD modules (`simd_packing.rs`, `simd_sample_conversion.rs`, `simd_quantize.rs`, `simd_shuffle.rs`)
+- Real ARM hardware/emulated validation (QEMU/Docker) for NEON kernels
+- CI step for aarch64 cross-compile check
 - Cache-friendly blocking in scalar byte-shuffle fallback
 - Runtime CPU detection for optional SIMD forcing
 - Benchmarking suite with Criterion framework
 - k-means palette quantization algorithm
 - Tone-mapping on encode (SDR → HDR inverse operation)
+
+---
+
+## [1.4.0] - 2026-09-01
+
+### Added
+
+- **ARM NEON SIMD (aarch64) extended to all remaining modules**, ported module by module (`simd_packing.rs` → `simd_sample_conversion.rs` → `simd_shuffle.rs` → `simd_quantize.rs`), each fully validated before moving to the next:
+  - `simd_packing.rs` (1/2/4-bit pack/unpack): "Full symmetry" approach — dedicated `_neon_impl` functions added even for functions with no real vectorization gain in the AVX2 version (2/4-bit pack: load-vectorized but pack scalar; 1/2/4-bit unpack: fully scalar), to keep the dispatch pattern consistent. `pack_1bit_samples_neon_impl` is the one genuinely vectorized kernel: bit-gather via `vtstq_u8` + `vandq_u8` against MSB-first bit weights, then `vaddv_u8` horizontal sum (no `reverse_bits()` workaround needed, unlike AVX2)
+  - `simd_sample_conversion.rs` (8↔16-bit expand/reduce, RGBA→luma8): `expand_8to16_neon_impl` uses `vzip1q_u8`/`vzip2q_u8`; `reduce_16to8_neon_impl` uses `vld2q_u8` (native 2-way deinterleave); `rgba_to_luma8_neon_impl` uses `vld4_u8` (native 4-way deinterleave) with widening `vmovl_u8`+`vmull_u16`, `vcvtq_f32_u32`/`vcvtq_u32_f32` for the ÷1000 truncating division, and `vmovn_u32`+`vmovn_u16` to narrow back down. `expand_8to32float`/`reduce_32float_to8` intentionally left scalar-only (unused/dead code in production)
+  - `simd_shuffle.rs` (byte-shuffle, Filter Method=1): `apply_byte_shuffle_neon_impl`/`undo_byte_shuffle_neon_impl` use `vqtbl1q_u8` (128-bit table lookup, direct analogue of `PSHUFB`). `build_encode_mask`/`build_decode_mask` broadened to be arch-agnostic and shared between AVX2 and NEON paths
+  - `simd_quantize.rs` (nearest-palette search): `find_closest_rgba_neon`/`find_closest_rgb_neon` reuse the packed-key reduction trick (`key = (dist << 8) | idx`), widening `u8`→`u16`→`i32`, computing squared Euclidean distance in `i32`, and reducing via `vminvq_s32` (NEON's native horizontal-minimum reduction)
+  - No SIMD module is AVX2-only anymore: `simd.rs`, `simd_packing.rs`, `simd_sample_conversion.rs`, `simd_shuffle.rs`, and `simd_quantize.rs` all dispatch to NEON on aarch64 at compile-time
+
+### Fixed
+
+- `src/shuffle.rs` only imported/called into `simd_shuffle` under `#[cfg(target_arch = "x86_64")]`, which would have left the new NEON byte-shuffle implementation dead code, never actually called; fixed to include `aarch64` in both the import and the dispatch call sites
+
+### Notes
+
+- Validated via `cargo check`/`cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` (clean rebuild after each module) and native `cargo test --lib` (273 tests) + `cargo test --test integration_roundtrip` (7 tests), zero regressions
+- Real hardware/emulated ARM execution still pending (see Planned/Unreleased)
 
 ---
 

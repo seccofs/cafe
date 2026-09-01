@@ -29,9 +29,24 @@
 //! stays well within `i32`'s positive range even after OR-ing in `idx`.
 //!
 //! # Dispatch
-//! AVX2 support is detected **at runtime** via `is_x86_feature_detected!`;
-//! on CPUs without AVX2 (or non-x86_64 targets), the scalar fallback is used
-//! automatically. No special build flags are required.
+//! - x86_64: AVX2 support is detected **at runtime** via
+//!   `is_x86_feature_detected!`; on CPUs without AVX2 the scalar fallback is
+//!   used automatically. No special build flags are required.
+//! - aarch64: dispatch is **compile-time only**, via
+//!   `#[cfg(target_arch = "aarch64")]` — NEON is mandatory on ARMv8-A, so no
+//!   runtime feature check is needed (same rationale as `simd.rs`).
+//! - Other architectures: scalar fallback used unconditionally.
+//!
+//! # NEON Implementation
+//! NEON's 128-bit registers hold 4 `i32` lanes (vs. AVX2's 8 per 256-bit
+//! register), so each NEON iteration processes 8 palette entries using two
+//! independent 4-lane halves (`_lo`/`_hi`) — mirroring how `simd.rs` widens
+//! a 128-bit byte chunk into two 8-lane `u16` halves for its filters. The
+//! packed-key horizontal reduction is simpler than AVX2's shuffle-based
+//! approach: aarch64 NEON provides a native "across-vector minimum"
+//! instruction, `vminvq_s32`, so combining the two halves and reducing to a
+//! single scalar is just `vminvq_s32(vminq_s32(lo, hi))` — no manual
+//! lane-shuffling needed.
 
 #![allow(dead_code)]
 
@@ -39,6 +54,9 @@ use crate::types::PaletteEntry;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 
 /// Structure-of-arrays view of a palette's color channels, enabling
 /// AVX2-vectorized nearest-neighbor search across entries. Built once and
@@ -110,6 +128,14 @@ impl PaletteSoa {
                 };
             }
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if self.len() >= 8 {
+                return unsafe {
+                    find_closest_rgba_neon(r, g, b, a, &self.r, &self.g, &self.b, &self.a)
+                };
+            }
+        }
 
         find_closest_rgba_scalar(r, g, b, a, &self.r, &self.g, &self.b, &self.a)
     }
@@ -127,6 +153,12 @@ impl PaletteSoa {
         {
             if is_x86_feature_detected!("avx2") && self.len() >= 8 {
                 return unsafe { find_closest_rgb_avx2(r, g, b, &self.r, &self.g, &self.b) };
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if self.len() >= 8 {
+                return unsafe { find_closest_rgb_neon(r, g, b, &self.r, &self.g, &self.b) };
             }
         }
 
@@ -298,6 +330,177 @@ unsafe fn find_closest_rgb_avx2(
     }
 
     let mut best_key_scalar = horizontal_min_epi32(best_key) as u32;
+
+    // Scalar tail (< 8 remaining entries).
+    while i < n {
+        let dr = r as i32 - r_arr[i] as i32;
+        let dg = g as i32 - g_arr[i] as i32;
+        let db = b as i32 - b_arr[i] as i32;
+        let dist = (dr * dr + dg * dg + db * db) as u32;
+        let key = (dist << 8) | (i as u32);
+        if key < best_key_scalar {
+            best_key_scalar = key;
+        }
+        i += 1;
+    }
+
+    unpack_key(best_key_scalar)
+}
+
+/// # Safety
+/// NEON is baseline on aarch64 (ARMv8-A mandates it) — always safe to call.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn find_closest_rgba_neon(
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+    r_arr: &[u8],
+    g_arr: &[u8],
+    b_arr: &[u8],
+    a_arr: &[u8],
+) -> (u8, u32) {
+    let n = r_arr.len();
+    let vr = vdupq_n_s32(r as i32);
+    let vg = vdupq_n_s32(g as i32);
+    let vb = vdupq_n_s32(b as i32);
+    let va = vdupq_n_s32(a as i32);
+    let offsets_lo = [0i32, 1, 2, 3];
+    let offsets_hi = [4i32, 5, 6, 7];
+    let lane_offsets_lo = vld1q_s32(offsets_lo.as_ptr());
+    let lane_offsets_hi = vld1q_s32(offsets_hi.as_ptr());
+
+    let mut best_key = vdupq_n_s32(i32::MAX);
+
+    let mut i = 0usize;
+    while i + 8 <= n {
+        // Widen 8 packed u8 entries per channel to 2x4 lanes of i32.
+        let er8 = vld1_u8(r_arr.as_ptr().add(i));
+        let eg8 = vld1_u8(g_arr.as_ptr().add(i));
+        let eb8 = vld1_u8(b_arr.as_ptr().add(i));
+        let ea8 = vld1_u8(a_arr.as_ptr().add(i));
+
+        let er16 = vmovl_u8(er8);
+        let eg16 = vmovl_u8(eg8);
+        let eb16 = vmovl_u8(eb8);
+        let ea16 = vmovl_u8(ea8);
+
+        let ver_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(er16)));
+        let ver_hi = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(er16)));
+        let veg_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(eg16)));
+        let veg_hi = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(eg16)));
+        let veb_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(eb16)));
+        let veb_hi = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(eb16)));
+        let vea_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(ea16)));
+        let vea_hi = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(ea16)));
+
+        for (half, (er, eg, eb, ea), lane_offsets) in [
+            (0, (ver_lo, veg_lo, veb_lo, vea_lo), lane_offsets_lo),
+            (1, (ver_hi, veg_hi, veb_hi, vea_hi), lane_offsets_hi),
+        ] {
+            let dr = vsubq_s32(vr, er);
+            let dg = vsubq_s32(vg, eg);
+            let db = vsubq_s32(vb, eb);
+            let da = vsubq_s32(va, ea);
+
+            // Max: 4 * 255^2 = 260100, well within i32 range, no overflow.
+            let dist = vaddq_s32(
+                vaddq_s32(vmulq_s32(dr, dr), vmulq_s32(dg, dg)),
+                vaddq_s32(vmulq_s32(db, db), vmulq_s32(da, da)),
+            );
+
+            let idx_vec = vaddq_s32(vdupq_n_s32((i + half * 4) as i32), lane_offsets);
+            let key = vorrq_s32(vshlq_n_s32(dist, 8), idx_vec);
+            best_key = vminq_s32(best_key, key);
+        }
+
+        i += 8;
+    }
+
+    let mut best_key_scalar = vminvq_s32(best_key) as u32;
+
+    // Scalar tail (< 8 remaining entries).
+    while i < n {
+        let dr = r as i32 - r_arr[i] as i32;
+        let dg = g as i32 - g_arr[i] as i32;
+        let db = b as i32 - b_arr[i] as i32;
+        let da = a as i32 - a_arr[i] as i32;
+        let dist = (dr * dr + dg * dg + db * db + da * da) as u32;
+        let key = (dist << 8) | (i as u32);
+        if key < best_key_scalar {
+            best_key_scalar = key;
+        }
+        i += 1;
+    }
+
+    unpack_key(best_key_scalar)
+}
+
+/// # Safety
+/// NEON is baseline on aarch64 (ARMv8-A mandates it) — always safe to call.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn find_closest_rgb_neon(
+    r: u8,
+    g: u8,
+    b: u8,
+    r_arr: &[u8],
+    g_arr: &[u8],
+    b_arr: &[u8],
+) -> (u8, u32) {
+    let n = r_arr.len();
+    let vr = vdupq_n_s32(r as i32);
+    let vg = vdupq_n_s32(g as i32);
+    let vb = vdupq_n_s32(b as i32);
+    let offsets_lo = [0i32, 1, 2, 3];
+    let offsets_hi = [4i32, 5, 6, 7];
+    let lane_offsets_lo = vld1q_s32(offsets_lo.as_ptr());
+    let lane_offsets_hi = vld1q_s32(offsets_hi.as_ptr());
+
+    let mut best_key = vdupq_n_s32(i32::MAX);
+
+    let mut i = 0usize;
+    while i + 8 <= n {
+        let er8 = vld1_u8(r_arr.as_ptr().add(i));
+        let eg8 = vld1_u8(g_arr.as_ptr().add(i));
+        let eb8 = vld1_u8(b_arr.as_ptr().add(i));
+
+        let er16 = vmovl_u8(er8);
+        let eg16 = vmovl_u8(eg8);
+        let eb16 = vmovl_u8(eb8);
+
+        let ver_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(er16)));
+        let ver_hi = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(er16)));
+        let veg_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(eg16)));
+        let veg_hi = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(eg16)));
+        let veb_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(eb16)));
+        let veb_hi = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(eb16)));
+
+        for (half, (er, eg, eb), lane_offsets) in [
+            (0, (ver_lo, veg_lo, veb_lo), lane_offsets_lo),
+            (1, (ver_hi, veg_hi, veb_hi), lane_offsets_hi),
+        ] {
+            let dr = vsubq_s32(vr, er);
+            let dg = vsubq_s32(vg, eg);
+            let db = vsubq_s32(vb, eb);
+
+            // Max: 3 * 255^2 = 195075, well within i32 range, no overflow.
+            let dist = vaddq_s32(
+                vmulq_s32(dr, dr),
+                vaddq_s32(vmulq_s32(dg, dg), vmulq_s32(db, db)),
+            );
+
+            let idx_vec = vaddq_s32(vdupq_n_s32((i + half * 4) as i32), lane_offsets);
+            let key = vorrq_s32(vshlq_n_s32(dist, 8), idx_vec);
+            best_key = vminq_s32(best_key, key);
+        }
+
+        i += 8;
+    }
+
+    let mut best_key_scalar = vminvq_s32(best_key) as u32;
 
     // Scalar tail (< 8 remaining entries).
     while i < n {

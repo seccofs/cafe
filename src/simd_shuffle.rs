@@ -29,13 +29,30 @@
 //! the transform, not a shortcut).
 //!
 //! # Dispatch
-//! Callers (`shuffle.rs`) check `is_x86_feature_detected!("avx2")` **at
-//! runtime** before calling into this module; the functions here assume AVX2
-//! is available (enforced via `#[target_feature(enable = "avx2")]` on the
-//! `unsafe` implementation functions).
+//! - x86_64: callers (`shuffle.rs`) check `is_x86_feature_detected!("avx2")`
+//!   **at runtime** before calling into this module; the AVX2 functions here
+//!   assume AVX2 is available (enforced via `#[target_feature(enable =
+//!   "avx2")]` on the `unsafe` implementation functions).
+//! - aarch64: dispatch is **compile-time only**, via
+//!   `#[cfg(target_arch = "aarch64")]` — NEON is mandatory on ARMv8-A, so no
+//!   runtime feature check is needed (same rationale as `simd.rs`).
+//!
+//! # NEON Implementation
+//! NEON's `vqtbl1q_u8` (single-register table lookup) is a direct
+//! equivalent of AVX2's `PSHUFB` but operates on one 128-bit register at a
+//! time (there is no 256-bit-wide table-lookup instruction on NEON, unlike
+//! AVX2's per-128-bit-lane `_mm256_shuffle_epi8`), so the NEON kernels
+//! process `pixels_per_lane` pixels per iteration (one `vld1q_u8` +
+//! `vqtbl1q_u8` + `vst1q_u8`) instead of AVX2's `2 * pixels_per_lane`
+//! (which needs two independent 128-bit shuffles glued into a 256-bit op).
+//! The permutation index tables ([`build_encode_mask`]/[`build_decode_mask`])
+//! are architecture-agnostic and reused as-is (no duplication needed, unlike
+//! [`duplicate_mask`] which only exists for AVX2's 256-bit-wide load).
 
-#[cfg(target_arch = "x86_64")]
 use crate::error::CafeError;
+
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 
 /// Applies byte-shuffle using AVX2 PSHUFB for fast vectorized reordering.
 ///
@@ -47,7 +64,7 @@ use crate::error::CafeError;
 ///
 /// # Safety
 /// Caller must have verified `is_x86_feature_detected!("avx2")` returns true.
-#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) fn apply_byte_shuffle_simd(
     data: &[u8],
     bpp: usize,
@@ -57,11 +74,18 @@ pub(crate) fn apply_byte_shuffle_simd(
     let pixels = (width as usize) * (height as usize);
     match bpp {
         2 | 4 | 8 | 16 => {
-            if is_x86_feature_detected!("avx2") {
-                Ok(unsafe { apply_byte_shuffle_avx2_impl(data, bpp, pixels) })
-            } else {
-                Ok(apply_byte_shuffle_generic_scalar(data, bpp, pixels))
+            #[cfg(target_arch = "x86_64")]
+            {
+                if is_x86_feature_detected!("avx2") {
+                    return Ok(unsafe { apply_byte_shuffle_avx2_impl(data, bpp, pixels) });
+                }
             }
+            #[cfg(target_arch = "aarch64")]
+            {
+                return Ok(unsafe { apply_byte_shuffle_neon_impl(data, bpp, pixels) });
+            }
+            #[allow(unreachable_code)]
+            Ok(apply_byte_shuffle_generic_scalar(data, bpp, pixels))
         }
         _ => Err(CafeError::UnsupportedFeature(format!(
             "byte-shuffle SIMD not supported for bpp={}",
@@ -74,7 +98,7 @@ pub(crate) fn apply_byte_shuffle_simd(
 ///
 /// # Safety
 /// Caller must have verified `is_x86_feature_detected!("avx2")` returns true.
-#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) fn undo_byte_shuffle_simd(
     data: &[u8],
     bpp: usize,
@@ -84,11 +108,18 @@ pub(crate) fn undo_byte_shuffle_simd(
     let pixels = (width as usize) * (height as usize);
     match bpp {
         2 | 4 | 8 | 16 => {
-            if is_x86_feature_detected!("avx2") {
-                Ok(unsafe { undo_byte_shuffle_avx2_impl(data, bpp, pixels) })
-            } else {
-                Ok(undo_byte_shuffle_generic_scalar(data, bpp, pixels))
+            #[cfg(target_arch = "x86_64")]
+            {
+                if is_x86_feature_detected!("avx2") {
+                    return Ok(unsafe { undo_byte_shuffle_avx2_impl(data, bpp, pixels) });
+                }
             }
+            #[cfg(target_arch = "aarch64")]
+            {
+                return Ok(unsafe { undo_byte_shuffle_neon_impl(data, bpp, pixels) });
+            }
+            #[allow(unreachable_code)]
+            Ok(undo_byte_shuffle_generic_scalar(data, bpp, pixels))
         }
         _ => Err(CafeError::UnsupportedFeature(format!(
             "byte-shuffle SIMD reverse not supported for bpp={}",
@@ -97,11 +128,12 @@ pub(crate) fn undo_byte_shuffle_simd(
     }
 }
 
-/// Builds the in-lane PSHUFB index table for the encode direction:
+/// Builds the in-lane PSHUFB/TBL index table for the encode direction:
 /// `mask[b * pixels_per_lane + p] = p * bpp + b`, i.e. output position
 /// `b*P+p` (grouped by byte-position `b`, pixel `p` within the lane) reads
-/// from AoS input position `p*bpp+b`.
-#[cfg(target_arch = "x86_64")]
+/// from AoS input position `p*bpp+b`. Shared by both the AVX2 (`PSHUFB`)
+/// and NEON (`vqtbl1q_u8`) kernels.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn build_encode_mask(bpp: usize) -> [i8; 16] {
     let pixels_per_lane = 16 / bpp;
     let mut mask = [0i8; 16];
@@ -115,11 +147,12 @@ fn build_encode_mask(bpp: usize) -> [i8; 16] {
     mask
 }
 
-/// Builds the in-lane PSHUFB index table for the decode direction (the
+/// Builds the in-lane PSHUFB/TBL index table for the decode direction (the
 /// inverse permutation of [`build_encode_mask`]):
 /// `mask[p * bpp + b] = b * pixels_per_lane + p`, i.e. AoS output position
 /// `p*bpp+b` reads from the "grouped by byte-position" input at `b*P+p`.
-#[cfg(target_arch = "x86_64")]
+/// Shared by both the AVX2 (`PSHUFB`) and NEON (`vqtbl1q_u8`) kernels.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn build_decode_mask(bpp: usize) -> [i8; 16] {
     let pixels_per_lane = 16 / bpp;
     let mut mask = [0i8; 16];
@@ -230,8 +263,88 @@ unsafe fn undo_byte_shuffle_avx2_impl(data: &[u8], bpp: usize, pixels: usize) ->
     output
 }
 
+/// NEON encode implementation. `vqtbl1q_u8` is a single-register 128-bit
+/// table lookup (direct NEON analogue of `PSHUFB`), so each iteration
+/// processes exactly `pixels_per_lane` pixels (one 128-bit lane) — half of
+/// AVX2's per-iteration throughput (which glues two 128-bit shuffles into
+/// one 256-bit op), since NEON has no wider table-lookup instruction.
+/// Falls back to the scalar reference for any remaining tail pixels.
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+#[target_feature(enable = "neon")]
+unsafe fn apply_byte_shuffle_neon_impl(data: &[u8], bpp: usize, pixels: usize) -> Vec<u8> {
+    let pixels_per_lane = 16 / bpp;
+    let mask = build_encode_mask(bpp);
+    let mask_vec = vld1q_u8(mask.as_ptr() as *const u8);
+
+    let mut output = vec![0u8; pixels * bpp];
+    let mut i = 0;
+
+    while i + pixels_per_lane <= pixels {
+        let loaded = vld1q_u8(data.as_ptr().add(i * bpp));
+        let shuffled = vqtbl1q_u8(loaded, mask_vec);
+
+        let mut temp = [0u8; 16];
+        vst1q_u8(temp.as_mut_ptr(), shuffled);
+
+        for b in 0..bpp {
+            let src_off = b * pixels_per_lane;
+            let dst_off = b * pixels + i;
+            output[dst_off..dst_off + pixels_per_lane]
+                .copy_from_slice(&temp[src_off..src_off + pixels_per_lane]);
+        }
+
+        i += pixels_per_lane;
+    }
+
+    // Scalar tail
+    for pix in i..pixels {
+        for b in 0..bpp {
+            output[b * pixels + pix] = data[pix * bpp + b];
+        }
+    }
+
+    output
+}
+
+/// NEON decode implementation, symmetric to [`apply_byte_shuffle_neon_impl`].
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+#[target_feature(enable = "neon")]
+unsafe fn undo_byte_shuffle_neon_impl(data: &[u8], bpp: usize, pixels: usize) -> Vec<u8> {
+    let pixels_per_lane = 16 / bpp;
+    let mask = build_decode_mask(bpp);
+    let mask_vec = vld1q_u8(mask.as_ptr() as *const u8);
+
+    let mut output = vec![0u8; pixels * bpp];
+    let mut i = 0;
+
+    while i + pixels_per_lane <= pixels {
+        let mut temp = [0u8; 16];
+        for b in 0..bpp {
+            let src_off = b * pixels + i;
+            let dst_off = b * pixels_per_lane;
+            temp[dst_off..dst_off + pixels_per_lane]
+                .copy_from_slice(&data[src_off..src_off + pixels_per_lane]);
+        }
+
+        let loaded = vld1q_u8(temp.as_ptr());
+        let shuffled = vqtbl1q_u8(loaded, mask_vec);
+        vst1q_u8(output.as_mut_ptr().add(i * bpp), shuffled);
+
+        i += pixels_per_lane;
+    }
+
+    // Scalar tail
+    for pix in i..pixels {
+        for b in 0..bpp {
+            output[pix * bpp + b] = data[b * pixels + pix];
+        }
+    }
+
+    output
+}
+
 /// Reference scalar implementation (encode direction), used both as the
-/// non-AVX2 fallback and as the correctness oracle in tests.
+/// non-AVX2/NEON fallback and as the correctness oracle in tests.
 #[allow(dead_code)]
 fn apply_byte_shuffle_generic_scalar(data: &[u8], bpp: usize, pixels: usize) -> Vec<u8> {
     let mut output = vec![0u8; pixels * bpp];
@@ -279,6 +392,22 @@ mod tests {
             assert_eq!(
                 data, avx2_unshuffled,
                 "AVX2 roundtrip failed for bpp={bpp}, pixels={pixels}"
+            );
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            let neon_shuffled = unsafe { apply_byte_shuffle_neon_impl(&data, bpp, pixels) };
+            assert_eq!(
+                scalar_shuffled, neon_shuffled,
+                "NEON vs scalar shuffle mismatch for bpp={bpp}, pixels={pixels}"
+            );
+
+            let neon_unshuffled =
+                unsafe { undo_byte_shuffle_neon_impl(&neon_shuffled, bpp, pixels) };
+            assert_eq!(
+                data, neon_unshuffled,
+                "NEON roundtrip failed for bpp={bpp}, pixels={pixels}"
             );
         }
 
@@ -341,7 +470,25 @@ mod tests {
         assert_eq!(unshuffled, data);
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_byte_shuffle_simd_matches_scalar_bpp4_odd_size() {
+        // width*height not a multiple of 4 (pixels_per_lane for bpp=4 on
+        // NEON), exercises the scalar tail path.
+        let width = 13u32;
+        let height = 7u32;
+        let pixels = (width * height) as usize;
+        let data: Vec<u8> = (0..(pixels * 4)).map(|i| (i % 256) as u8).collect();
+
+        let shuffled = apply_byte_shuffle_simd(&data, 4, width, height).unwrap();
+        let scalar_shuffled = apply_byte_shuffle_generic_scalar(&data, 4, pixels);
+        assert_eq!(shuffled, scalar_shuffled);
+
+        let unshuffled = undo_byte_shuffle_simd(&shuffled, 4, width, height).unwrap();
+        assert_eq!(unshuffled, data);
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn test_byte_shuffle_invalid_bpp() {
         let result = apply_byte_shuffle_simd(&[0u8; 9], 3, 3, 1);
