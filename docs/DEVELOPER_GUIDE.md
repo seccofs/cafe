@@ -4,7 +4,7 @@
 
 CAFE (Compression Adaptive Filtering Experiment) is a modern chunk-based image format, inspired by PNG, with support for ZSTD compression, advanced predictive filters, indexed palette, and structured metadata (EXIF, JSON, ICC, XMP).
 
-**Specification:** `docs/CAFE-spec.md` (698 lines, v1.2.1)
+**Specification:** `docs/CAFE-spec.md` (722 lines, v1.1, updated through v1.5)
 **Implementation:** Rust 2021 with BSD-3-Clause license
 
 ---
@@ -29,7 +29,11 @@ Cafe/
 │   ├── codec.rs          # ZSTD compression with fallback (section 3.2)
 │   ├── color.rs          # Color conversions, pack/unpack, float/half
 │   ├── filter.rs         # 16 predictive filters + heuristics (with SIMD integration)
-│   ├── simd.rs           # AVX2 vectorized filters 1-3 (v1.1+, optional feature)
+│   ├── simd.rs           # AVX2/NEON vectorized filters 1-14 (v1.1+, optional feature)
+│   ├── simd_packing.rs   # AVX2/NEON pack/unpack for 1/2/4-bit samples (v1.2+)
+│   ├── simd_sample_conversion.rs # AVX2/NEON 8→16/32 expansion, 16/32→8 reduction (v1.2+)
+│   ├── simd_quantize.rs  # AVX2/NEON nearest-palette search (v1.2+)
+│   ├── simd_shuffle.rs   # AVX2/NEON byte-shuffle table lookup (v1.2+)
 │   ├── shuffle.rs        # Byte-shuffle (Filter Method=1, v1.1)
 │   ├── tonemap.rs        # HDR tone-mapping (EOTF, primaries, operators, v1.1)
 │   ├── interlace.rs      # Adam7 and even/odd
@@ -43,7 +47,7 @@ Cafe/
 │   ├── basic_encode.rs   # Basic encoding example
 │   └── basic_decode.rs   # Basic decoding example
 ├── docs/                 # Spec, security audit, dev guide
-│   ├── CAFE-spec.md      # Complete format specification (v1.2.1)
+│   ├── CAFE-spec.md      # Complete format specification (v1.1, updated through v1.5)
 │   ├── CAFE-spec.pt.md   # Portuguese version of the spec
 │   ├── SECURITY_AUDIT.md # Security audit report
 │   └── DEVELOPER_GUIDE.md # Developer guide
@@ -58,6 +62,7 @@ zstd = "0.13"             # ZSTD compression/decompression
 serde_json = "1.0"        # JSON metadata parsing
 half = "2.7"              # Half-float (fp16) for sample_format HALF (HDR, v1.0)
 crc32fast = "1.3"         # Chunk validation via CRC32
+log = "0.4"               # Diagnostic facade (debug/info/warn); consumers choose their own logger
 ```
 
 ---
@@ -101,7 +106,7 @@ All chunks follow this layout:
 
 ## Predictive Filters (Section 4.3.1)
 
-Each block/tile (set of lines in an `IDAT`) chooses a single filter, prefixed by 1 byte at start of block. Prediction occurs **before** ZSTD compression.
+Each block/tile (set of lines in an `IDAT`) chooses a single filter, prefixed by 1 byte at start of block (`Filter method=2`). As of v1.5, `Filter method=3` selects a filter **per row** instead, at the cost of one extra byte per row before compression (finer-grained adaptation than per-tile). Prediction occurs **before** ZSTD compression.
 
 | Code | Name | Prediction | Cost | SIMD (v1.1+) |
 |--------|------|----------|-------|------|
@@ -462,32 +467,39 @@ fn bytes_per_row_for_bit_depth(width: u32, bit_depth: u8) -> Result<usize>
 ### Encode
 
 ```bash
-cargo run --bin cafe-encode -- encode <input> <output.cafe> [options]
+cargo run --bin cafe-encode -- <input> <output.cafe> [options]
 ```
 
 **Options:**
 - `--no-filter` — Disable predictive filter (faster)
+- `--byte-shuffle` — Use byte-shuffle (Filter Method=1) for multi-byte samples (bpp ∈ {2,4,8,16})
+- `--filter-heuristic <entropy|msad|test>` — Filter selection heuristic per block (default: entropy)
 - `--level <1-22>` — ZSTD compression level (default: 19)
 - `--color-type <0|2|4|6>` — Force color type (default: auto-detected)
+- `--bit-depth <1-32>` — Target bit depth for uint (default: 8)
 - `--adaptive` — Local complexity analysis per tile
 - `--indexed` — Force indexed palette
 - `--json-file <file>` — JSON metadata
 - `--exif-file <file>` — Raw EXIF blob
+- `--sample-format <0|1|2>` — Sample format (uint/float/half-float)
+- `--chdr-transfer <func>` / `--chdr-primaries <prim>` / `--chdr-max-lum` / `--chdr-min-lum` — HDR metadata (cHDR)
+- `--chdr-dict-file <path>` — ZSTD dictionary
+- `--interlace <0|1|2>` — Interlace (none/Adam7/Even-Odd)
 
 **Example:**
 ```bash
-cargo run --bin cafe-encode -- encode photo.png photo.cafe --level 22 --color-type 2
+cargo run --bin cafe-encode -- photo.png photo.cafe --level 22 --color-type 2
 ```
 
 ### Decode
 
 ```bash
-cargo run --bin cafe-decode -- decode <input.cafe> <output>
+cargo run --bin cafe-decode -- <input.cafe> <output> [--extract-metadata]
 ```
 
 **Example:**
 ```bash
-cargo run --bin cafe-decode -- decode photo.cafe photo.png
+cargo run --bin cafe-decode -- photo.cafe photo.png
 ```
 
 ---
@@ -563,6 +575,7 @@ cargo test --release                 # Release mode (faster)
 cargo test -- --nocapture           # With output
 cargo clippy                         # Linting and warnings
 cargo fmt --check                   # Verify formatting
+cargo deny check                     # Security and license audit (requires: cargo install cargo-deny)
 ```
 
 ---
@@ -577,29 +590,26 @@ cargo fmt --check                   # Verify formatting
 | **v1.4** | **ARM NEON SIMD extended to all remaining modules**: `simd_packing.rs`, `simd_sample_conversion.rs`, `simd_shuffle.rs`, `simd_quantize.rs` — no SIMD module is AVX2-only anymore | ✅ |
 | **v1.4.1** | **Real ARM execution validation (QEMU emulation)**: ran the full test suite natively on aarch64 for the first time — found and fixed a real NEON index-calculation bug in `simd_quantize.rs` that cross-compilation alone could never have caught | ✅ |
 | **v1.4.2** | **CI: ARM64 Cross-Compile Check job** — new `aarch64-cross-compile` job in `.github/workflows/ci.yml` runs `cargo check`/`cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` on every push/PR (Ubuntu runner + `gcc-aarch64-linux-gnu`), preventing future aarch64 regressions from merging unnoticed | ✅ |
-| Future | Real hardware validation on physical ARM devices, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR) | ⏳ |
+| **v1.5** | **Compression-focused audit (5 items)**: per-row predictive filter (`Filter method=3`), real compression benchmarks + CI regression gate (`tests/compression_regression.rs`, `benches/encode_decode.rs`), `auto_dictionary` non-regression guarantee, perceptually-weighted palette quantization (`PaletteAlgorithm::NearestNeighborWeighted`, redmean distance), `DEFAULT_TILE_ROWS` retuning investigation (benchmarked, kept at 64) | ✅ |
+| Future | Real hardware validation on physical ARM devices, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
 
 ---
 
 ## Performance and Optimizations
 
-### SIMD Acceleration (v1.1+)
+### SIMD Acceleration (v1.1+ → v1.4+)
 
 **What's Vectorized:**
-- **Filter 1 (Sub)**: `pixel - left`, 32 bytes/iteration with AVX2
-- **Filter 2 (Up)**: `pixel - above`, 32 bytes/iteration with AVX2
-- **Filter 3 (Average)**: `pixel - (left + above) / 2`, scalar-optimized
+- **Filters 1-14**: all vectorized on AVX2 (x86_64) and NEON (aarch64); Filter 15 (Weighted) remains scalar-only everywhere (sequential adaptive-state dependency)
+- **Pack/Unpack 1/2/4-bit, sample expansion/reduction, byte-shuffle, palette quantization**: all vectorized on AVX2 and NEON as of v1.4 (see `AGENTS.md` for per-module details)
 
 **Building with SIMD:**
 ```bash
-# Default (SIMD enabled on x86_64)
+# Default (SIMD enabled on x86_64, AVX2 detected at runtime; NEON on aarch64 at compile-time)
 cargo build --release
 
 # Disable SIMD for portability
 cargo build --release --no-default-features
-
-# Force SIMD on compatible CPU
-RUSTFLAGS="-C target-feature=+avx2" cargo build --release
 ```
 
 **How to Check SIMD is Working:**
@@ -612,13 +622,12 @@ RUSTFLAGS="-C target-feature=+avx2" cargo build --release
 1. **Filter heuristic:** Testing all 16 filters is O(16n) per block/tile
    - Solution: Shannon entropy (cheaper than real compression)
    - Future: Smart heuristic that skips unlikely filters
-   - **SIMD helps**: Filters 1-3 are now 4-8x faster
+   - **SIMD helps**: Filters 1-14 are now 4-8x faster
 
 2. **Decompression without dictionary:** ZSTD slow without context
-   - Solution: zDIC chunk for small images
+   - Solution: zDIC chunk for small images; `auto_dictionary` non-regression guarantee (v1.5) ensures it's only used when it actually helps
 
-3. **Sub-byte packing:** Lots of bit-by-bit arithmetic
-   - Solution: SIMD/vectorization (partially done for filters; can extend to pack/unpack)
+3. **Encode time vs. tile size:** larger tiles compress slightly better but reduce parallelism (rayon splits work per tile) — `DEFAULT_TILE_ROWS=64` is a deliberately tuned balance, not a compression-only optimum (see `tests/tile_rows_benchmark.rs`, v1.5)
 
 ### Performance Tips
 
@@ -635,15 +644,15 @@ RUSTFLAGS="-C target-feature=+avx2" cargo build --release
 
 ### High-Potential Areas
 
-1. **SIMD for sub-byte packing** — Extend AVX2 to `pack/unpack_samples_row` (currently scalar)
+1. **SIMD for sub-byte packing** — Extend AVX2/NEON to the scalar-only parts of `pack/unpack_samples_row` (partially vectorized as of v1.4)
 2. **Real ARM hardware validation on physical devices** — QEMU emulation (v1.4.1) already caught and fixed one real NEON bug; running the suite on actual ARM64 hardware (Raspberry Pi, mobile, Apple Silicon) would add confidence beyond emulation (e.g. timing-sensitive or alignment-sensitive behavior QEMU might not reproduce exactly)
-3. **Real 2D tiling (iDIM)** — Implemented; evolve with preview/progressive streaming
+3. **Advanced 2D tiling** — iDIM with per-tile IDAT already implemented; evolve with preview/progressive streaming
 4. **Optimized interlace** — Adam7 and even/odd already supported; optimize progressiveness and SIMD of passes
-5. **Optimized indexed palette** — Currently uses nearest-neighbor; could use k-means
-6. **Automatic ZSTD dictionary** — Train dictionary for small images
+5. **Optimized indexed palette** — `NearestNeighbor`, `MedianCut`, and a perceptually-weighted `NearestNeighborWeighted` (redmean distance, v1.5) already exist; could still use k-means clustering for the palette-building step itself
+6. **Automatic ZSTD dictionary** — Train dictionary for small images (non-regression guarantee already added in v1.5)
 7. **Tone-mapping on encode (SDR→HDR)** — Inverse of decode; operator selection via CLI
 8. **More robust tests** — Adversarial files, fuzzing
-9. **Benchmarking** — Performance vs PNG, JPEG, WebP
+9. **Benchmarking** — Performance vs PNG, JPEG, WebP (real compression regression tests + Criterion benches already added in v1.5)
 
 ---
 
@@ -681,4 +690,4 @@ cargo doc --open
 
 ---
 
-**Last updated:** August 11, 2026 (v1.2.1: SIMD fully integrated, tone-mapping operator dispatcher, 252 comprehensive tests) | **Project version:** v1.2.1
+**Last updated:** September 2, 2026 (v1.5: compression-focused audit — per-row predictive filter, dictionary non-regression guarantee, redmean-weighted palette, compression regression CI gate) | **Project version:** v1.5.0

@@ -7,7 +7,7 @@
 
 A modern chunk-based image format inspired by PNG, with support for ZSTD compression, advanced predictive filters (16 types), indexed palette, structured metadata (EXIF, JSON, ICC, XMP), and progressive interlacing.
 
-**Version**: 1.2.1  
+**Version**: 1.5.0  
 **Status**: ✅ Complete, audited, and SIMD-accelerated  
 **Compatibility**: Rust 2021+
 
@@ -22,8 +22,9 @@ A modern chunk-based image format inspired by PNG, with support for ZSTD compres
 
 ### Advanced Predictive Filters
 - **16 filter types**: None, Sub, Up, Average, Paeth, MED, Gradient, Simple Median, 2nd Order, 4-way Directional (4 variants), Context-Based, TR-Directional (WebP Predictor 10), and adaptive Weighted (inspired by JPEG-XL)
-- Applied per block (tile) for maximum efficiency
-- **AVX2 SIMD acceleration** (v1.1+): Filters 1 (Sub), 2 (Up), 3 (Average) vectorized for 4-8x faster processing; automatic CPU detection with scalar fallback
+- Applied per block/tile (Filter method=2) or **per row** (Filter method=3, v1.5, finer-grained adaptation)
+- **AVX2 SIMD acceleration** (v1.1+): Filters 1-14 vectorized for 4-8x faster processing; automatic CPU detection with scalar fallback
+- **ARM NEON SIMD acceleration** (v1.3-v1.4): all 14 vectorized filters plus pack/unpack, sample conversion, byte-shuffle, and palette quantization ported to NEON — no SIMD module is AVX2-only anymore
 - **v1.2 Aggressive SIMD**: Pack/Unpack 1/2/4-bit (8-16x), Sample expansion/reduction 8→16/32 float (4-6x), Byte-shuffle with blocking (10-20% cache improvement), Filter 3 enhanced (4-6x)
 - Automatic selection via heuristic: **Shannon Entropy** (default), **MSAD** (`--filter-heuristic msad`), **real compression test** (`--filter-heuristic test`), **QuickPrune** (v1.1, fast MSAD + Entropy on top 8), or **AdaptiveEntropy** (v1.1, content-aware analysis)
 
@@ -42,6 +43,12 @@ A modern chunk-based image format inspired by PNG, with support for ZSTD compres
 - **iDIM**: Real 2D tiling with IDAT per tile, row-major or Z-order (Morton) scan order
 - **Interlacing**: Adam7 (7 passes) or Even/Odd (2 passes)
 - Incremental decoding (chunk-by-chunk)
+
+### Compression Audit (v1.5)
+- **Per-row predictive filter** (`Filter method=3`): finer-grained adaptation than per-tile filtering
+- **`auto_dictionary` non-regression guarantee**: an auto-trained ZSTD dictionary is only used when it strictly shrinks the file, checked per-`IDAT` and whole-file
+- **Perceptually-weighted palette quantization**: `PaletteAlgorithm::NearestNeighborWeighted` using the redmean distance formula
+- **Real compression benchmarks + CI regression gate**: `tests/compression_regression.rs` and `benches/encode_decode.rs`
 
 ### Security
 - ✅ Decompression bomb protection (CWE-409)
@@ -69,9 +76,11 @@ cafe/
 │   ├── codec.rs                   # ZSTD compression with fallback (section 3.2)
 │   ├── color.rs                   # Color conversions, pack/unpack, float/half
 │   ├── filter.rs                  # 16 predictive filters + heuristics (with SIMD integration)
-│   ├── simd.rs                    # AVX2 vectorized filters 1-3 (v1.1+, optional feature)
-│   ├── simd_packing.rs            # AVX2 pack/unpack for 1/2/4-bit samples (v1.2+)
-│   ├── simd_sample_conversion.rs  # AVX2 8→16/32 expansion, 16/32→8 reduction (v1.2+)
+│   ├── simd.rs                    # AVX2/NEON vectorized filters 1-14 (v1.1+, optional feature)
+│   ├── simd_packing.rs            # AVX2/NEON pack/unpack for 1/2/4-bit samples (v1.2+)
+│   ├── simd_sample_conversion.rs  # AVX2/NEON 8→16/32 expansion, 16/32→8 reduction (v1.2+)
+│   ├── simd_quantize.rs           # AVX2/NEON nearest-palette search (v1.2+)
+│   ├── simd_shuffle.rs            # AVX2/NEON byte-shuffle table lookup (v1.2+)
 │   ├── shuffle.rs                 # Byte-shuffle (Filter Method=1, v1.1)
 │   ├── tonemap.rs                 # HDR tone-mapping (EOTF, primaries, operators, v1.1)
 │   ├── interlace.rs               # Adam7 and even/odd
@@ -81,8 +90,8 @@ cafe/
 │   ├── cafe-encode.rs            # Encoder binary
 │   └── cafe-decode.rs            # Decoder binary
 ├── docs/                          # Documentation
-│   ├── CAFE-spec.md              # Complete specification (v1.2)
-│   ├── CAFE-spec.pt.md           # Portuguese version of the spec (v1.2)
+│   ├── CAFE-spec.md              # Complete specification (v1.1, updated through v1.5)
+│   ├── CAFE-spec.pt.md           # Portuguese version of the spec
 │   ├── SECURITY_AUDIT.md         # Security audit
 │   └── DEVELOPER_GUIDE.md        # Developer guide
 ├── tests/                         # Integration and round-trip tests
@@ -265,6 +274,10 @@ Contributions welcome! High-potential areas:
 - [x] Indexed palette with median-cut — *complete in v1.1* (`--palette-algorithm`)
 - [x] **SIMD in sub-byte packing** — *complete in v1.2.1* (pack/unpack 1/2/4-bit, 8-16x speedup, integrated into encode/decode pipeline)
 - [x] **NEON support (ARM SIMD)** — *complete in v1.3-v1.4*: Filters 1-14 (v1.3) plus pack/unpack, sample conversion, byte-shuffle, and palette quantization (v1.4) — no SIMD module is AVX2-only anymore
+- [x] **Per-row predictive filter** — *complete in v1.5* (`Filter method=3`, finer-grained adaptation than per-tile)
+- [x] **Automatic ZSTD dictionary non-regression guarantee** — *complete in v1.5* (`auto_dictionary` only used when it strictly shrinks the file)
+- [x] **Perceptually-weighted palette quantization** — *complete in v1.5* (`PaletteAlgorithm::NearestNeighborWeighted`, redmean distance)
+- [x] **Real compression benchmarks + CI regression gate** — *complete in v1.5* (`tests/compression_regression.rs`, `benches/encode_decode.rs`)
 
 ---
 
@@ -280,7 +293,8 @@ Contributions welcome! High-potential areas:
 | **v1.4** | **ARM NEON SIMD extended to all remaining modules**: pack/unpack, sample conversion, byte-shuffle, palette quantization — no SIMD module is AVX2-only anymore | ✅ Complete |
 | **v1.4.1** | **Real ARM execution validation (QEMU emulation)**: full test suite run natively on aarch64 for the first time — found and fixed a real NEON index-calculation bug that cross-compile checks alone couldn't catch | ✅ Complete |
 | **v1.4.2** | **CI: ARM64 cross-compile check** — new `aarch64-cross-compile` job runs `cargo check`/`clippy --target aarch64-unknown-linux-gnu` on every push/PR, preventing future aarch64 regressions from merging unnoticed | ✅ Complete |
-| **Future** | Real hardware validation on physical ARM devices, additional compressors, enhanced progressive streaming | 🔮 Planned |
+| **v1.5** | **Compression-focused audit (5 items)**: per-row predictive filter (`Filter method=3`), real compression benchmarks + CI regression gate, `auto_dictionary` non-regression guarantee, perceptually-weighted palette quantization (redmean distance), `DEFAULT_TILE_ROWS` retuning investigation (kept at 64, documented trade-off) | ✅ Complete |
+| **Future** | Real hardware validation on physical ARM devices, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR) | 🔮 Planned |
 
 ---
 
@@ -312,6 +326,6 @@ Architecture, specification, Rust reference implementation (v1.1)
 
 ---
 
-**Last updated**: 2026-08-11 (v1.2.1: SIMD fully integrated, tone-mapping operator dispatcher, 252 comprehensive tests)  
-**Test Coverage**: 197 unit tests + 6 roundtrip integration tests + 49 SIMD-specific tests = 252 total  
+**Last updated**: 2026-09-02 (v1.5: compression-focused audit — per-row predictive filter, dictionary non-regression guarantee, redmean-weighted palette, compression regression CI gate)  
+**Test Coverage**: 288 lib tests + 12 integration test suites (roundtrip, SIMD, compression regression, dictionary regression, palette algorithm, tile_rows benchmarks, etc.)  
 **Next security audit**: 2027-08-04
