@@ -350,15 +350,74 @@ pub struct EncodeOptions {
 
 ```rust
 pub fn decode(input_path: &str, output_path: &str) -> Result<DecodeResult>
+pub fn decode_bytes(buf: &[u8]) -> Result<(Vec<u8>, DecodeResult)> // pixels + metadata
 
 pub struct DecodeResult {
     pub width: u32,
     pub height: u32,
-    pub pixels: Vec<u8>, // RGBA
     pub exif: Option<Vec<u8>>,
     pub json_metadata: HashMap<String, Value>,
+    pub compression_stats: Option<CompressionStats>,
+    pub icc_profile: Option<Vec<u8>>,
+    pub xmp_metadata: Option<String>,
+    pub zstd_dictionary: Option<Vec<u8>>,
+    pub chdr_metadata: Option<cHDR>,
 }
 ```
+
+Note: `DecodeResult` does not carry the pixel buffer itself — `decode_bytes`
+returns pixels as the first element of a tuple, and `decode` writes them
+directly to `output_path` instead.
+
+#### Streaming Decoder (`Decoder<R: Read>`, v1.5+)
+
+For large images or memory-constrained environments, `Decoder<R: Read>`
+decodes tile-by-tile directly off any `Read` source (file, socket, in-memory
+`Cursor`) instead of requiring the whole compressed file (`decode_bytes`'s
+`&[u8]`) or the whole decoded image to be materialized in memory up front.
+
+```rust
+pub struct Decoder<R: Read> { /* ... */ }
+
+impl<R: Read> Decoder<R> {
+    pub fn new(reader: R) -> Self
+    pub fn with_tonemap_operator(reader: R, tonemap_operator: ToneMapOperator) -> Self
+    pub fn read_info(&mut self) -> Result<DecodeInfo>       // reads signature + all pre-IDAT chunks
+    pub fn next_tile(&mut self) -> Result<Option<Tile>>     // one IDAT -> one Tile, None at IEND
+    pub fn finish(self) -> Result<DecodeResult>             // drains remaining IDATs, returns metadata
+}
+
+pub struct DecodeInfo {
+    pub width: u32,
+    pub height: u32,
+    pub color_type: u8,
+    pub bit_depth: u8,
+    pub sample_format: u8,
+    pub supports_streaming_tiles: bool, // false for iDIM (2D tiling) or interlaced files
+}
+
+pub struct Tile {
+    pub x: u32, pub y: u32, pub width: u32, pub height: u32,
+    pub pixels: Vec<u8>, // width * height * 4 bytes RGBA, already color-converted
+}
+```
+
+**Call order**: `read_info()` exactly once, then `next_tile()` in a loop
+until `Ok(None)`, then optionally `finish()` for ancillary metadata.
+`next_tile()` returns `UnsupportedFeature` for files with `iDIM` (2D tiling)
+or Adam7/even-odd interlacing — check `DecodeInfo::supports_streaming_tiles`
+first and fall back to `decode`/`decode_bytes` for those. See
+`examples/streaming_decode.rs` for a complete runnable example.
+
+**Implementation note**: built entirely on top of the same private
+`DecodeState`/`handle_*_chunk` functions and the CWE-409 decompression
+budget used by `decode_bytes_internal` — `chunk::read_chunk_from` (a
+`Read`-based counterpart to the slice-based `read_chunk`) is the only new
+low-level primitive; everything else (per-tile color conversion, filter
+reversal, budget enforcement) is shared, not duplicated. `decode_bytes`/
+`decode`/`decode_bytes_internal` themselves are unchanged and still operate
+on an in-memory `&[u8]` — `Decoder<R>` is an additional, independent API,
+not a replacement.
 
 ### Color Conversion Functions
 

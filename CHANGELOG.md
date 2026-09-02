@@ -9,12 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Streaming decoder (`Decoder<R: Read>`)**: decodes a CAFE file tile-by-tile directly off any `Read` source (file, socket, in-memory `Cursor`) instead of requiring the whole compressed file or the whole decoded image to be materialized in memory up front, unlike `decode`/`decode_bytes`. API: `Decoder::new(reader)` / `with_tonemap_operator(reader, op)`, `read_info() -> Result<DecodeInfo>` (reads the signature and every pre-`IDAT` chunk: `IHDR`, `iDIM`, `cHDR`, `eXIF`, `jSON`, `iCCP`, `xMPd`, `zDIC`, `PLTE`), `next_tile() -> Result<Option<Tile>>` (one `IDAT` in, one RGBA `Tile` out, `Ok(None)` at `IEND`), `finish(self) -> Result<DecodeResult>` (drains any remaining `IDAT`s and returns the same ancillary metadata `decode_bytes` returns). New public types `DecodeInfo` and `Tile` in `src/types.rs`.
+  - Built entirely on the existing private `DecodeState`/`handle_*_chunk` machinery and the CWE-409 cumulative decompression budget — the only new low-level primitive is `chunk::read_chunk_from<R: Read>`, a `Read`-based counterpart to the existing slice-based `read_chunk`. `decode_bytes`/`decode`/`decode_bytes_internal` are unchanged and still operate on an in-memory `&[u8]`; `Decoder<R>` is an additional, independent API, not a replacement.
+  - **Limitation (v1 of this API)**: `next_tile()` does not support 2D tiling (`iDIM`) or interlaced (Adam7/even-odd) files — it returns `Err(CafeError::UnsupportedFeature(..))` for those; check `DecodeInfo::supports_streaming_tiles` up front and fall back to `decode_bytes`/`decode` if `false`.
+  - New example: `examples/streaming_decode.rs`. Documented in `README.md`/`README.pt.md` ("Intelligent Streaming" / "Library API" sections) and `AGENTS.md`.
+  - 311 lib tests (up from 303), covering `read_info()`/`next_tile()`/`finish()` parity against `decode_bytes()` (direct-color and indexed-palette paths), call-order errors, truncated-stream handling, and `iDIM` rejection.
+
 ### Planned (Future)
 - Real ARM hardware validation on physical devices (Raspberry Pi, mobile, Apple Silicon) beyond QEMU emulation
 - Cache-friendly blocking in scalar byte-shuffle fallback
 - Runtime CPU detection for optional SIMD forcing
 - k-means palette quantization algorithm (clustering-based, as opposed to the greedy/median-cut/redmean-weighted strategies already implemented)
 - Tone-mapping on encode (SDR → HDR inverse operation), including operator selection via CLI
+- `Decoder<R: Read>::next_tile()` support for 2D tiling (`iDIM`) and interlaced (Adam7/even-odd) files
 
 ---
 

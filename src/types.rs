@@ -1,5 +1,61 @@
 //! Main CAFE types: data structures for chunks, metadata and options.
 
+/// A single decoded tile, already converted to RGBA — the unit of
+/// incremental output a future streaming `Decoder<R: Read>` will yield one
+/// at a time via `next_tile()` (see AGENTS.md "Streaming" discussion),
+/// instead of requiring the whole image to be assembled in memory before
+/// any pixels are available to the caller.
+///
+/// `(x, y)` is the pixel offset of the tile's top-left corner within the
+/// full image; `pixels` holds exactly `width * height * 4` bytes of RGBA
+/// data (8 bits/channel), regardless of the file's original color type,
+/// bit depth, or sample format — the same normalization
+/// `DecodeResult`/`decode_bytes` already apply to the whole image.
+///
+/// Two tile layouts currently produce a `Tile`:
+/// - **Row-strip (default, no `iDIM`)**: `x` is always `0`, `width` is
+///   always the full image width, and `height` is the number of rows
+///   carried by that particular `IDAT` (matches the encoder's
+///   `tile_rows`-based horizontal-strip tiling, section 4.3 of the spec).
+/// - **2D tiling (`iDIM` present)**: `x`/`y`/`width`/`height` describe the
+///   tile's actual rectangular region, which may be smaller than
+///   `tile_width`/`tile_height` at the right/bottom edges of the image
+///   (section 4.2 of the spec).
+///
+/// Interlaced images (Adam7/even-odd) do not currently produce `Tile`s —
+/// an interlace pass is not a spatial rectangle and cannot be converted to
+/// a standalone RGBA sub-image without the other passes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tile {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    /// RGBA pixel data, `width * height * 4` bytes, row-major, top-to-bottom.
+    pub pixels: Vec<u8>,
+}
+
+/// Geometry and format metadata returned by `Decoder::read_info()` —
+/// everything a streaming caller can learn *before* any pixel data (`IDAT`)
+/// has been read off the stream, e.g. to size buffers or pick a code path
+/// ahead of calling `next_tile()` in a loop.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodeInfo {
+    pub width: u32,
+    pub height: u32,
+    pub color_type: u8,
+    pub bit_depth: u8,
+    pub sample_format: u8,
+    /// `false` if the file uses 2D tiling (`iDIM`) or interlacing (Adam7 /
+    /// even-odd) — `Decoder::next_tile()` does not support either case (see
+    /// `Tile`'s doc comment above: an iDIM tile has different geometry than
+    /// a row-strip, and an interlace pass is not a spatial rectangle at
+    /// all) and will return `Err(CafeError::UnsupportedFeature(..))` on the
+    /// first call for such a file. Callers that need those cases must fall
+    /// back to `decode_bytes`/`decode` (the whole-image API) instead.
+    pub supports_streaming_tiles: bool,
+}
+
 /// Palette entry (RGB or RGBA)
 #[derive(Clone, Debug, PartialEq)]
 pub struct PaletteEntry {

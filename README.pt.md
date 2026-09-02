@@ -43,6 +43,7 @@ Um formato de imagem moderno baseado em chunks, inspirado em PNG, com suporte a 
 - **iDIM**: Tiling 2D real com IDAT por tile, scan order row-major ou Z-order (Morton)
 - **Entrelaçamento**: Adam7 (7 passes) ou Par/Ímpar (2 passes)
 - Decodificação incremental (chunk-by-chunk)
+- **API de streaming `Decoder<R: Read>`**: decodifica tile por tile diretamente de qualquer fonte `Read` (arquivo, socket, `Cursor`) sem armazenar o arquivo comprimido inteiro nem a imagem decodificada inteira em memória — veja `examples/streaming_decode.rs` e a seção "API de Biblioteca" abaixo (apenas tiling row-strip; recai para `decode`/`decode_bytes` em arquivos com tiling 2D ou entrelaçados)
 
 ### Auditoria de Compressão (v1.5)
 - **Filtro preditivo por linha** (`Filter method=3`): adaptação mais granular que o filtro por tile
@@ -176,6 +177,29 @@ let result = decode("output.cafe", "output.png")?;
 println!("EXIF: {:?}", result.exif);
 println!("JSON: {:?}", result.json_metadata);
 ```
+
+#### Decodificação em streaming (imagens grandes / pouca memória)
+
+```rust
+use cafe::Decoder;
+use std::fs::File;
+
+let file = File::open("output.cafe")?;
+let mut decoder = Decoder::new(file);
+
+let info = decoder.read_info()?; // lê IHDR + todos os chunks antes do IDAT
+if info.supports_streaming_tiles {
+    while let Some(tile) = decoder.next_tile()? {
+        // tile.pixels: tile.width * tile.height * 4 bytes de RGBA
+    }
+}
+let result = decoder.finish()?; // metadados EXIF/JSON/ICC/XMP/HDR
+```
+
+Veja `examples/streaming_decode.rs` para um exemplo completo executável,
+incluindo o caminho de fallback para arquivos com tiling 2D (`iDIM`) ou
+entrelaçamento, que `next_tile()` não suporta (verifique
+`info.supports_streaming_tiles`).
 
 ### CLI
 

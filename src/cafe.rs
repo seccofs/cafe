@@ -44,8 +44,8 @@ mod tonemap;
 pub use error::{CafeError, Result};
 pub use tonemap::ToneMapOperator;
 pub use types::{
-    cHDR, iDim, DecodeResult, EncodeOptions, FilterHeuristic, Palette, PaletteAlgorithm,
-    PaletteEntry,
+    cHDR, iDim, DecodeInfo, DecodeResult, EncodeOptions, FilterHeuristic, Palette,
+    PaletteAlgorithm, PaletteEntry, Tile,
 };
 
 use crate::constants::*;
@@ -71,9 +71,10 @@ use crate::codec::{
     decompress_chunk_dict_limited,
 };
 
-use crate::chunk::{read_chunk, write_chunk};
+use crate::chunk::{read_chunk, read_chunk_from, write_chunk, ReadChunk};
 
 use std::collections::HashMap;
+use std::io::Read;
 
 use rayon::prelude::*;
 use serde_json::Value;
@@ -941,6 +942,72 @@ struct ReconstructParams<'a> {
     tonemap_operator: tonemap::ToneMapOperator,
 }
 
+/// Converts a buffer of raw (post-deinterlace, post-filter-undo) pixel bytes
+/// in the file's native color_type/bit_depth/sample_format to a standalone
+/// RGBA buffer (`width * height * 4` bytes) — palette dequantization,
+/// float/half sample reduction, and HDR tone-mapping all happen here.
+///
+/// This is "Step 2" of whole-image reconstruction (see
+/// `reconstruct_final_pixels`, which calls this after deinterlacing), but it
+/// is deliberately parameterized on a plain `(data, width, height)` triple
+/// rather than a whole `DecodeState`/`ReconstructParams`, so the exact same
+/// conversion logic can also be applied to a single tile's raw bytes (see
+/// the `decode_tile_*` family below) without duplicating this dispatch —
+/// the two call sites can never diverge on how a given
+/// color_type/bit_depth/sample_format combination gets converted to RGBA.
+#[allow(clippy::too_many_arguments)]
+fn convert_raw_to_rgba(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    color_type: u8,
+    bit_depth: u8,
+    sample_format: u8,
+    palette: Option<&Palette>,
+    chdr: Option<&cHDR>,
+    tonemap_operator: tonemap::ToneMapOperator,
+) -> Result<Vec<u8>> {
+    if color_type == COLOR_TYPE_INDEXED {
+        if let Some(pal) = palette {
+            Ok(dequantize_from_palette(data, pal, width, height))
+        } else {
+            Err(CafeError::UnsupportedFeature(
+                "Color type=3 found without PLTE chunk".into(),
+            ))
+        }
+    } else if sample_format == SAMPLE_FORMAT_FLOAT && chdr.is_some() {
+        // v1.1: HDR tone-mapping — converts linear HDR float → SDR sRGB 8-bit
+        let target = 0u8; // 0=sRGB, 1=Rec.709, 2=DCI-P3, 3=Linear
+        tonemap::apply_tone_mapping_to_image(
+            data,
+            width,
+            height,
+            chdr.unwrap(),
+            target,
+            tonemap_operator,
+        )
+    } else if sample_format == SAMPLE_FORMAT_FLOAT || sample_format == SAMPLE_FORMAT_HALF {
+        // float/half: reduces samples to 8 bits and converts color → RGBA
+        convert_color_type_to_rgba_with_format(
+            data,
+            width,
+            height,
+            color_type,
+            bit_depth,
+            sample_format,
+        )
+    } else {
+        // uint: convert back to RGBA
+        let _bpp_from_color = bytes_per_pixel(color_type, bit_depth).ok_or_else(|| {
+            CafeError::UnsupportedFeature(format!(
+                "Color type {}, bit depth {} not supported in output conversion",
+                color_type, bit_depth
+            ))
+        })?;
+        convert_color_type_to_rgba(data, width, height, color_type, bit_depth)
+    }
+}
+
 /// Reconstructs final RGBA image from pixel data (refactoring v1.1).
 /// Handles interlace deinterlacing, palette dequantization, color type conversion,
 /// and HDR tone-mapping. Returns final RGBA pixel buffer.
@@ -955,59 +1022,17 @@ fn reconstruct_final_pixels(pixel_rows: Vec<u8>, params: &ReconstructParams) -> 
     };
 
     // Step 2: Convert to RGBA based on color type and sample format
-    if params.color_type == COLOR_TYPE_INDEXED {
-        if let Some(pal) = params.palette {
-            Ok(dequantize_from_palette(
-                &pixel_rows,
-                pal,
-                params.width,
-                params.height,
-            ))
-        } else {
-            Err(CafeError::UnsupportedFeature(
-                "Color type=3 found without PLTE chunk".into(),
-            ))
-        }
-    } else if params.sample_format == SAMPLE_FORMAT_FLOAT && params.chdr.is_some() {
-        // v1.1: HDR tone-mapping — converts linear HDR float → SDR sRGB 8-bit
-        let target = 0u8; // 0=sRGB, 1=Rec.709, 2=DCI-P3, 3=Linear
-        tonemap::apply_tone_mapping_to_image(
-            &pixel_rows,
-            params.width,
-            params.height,
-            params.chdr.unwrap(),
-            target,
-            params.tonemap_operator,
-        )
-    } else if params.sample_format == SAMPLE_FORMAT_FLOAT
-        || params.sample_format == SAMPLE_FORMAT_HALF
-    {
-        // float/half: reduces samples to 8 bits and converts color → RGBA
-        convert_color_type_to_rgba_with_format(
-            &pixel_rows,
-            params.width,
-            params.height,
-            params.color_type,
-            params.bit_depth,
-            params.sample_format,
-        )
-    } else {
-        // uint: convert back to RGBA
-        let _bpp_from_color =
-            bytes_per_pixel(params.color_type, params.bit_depth).ok_or_else(|| {
-                CafeError::UnsupportedFeature(format!(
-                    "Color type {}, bit depth {} not supported in output conversion",
-                    params.color_type, params.bit_depth
-                ))
-            })?;
-        convert_color_type_to_rgba(
-            &pixel_rows,
-            params.width,
-            params.height,
-            params.color_type,
-            params.bit_depth,
-        )
-    }
+    convert_raw_to_rgba(
+        &pixel_rows,
+        params.width,
+        params.height,
+        params.color_type,
+        params.bit_depth,
+        params.sample_format,
+        params.palette,
+        params.chdr,
+        params.tonemap_operator,
+    )
 }
 
 /// Decodes a CAFE buffer (bytes) and returns pixels + metadata.
@@ -1061,6 +1086,14 @@ struct DecodeState {
     // tile would make decoding an N-tile image O(N^2)/O(N^2 log N) overall.
     idim_tile_order: Option<Vec<(u16, u16)>>,
     chdr: Option<cHDR>, // cHDR chunk (v1.0, ancillary, HDR metadata)
+    // Number of image rows already produced by previous IDATs in the
+    // row-strip (non-iDIM, non-indexed-cap-tracked) case. Used only by the
+    // per-tile decode path (`decode_idat_as_tile`, v1.5+ streaming-prep
+    // refactor) to compute a `Tile`'s `y` offset — the whole-image
+    // accumulation path (`handle_idat_indexed`/`handle_idat_direct_color`)
+    // derives the same information implicitly from `state.pixel_rows.len()`
+    // and does not need this counter.
+    tile_rows_seen: usize,
 }
 
 impl Default for DecodeState {
@@ -1089,6 +1122,7 @@ impl Default for DecodeState {
             tiles_seen: 0,
             idim_tile_order: None,
             chdr: None,
+            tile_rows_seen: 0,
         }
     }
 }
@@ -1750,13 +1784,205 @@ fn handle_idat_tile_idim(state: &mut DecodeState, tile_payload: Vec<u8>) -> Resu
     Ok(())
 }
 
+/// Undoes byte-shuffle and predictive/per-row-predictive filtering for a
+/// single non-interlaced, non-2D-tiled (row-strip or whole-image) IDAT
+/// payload. Shared by `handle_idat_indexed`, `handle_idat_direct_color`, and
+/// the per-tile streaming-prep path (`decode_idat_as_tile_row_strip`) so the
+/// three call sites can never diverge on how a payload's
+/// byte-shuffle/predictive-filter combination gets reversed.
+///
+/// `bpp_for_filter` is the bytes-per-pixel used for both byte-shuffle and
+/// the predictive filter's neighbor math — always `1` for indexed (operates
+/// on packed index bytes, not unpacked samples), or `bytes_per_pixel
+/// (color_type, bit_depth)` for direct color types.
+///
+/// Returns `(tile_raw, tile_h)`: `tile_raw` is `tile_h *
+/// state.bytes_per_row` bytes of packed row data (still packed for
+/// sub-byte-depth indexed — callers unpack separately), and `tile_h` is the
+/// number of image rows recovered from this single payload.
+fn undo_tile_filters(
+    state: &DecodeState,
+    tile_payload: Vec<u8>,
+    bpp_for_filter: usize,
+) -> Result<(Vec<u8>, usize)> {
+    let img_width = state.width.ok_or(CafeError::MissingIhdr)?;
+    let bytes_per_row = state.bytes_per_row;
+
+    // v1.1: Byte-shuffle undone before other filters. Byte-shuffle
+    // reorders bytes but never changes the payload length, so computing
+    // `tile_h` from the (still-shuffled) payload length below is safe
+    // regardless of whether it happens before or after this step.
+    let tile_payload = if state.filter_method == FILTER_METHOD_BYTE_SHUFFLE {
+        let tile_h = tile_payload.len() / bytes_per_row.max(1);
+        shuffle::undo_byte_shuffle(&tile_payload, bpp_for_filter, img_width, tile_h as u32)?
+    } else {
+        tile_payload
+    };
+
+    let tile_h = if state.filter_method == FILTER_METHOD_PREDICTIVE {
+        // v1.0: 1 filter byte prefixed per block/tile (not per row)
+        tile_payload.len().saturating_sub(1) / bytes_per_row
+    } else if state.filter_method == FILTER_METHOD_PREDICTIVE_PER_ROW {
+        // v1.5: 1 filter byte prefixed per row (not per tile)
+        tile_payload.len() / bytes_per_row.saturating_add(1).max(1)
+    } else {
+        tile_payload.len() / bytes_per_row
+    };
+
+    let tile_raw = if state.filter_method == FILTER_METHOD_PREDICTIVE {
+        undo_predictive_filter(&tile_payload, tile_h, bytes_per_row, bpp_for_filter)?
+    } else if state.filter_method == FILTER_METHOD_PREDICTIVE_PER_ROW {
+        undo_predictive_filter_per_row(&tile_payload, tile_h, bytes_per_row, bpp_for_filter)?
+    } else {
+        tile_payload
+    };
+
+    Ok((tile_raw, tile_h))
+}
+
+/// Decodes a single non-interlaced, non-iDIM IDAT payload into a standalone
+/// row-strip `Tile`, already converted to RGBA — the per-tile analogue of
+/// `handle_idat_indexed`/`handle_idat_direct_color`, which instead append
+/// their raw (pre-RGBA-conversion) output to `state.pixel_rows` for later
+/// whole-image reconstruction.
+///
+/// This function does **not** touch `state.pixel_rows` at all — it is
+/// intended for a future streaming `Decoder<R: Read>::next_tile()` that
+/// yields tiles one at a time without ever materializing the whole image in
+/// memory, so it must not depend on (or feed) the whole-image accumulation
+/// path. It *does* read/update `state.tile_rows_seen` (this payload's `y`
+/// offset within the full image) and the shared CWE-409 decompression
+/// budget fields on `state`, exactly like the whole-image handlers, since
+/// those protections must apply identically regardless of which output path
+/// is used.
+///
+/// Reuses `undo_tile_filters` (byte-shuffle/predictive-filter reversal,
+/// shared with the whole-image handlers) and `convert_raw_to_rgba` (color
+/// conversion/palette dequantization/HDR tone-mapping, shared with
+/// `reconstruct_final_pixels`) — the only code unique to this function is
+/// computing the tile's row count/`y` offset and unpacking indexed samples
+/// per-row (mirroring `handle_idat_indexed`'s loop, since
+/// `convert_raw_to_rgba` expects unpacked bytes, not bit-packed indices).
+///
+/// # Panics / errors
+/// Returns `CafeError::UnsupportedFeature` if `state.idim.is_some()` (2D
+/// tiling has its own tile geometry — see `handle_idat_tile_idim` — and is
+/// not row-strip shaped) or if the interlace method is not `INTERLACE_NONE`
+/// (an interlace pass is not a spatial rectangle; see the `Tile` doc
+/// comment in `src/types.rs`).
+///
+/// Called by `decode_idat_chunk_as_tile_row_strip` below, which in turn is
+/// the function `Decoder::next_tile()` calls once per `IDAT` chunk.
+fn decode_idat_as_tile_row_strip(
+    state: &mut DecodeState,
+    tile_payload: Vec<u8>,
+    tonemap_operator: tonemap::ToneMapOperator,
+) -> Result<Tile> {
+    if state.idim.is_some() {
+        return Err(CafeError::UnsupportedFeature(
+            "decode_idat_as_tile_row_strip: 2D tiling (iDIM) uses its own tile geometry, \
+             not row-strip tiling"
+                .into(),
+        ));
+    }
+    if state.interlace_method_read != INTERLACE_NONE {
+        return Err(CafeError::UnsupportedFeature(
+            "decode_idat_as_tile_row_strip: interlaced images do not produce row-strip tiles"
+                .into(),
+        ));
+    }
+
+    let img_width = state.width.ok_or(CafeError::MissingIhdr)?;
+    let img_height = state.height.ok_or(CafeError::MissingIhdr)?;
+    let y0 = state.tile_rows_seen;
+
+    let raw_rgba_input = if state.color_type == COLOR_TYPE_INDEXED {
+        // SECURITY (§4.1.2/CWE-369): same PLTE-before-IDAT requirement as
+        // `handle_idat_indexed`.
+        if state.palette.is_none() {
+            return Err(CafeError::TruncatedFile(
+                "Color type=3 requires PLTE chunk before first IDAT".into(),
+            ));
+        }
+        let (tile_packed, tile_h) = undo_tile_filters(state, tile_payload, 1)?;
+        let row_width = img_width as usize;
+        let mut indices = Vec::with_capacity(tile_h.saturating_mul(row_width));
+        for r in 0..tile_h {
+            let row_packed = &tile_packed[r * state.bytes_per_row..(r + 1) * state.bytes_per_row];
+            let row_indices = unpack_indices_row(row_packed, state.bit_depth, row_width)?;
+            indices.extend_from_slice(&row_indices);
+        }
+        (indices, tile_h)
+    } else {
+        let bpp_for_filter =
+            bytes_per_pixel(state.color_type, state.bit_depth).ok_or_else(|| {
+                CafeError::UnsupportedFeature(format!(
+                    "Color type {}, bit depth {} not supported",
+                    state.color_type, state.bit_depth
+                ))
+            })?;
+        undo_tile_filters(state, tile_payload, bpp_for_filter)?
+    };
+    let (raw_data, tile_h) = raw_rgba_input;
+
+    // SECURITY (CWE-400): a row-strip tile can never carry more rows than
+    // the image still has left, mirroring the accumulation caps in
+    // `handle_idat_indexed`/`handle_idat_direct_color`.
+    let img_height_usize = img_height as usize;
+    let new_y = y0
+        .checked_add(tile_h)
+        .ok_or_else(|| CafeError::TruncatedFile("overflow accumulating tile rows".into()))?;
+    if new_y > img_height_usize {
+        return Err(CafeError::TruncatedFile(format!(
+            "Excess IDAT: row-strip tile exceeds declared height \
+             {img_height_usize} (tile rows {y0}..{new_y})"
+        )));
+    }
+
+    let pixels = convert_raw_to_rgba(
+        &raw_data,
+        img_width,
+        tile_h as u32,
+        state.color_type,
+        state.bit_depth,
+        state.sample_format,
+        state.palette.as_ref(),
+        state.chdr.as_ref(),
+        tonemap_operator,
+    )?;
+
+    state.tile_rows_seen = new_y;
+
+    Ok(Tile {
+        x: 0,
+        y: y0 as u32,
+        width: img_width,
+        height: tile_h as u32,
+        pixels,
+    })
+}
+
+/// Decompresses a single raw IDAT chunk (flag+data, as read straight off the
+/// file/stream) and decodes it into a row-strip `Tile` — the per-tile
+/// analogue of `handle_idat_chunk`'s non-interlaced/non-iDIM branch. This is
+/// the function `Decoder::next_tile()` calls once per `IDAT` chunk read off
+/// the stream via `chunk::read_chunk_from`.
+fn decode_idat_chunk_as_tile_row_strip(
+    state: &mut DecodeState,
+    flag: u8,
+    data: &[u8],
+    tonemap_operator: tonemap::ToneMapOperator,
+) -> Result<Tile> {
+    let decompressed = decompress_idat_payload(state, flag, data)?;
+    decode_idat_as_tile_row_strip(state, decompressed, tonemap_operator)
+}
+
 /// Handles a non-interlaced, non-tiled IDAT payload for `color_type=3`
 /// (Indexed): undoes byte-shuffle/predictive filter, unpacks each row back
 /// to 1 byte/index, and appends to `state.pixel_rows` with an explicit
 /// CWE-400 accumulation cap derived from the IHDR dimensions.
 fn handle_idat_indexed(state: &mut DecodeState, tile_payload: Vec<u8>) -> Result<()> {
     // IDAT contains indices packed in bit_depth bits (or filtered)
-    // v1.0: the predictive filter prefixes 1 byte per block/tile (not per row)
     // SECURITY (§4.1.2/CWE-369): color_type=3 requires a PLTE chunk before
     // any IDAT; without it bytes_per_row is 0 and the division below
     // would panic. Reject with a recoverable error.
@@ -1765,30 +1991,9 @@ fn handle_idat_indexed(state: &mut DecodeState, tile_payload: Vec<u8>) -> Result
             "Color type=3 requires PLTE chunk before first IDAT".into(),
         ));
     }
-    // v1.1: Byte-shuffle undone before other filters
-    let tile_payload = if state.filter_method == FILTER_METHOD_BYTE_SHUFFLE {
-        let img_width = state.width.ok_or(CafeError::MissingIhdr)?;
-        let img_height = state.height.ok_or(CafeError::MissingIhdr)?;
-        let bpp = 1; // Indexed always 1 byte/pixel (before pack)
-        shuffle::undo_byte_shuffle(&tile_payload, bpp, img_width, img_height)?
-    } else {
-        tile_payload
-    };
-    let tile_h = if state.filter_method == FILTER_METHOD_PREDICTIVE {
-        tile_payload.len().saturating_sub(1) / state.bytes_per_row
-    } else if state.filter_method == FILTER_METHOD_PREDICTIVE_PER_ROW {
-        // v1.5: 1 filter byte prefixed per row (not per tile)
-        tile_payload.len() / state.bytes_per_row.saturating_add(1).max(1)
-    } else {
-        tile_payload.len() / state.bytes_per_row
-    };
-    let tile_packed = if state.filter_method == FILTER_METHOD_PREDICTIVE {
-        undo_predictive_filter(&tile_payload, tile_h, state.bytes_per_row, 1)?
-    } else if state.filter_method == FILTER_METHOD_PREDICTIVE_PER_ROW {
-        undo_predictive_filter_per_row(&tile_payload, tile_h, state.bytes_per_row, 1)?
-    } else {
-        tile_payload
-    };
+    // Indexed always operates on 1 byte/pixel (packed index) for both
+    // byte-shuffle and the predictive filter, regardless of bit_depth.
+    let (tile_packed, tile_h) = undo_tile_filters(state, tile_payload, 1)?;
     // Unpack each row back to 1 byte/index
     // (bit_depth==8 is a trivial case inside unpack_indices_row)
     let row_width = state.width.ok_or(CafeError::MissingIhdr)? as usize;
@@ -1832,28 +2037,7 @@ fn handle_idat_direct_color(state: &mut DecodeState, tile_payload: Vec<u8>) -> R
         ))
     })?;
 
-    // v1.1: Byte-shuffle undone before the predictive filter
-    let tile_payload = if state.filter_method == FILTER_METHOD_BYTE_SHUFFLE {
-        let img_width = state.width.ok_or(CafeError::MissingIhdr)?;
-        // tile_h derived from the payload (without the prefixed filter byte):
-        // each row has bytes_per_row bytes, so height = len / stride
-        let tile_h = tile_payload.len() / state.bytes_per_row.max(1);
-        shuffle::undo_byte_shuffle(&tile_payload, bpp_for_filter, img_width, tile_h as u32)?
-    } else {
-        tile_payload
-    };
-
-    let tile_raw = if state.filter_method == FILTER_METHOD_PREDICTIVE {
-        // v1.0: 1 filter byte per block/tile
-        let tile_h = tile_payload.len().saturating_sub(1) / state.bytes_per_row;
-        undo_predictive_filter(&tile_payload, tile_h, state.bytes_per_row, bpp_for_filter)?
-    } else if state.filter_method == FILTER_METHOD_PREDICTIVE_PER_ROW {
-        // v1.5: 1 filter byte per row
-        let tile_h = tile_payload.len() / state.bytes_per_row.saturating_add(1).max(1);
-        undo_predictive_filter_per_row(&tile_payload, tile_h, state.bytes_per_row, bpp_for_filter)?
-    } else {
-        tile_payload
-    };
+    let (tile_raw, _tile_h) = undo_tile_filters(state, tile_payload, bpp_for_filter)?;
     // SECURITY (CWE-400): prevents accumulation of pixel rows beyond
     // the declared size (multiple-IDAT bomb).
     let img_height = state.height.ok_or(CafeError::MissingIhdr)? as usize;
@@ -1878,14 +2062,15 @@ fn handle_idat_direct_color(state: &mut DecodeState, tile_payload: Vec<u8>) -> R
     Ok(())
 }
 
-/// Handles the IDAT chunk (pixel data): enforces the cumulative
-/// decompression budget (CWE-409), then dispatches to the interlaced,
-/// tiled (iDIM), indexed, or direct-color handler depending on the state
-/// accumulated so far from IHDR/iDIM/PLTE.
-fn handle_idat_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) -> Result<()> {
-    // SECURITY (CWE-409): the decompression cap for this IDAT is the
-    // remaining budget (computed from the IHDR). A single IDAT cannot
-    // expand beyond what the image still needs.
+/// Decompresses a single IDAT chunk's payload, enforcing the cumulative
+/// decompression budget (CWE-409): the cap for this IDAT is whatever
+/// remains of the whole-image budget (derived from the IHDR) after
+/// previous IDATs, so multiple IDATs can never together decompress to more
+/// than the image actually needs. Shared by `handle_idat_chunk` (whole-image
+/// accumulation path) and the per-tile streaming-prep path
+/// (`decode_idat_as_tile_row_strip`'s callers), since this protection must
+/// apply identically regardless of which output path consumes the result.
+fn decompress_idat_payload(state: &mut DecodeState, flag: u8, data: &[u8]) -> Result<Vec<u8>> {
     let budget = state
         .decompress_budget
         .ok_or_else(|| CafeError::TruncatedFile("IDAT before IHDR".into()))?;
@@ -1896,6 +2081,15 @@ fn handle_idat_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) -> Result<(
         .decompressed_total
         .checked_add(decompressed.len() as u64)
         .ok_or_else(|| CafeError::TruncatedFile("overflow in decompressed total".into()))?;
+    Ok(decompressed)
+}
+
+/// Handles the IDAT chunk (pixel data): enforces the cumulative
+/// decompression budget (CWE-409), then dispatches to the interlaced,
+/// tiled (iDIM), indexed, or direct-color handler depending on the state
+/// accumulated so far from IHDR/iDIM/PLTE.
+fn handle_idat_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) -> Result<()> {
+    let decompressed = decompress_idat_payload(state, flag, data)?;
 
     // v1.0/+5: If interlaced, extract pass_number from the prefix
     if state.interlace_method_read == INTERLACE_ADAM7
@@ -2015,6 +2209,313 @@ fn decode_bytes_internal(
     };
 
     Ok((final_pixels, result))
+}
+
+/// Dispatches a single ancillary/PLTE/iDIM chunk (everything except
+/// `IHDR`/`IDAT`/`IEND`, which the two `Decoder` loops below handle
+/// specially since their behavior differs between `read_info()` and
+/// `finish()`'s drain loop). Shared so the two loops' chunk-type matches
+/// can never drift out of sync on what is recognized/ignored/rejected —
+/// mirrors the fallback arm of `decode_bytes_internal`'s single big match
+/// (critical unknown chunk -> error, ancillary unknown chunk -> ignore,
+/// section 3.1).
+fn dispatch_ancillary_chunk(state: &mut DecodeState, chunk: &ReadChunk) -> Result<()> {
+    match &chunk.chunk_type {
+        t if t == CHUNK_PLTE => handle_plte_chunk(state, chunk.flag, &chunk.data)?,
+        t if t == CHUNK_EXIF => handle_exif_chunk(state, chunk.flag, &chunk.data)?,
+        t if t == CHUNK_JSON => handle_json_chunk(state, chunk.flag, &chunk.data)?,
+        t if t == CHUNK_ICCP => handle_iccp_chunk(state, chunk.flag, &chunk.data),
+        t if t == CHUNK_XMPD => handle_xmpd_chunk(state, chunk.flag, &chunk.data),
+        t if t == CHUNK_ZDIC => handle_zdic_chunk(state, chunk.flag, &chunk.data),
+        t if t == CHUNK_IDIM => handle_idim_chunk(state, chunk.flag, &chunk.data)?,
+        t if t == CHUNK_CHDR => handle_chdr_chunk(state, chunk.flag, &chunk.data),
+        t => {
+            // Unknown chunk: ancillary (1st letter lowercase) -> ignore;
+            // critical (uppercase) -> error (section 3.1). This also
+            // catches a misplaced/duplicate IHDR here, since IHDR is not
+            // matched above — reported as "unknown critical chunk" rather
+            // than a more specific message, but still correctly rejected.
+            if t[0].is_ascii_uppercase() {
+                return Err(CafeError::UnsupportedFeature(format!(
+                    "unknown critical chunk: {:?}",
+                    String::from_utf8_lossy(t)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Streaming decoder over any `Read` source (file, socket, in-memory
+/// `Cursor`, etc.) — decodes one tile at a time instead of requiring the
+/// whole compressed file to be materialized in memory up front, unlike
+/// `decode`/`decode_bytes` (which call `std::fs::read`/expect an
+/// already-fully-buffered `&[u8]`).
+///
+/// # Usage
+/// ```no_run
+/// use cafe::Decoder;
+/// use std::fs::File;
+///
+/// # fn main() -> Result<(), cafe::CafeError> {
+/// let file = File::open("input.cafe")?;
+/// let mut decoder = Decoder::new(file);
+/// let info = decoder.read_info()?;
+/// println!("{}x{}", info.width, info.height);
+/// while let Some(tile) = decoder.next_tile()? {
+///     // tile.pixels is tile.width * tile.height * 4 RGBA bytes
+/// }
+/// let result = decoder.finish()?;
+/// # let _ = result;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Call order
+/// `read_info()` must be called exactly once, before any call to
+/// `next_tile()`; `next_tile()` is then called in a loop until it returns
+/// `Ok(None)`; `finish()` may be called at any point afterward (even before
+/// `next_tile()` has returned `Ok(None)`, in which case it drains and
+/// discards any remaining `IDAT`s — still subject to the CWE-409
+/// decompression budget — until `IEND`) to obtain the same ancillary
+/// metadata (`eXIF`/`jSON`/`iCCP`/`xMPd`/`zDIC`/`cHDR`) that
+/// `decode_bytes`/`decode` return in their `DecodeResult`.
+///
+/// # Limitations (v1 of this API)
+/// - Does **not** support 2D tiling (`iDIM`) or interlaced (Adam7/even-odd)
+///   files: `next_tile()` returns `Err(CafeError::UnsupportedFeature(..))`
+///   on every call for such a file (`read_info()` itself still succeeds, so
+///   callers can check `DecodeInfo::supports_streaming_tiles` up front and
+///   fall back to `decode_bytes`/`decode` instead of calling `next_tile()`
+///   at all).
+/// - Relies on the file honoring section 9's mandatory chunk order (all
+///   ancillary chunks and `PLTE` appear before the first `IDAT`): a
+///   spec-nonconforming file that places one of those chunks *after* an
+///   `IDAT` will have it silently ignored by `next_tile()`/`finish()` — the
+///   ancillary contract (section 3.1) already permits ignoring ancillary
+///   chunks unconditionally, and this streaming decoder additionally
+///   relies on their expected position to know when it's safe to stop
+///   looking for them. `decode_bytes`/`decode`, which see the whole file
+///   at once, do not have this limitation.
+pub struct Decoder<R: Read> {
+    reader: R,
+    state: DecodeState,
+    tonemap_operator: tonemap::ToneMapOperator,
+    /// `Some` once `read_info()` has completed successfully. Guards against
+    /// calling `next_tile()` before `read_info()`, and against calling
+    /// `read_info()` a second time.
+    info: Option<DecodeInfo>,
+    /// `read_info()` must read one chunk past the pre-IDAT metadata to know
+    /// whether to stop (it stops at the first `IDAT` or at `IEND`) — if
+    /// that chunk was an `IDAT`, it is stashed here for the first
+    /// `next_tile()` call to consume instead of re-reading from `reader`.
+    pending_idat: Option<ReadChunk>,
+    /// Set once `IEND` has been observed (by `read_info()`, `next_tile()`,
+    /// or `finish()`'s drain loop), making `next_tile()` idempotent
+    /// (`Ok(None)` forever after) instead of erroring on a second call
+    /// past the end of the stream.
+    finished: bool,
+}
+
+impl<R: Read> Decoder<R> {
+    /// Creates a new streaming decoder over `reader`, using the default
+    /// tone-map operator (Filmic — same default as `EncodeOptions`/
+    /// `decode_bytes`). Nothing is read from `reader` until `read_info()`
+    /// is called.
+    pub fn new(reader: R) -> Self {
+        Self::with_tonemap_operator(reader, tonemap::ToneMapOperator::Filmic)
+    }
+
+    /// Creates a new streaming decoder over `reader` with an explicit
+    /// tone-map operator (relevant only for HDR content with a `cHDR`
+    /// chunk) — the streaming equivalent of `decode_bytes_with_opts`.
+    pub fn with_tonemap_operator(reader: R, tonemap_operator: tonemap::ToneMapOperator) -> Self {
+        Decoder {
+            reader,
+            state: DecodeState::default(),
+            tonemap_operator,
+            info: None,
+            pending_idat: None,
+            finished: false,
+        }
+    }
+
+    /// Reads the signature and every chunk up to (but not including) the
+    /// first `IDAT` — i.e. `IHDR`, and any of `iDIM`/`cHDR`/`eXIF`/`jSON`/
+    /// `iCCP`/`xMPd`/`zDIC`/`PLTE` that are present — and returns the
+    /// resulting geometry/format info. Must be called exactly once, before
+    /// any call to `next_tile()`.
+    ///
+    /// If the file has no `IDAT` at all (`IEND` appears immediately after
+    /// the pre-IDAT chunks — a degenerate but not inherently malformed
+    /// case, e.g. truly empty streaming input), `next_tile()` will simply
+    /// return `Ok(None)` on its first call rather than this function
+    /// erroring.
+    pub fn read_info(&mut self) -> Result<DecodeInfo> {
+        if self.info.is_some() {
+            return Err(CafeError::UnsupportedFeature(
+                "Decoder::read_info() called more than once".into(),
+            ));
+        }
+
+        let mut sig = [0u8; 9];
+        self.reader.read_exact(&mut sig).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                CafeError::TruncatedFile(
+                    "stream ended before the 9-byte signature could be read".into(),
+                )
+            } else {
+                CafeError::Io(e)
+            }
+        })?;
+        if sig != SIGNATURE {
+            return Err(CafeError::InvalidSignature);
+        }
+
+        let mut ihdr_seen = false;
+        loop {
+            let chunk = read_chunk_from(&mut self.reader)?.ok_or_else(|| {
+                CafeError::TruncatedFile("stream ended before the first IDAT/IEND chunk".into())
+            })?;
+            match &chunk.chunk_type {
+                t if t == CHUNK_IHDR => {
+                    handle_ihdr_chunk(&mut self.state, &chunk.data)?;
+                    ihdr_seen = true;
+                }
+                t if t == CHUNK_IDAT => {
+                    self.pending_idat = Some(chunk);
+                    break;
+                }
+                t if t == CHUNK_IEND => {
+                    self.finished = true;
+                    break;
+                }
+                _ => dispatch_ancillary_chunk(&mut self.state, &chunk)?,
+            }
+        }
+
+        if !ihdr_seen {
+            return Err(CafeError::MissingIhdr);
+        }
+
+        let width = self.state.width.ok_or(CafeError::MissingIhdr)?;
+        let height = self.state.height.ok_or(CafeError::MissingIhdr)?;
+        let supports_streaming_tiles =
+            self.state.idim.is_none() && self.state.interlace_method_read == INTERLACE_NONE;
+
+        let info = DecodeInfo {
+            width,
+            height,
+            color_type: self.state.color_type,
+            bit_depth: self.state.bit_depth,
+            sample_format: self.state.sample_format,
+            supports_streaming_tiles,
+        };
+        self.info = Some(info.clone());
+        Ok(info)
+    }
+
+    /// Reads and decodes the next `IDAT` chunk into a standalone RGBA
+    /// `Tile`, or returns `Ok(None)` once `IEND` has been reached (safe to
+    /// call again after that point — always returns `Ok(None)`).
+    ///
+    /// # Errors
+    /// - `UnsupportedFeature` if called before `read_info()`.
+    /// - `UnsupportedFeature` if the file uses 2D tiling (`iDIM`) or
+    ///   interlacing — check `DecodeInfo::supports_streaming_tiles` (from
+    ///   `read_info()`'s return value) before calling this in a loop, and
+    ///   fall back to `decode_bytes`/`decode` if `false`.
+    /// - Any error `chunk::read_chunk_from`/the per-tile decode pipeline
+    ///   can return (CRC mismatch, truncation, decompression-budget
+    ///   exceeded, unknown critical chunk, etc.)
+    pub fn next_tile(&mut self) -> Result<Option<Tile>> {
+        let info = self.info.as_ref().ok_or_else(|| {
+            CafeError::UnsupportedFeature("Decoder::next_tile() called before read_info()".into())
+        })?;
+        if !info.supports_streaming_tiles {
+            return Err(CafeError::UnsupportedFeature(
+                "Decoder::next_tile() does not support 2D tiling (iDIM) or interlaced \
+                 images in this version; use decode_bytes()/decode() for this file"
+                    .into(),
+            ));
+        }
+        if self.finished {
+            return Ok(None);
+        }
+
+        let chunk = if let Some(chunk) = self.pending_idat.take() {
+            chunk
+        } else {
+            loop {
+                let chunk = read_chunk_from(&mut self.reader)?
+                    .ok_or_else(|| CafeError::TruncatedFile("stream ended before IEND".into()))?;
+                match &chunk.chunk_type {
+                    t if t == CHUNK_IDAT => break chunk,
+                    t if t == CHUNK_IEND => {
+                        self.finished = true;
+                        return Ok(None);
+                    }
+                    _ => dispatch_ancillary_chunk(&mut self.state, &chunk)?,
+                }
+            }
+        };
+
+        let tile = decode_idat_chunk_as_tile_row_strip(
+            &mut self.state,
+            chunk.flag,
+            &chunk.data,
+            self.tonemap_operator,
+        )?;
+        Ok(Some(tile))
+    }
+
+    /// Consumes the decoder and returns the accumulated ancillary metadata
+    /// (`eXIF`/`jSON`/`iCCP`/`xMPd`/`zDIC`/`cHDR`) as a `DecodeResult`, the
+    /// same struct `decode_bytes`/`decode` return alongside their pixel
+    /// buffer (here, the pixels were already handed out incrementally via
+    /// `next_tile()`, so `DecodeResult` is all that's left to return).
+    ///
+    /// May be called before `next_tile()` has returned `Ok(None)`: any
+    /// remaining `IDAT`s are decompressed (respecting the CWE-409 budget)
+    /// and discarded — not decoded into `Tile`s — up through `IEND`.
+    ///
+    /// # Errors
+    /// `MissingIhdr` if `read_info()` was never called (or failed before
+    /// reaching `IHDR`). Otherwise, any error the underlying chunk reads
+    /// can return (same as `next_tile()`).
+    pub fn finish(mut self) -> Result<DecodeResult> {
+        while !self.finished {
+            let chunk = read_chunk_from(&mut self.reader)?
+                .ok_or_else(|| CafeError::TruncatedFile("stream ended before IEND".into()))?;
+            match &chunk.chunk_type {
+                t if t == CHUNK_IDAT => {
+                    // Caller stopped calling next_tile() before IEND (or
+                    // next_tile() was never called at all, e.g. an
+                    // unsupported-tiling file): decompress-and-discard,
+                    // still enforcing the decompression budget so a
+                    // malicious tail can't bypass CWE-409 protection.
+                    decompress_idat_payload(&mut self.state, chunk.flag, &chunk.data)?;
+                }
+                t if t == CHUNK_IEND => self.finished = true,
+                _ => dispatch_ancillary_chunk(&mut self.state, &chunk)?,
+            }
+        }
+
+        let width = self.state.width.ok_or(CafeError::MissingIhdr)?;
+        let height = self.state.height.ok_or(CafeError::MissingIhdr)?;
+
+        Ok(DecodeResult {
+            width,
+            height,
+            exif: self.state.exif,
+            json_metadata: self.state.json_metadata,
+            compression_stats: None,
+            icc_profile: self.state.icc_profile,
+            xmp_metadata: self.state.xmp_metadata,
+            zstd_dictionary: self.state.zstd_dictionary,
+            chdr_metadata: self.state.chdr,
+        })
+    }
 }
 
 /// Decodes a CAFE buffer with custom decode options (tone-map operator selection, etc.)
@@ -4951,6 +5452,502 @@ mod tests {
             .into_raw();
 
         assert_eq!(img_data, decoded, "Round-trip compression test failed");
+    }
+
+    /// Test helper for the Fase 2 (streaming-prep) parity tests below:
+    /// manually walks a `.cafe` file's chunks (mirroring
+    /// `decode_bytes_internal`'s loop but stopping short of accumulating
+    /// into `state.pixel_rows`), decoding each `IDAT` via
+    /// `decode_idat_chunk_as_tile_row_strip` instead of
+    /// `handle_idat_indexed`/`handle_idat_direct_color`. Returns the
+    /// collected tiles in file order (which is `y` order for row-strip
+    /// tiling, section 4.3 of the spec). Panics (via `expect`) on any
+    /// decode error — acceptable in a test helper operating on
+    /// freshly-encoded, trusted input.
+    fn decode_all_tiles_row_strip(buf: &[u8]) -> Vec<Tile> {
+        assert_eq!(
+            &buf[0..9],
+            &SIGNATURE,
+            "test file must start with signature"
+        );
+        let mut offset = 9;
+        let mut state = DecodeState::default();
+        let mut tiles: Vec<Tile> = Vec::new();
+        loop {
+            let chunk = read_chunk(buf, offset).expect("chunk read failed");
+            offset = chunk.next_offset;
+            match &chunk.chunk_type {
+                t if t == CHUNK_IHDR => {
+                    handle_ihdr_chunk(&mut state, &chunk.data).expect("IHDR handling failed")
+                }
+                t if t == CHUNK_PLTE => handle_plte_chunk(&mut state, chunk.flag, &chunk.data)
+                    .expect("PLTE handling failed"),
+                t if t == CHUNK_ZDIC => handle_zdic_chunk(&mut state, chunk.flag, &chunk.data),
+                t if t == CHUNK_CHDR => handle_chdr_chunk(&mut state, chunk.flag, &chunk.data),
+                t if t == CHUNK_IDIM => handle_idim_chunk(&mut state, chunk.flag, &chunk.data)
+                    .expect("iDIM handling failed"),
+                t if t == CHUNK_IDAT => {
+                    let tile = decode_idat_chunk_as_tile_row_strip(
+                        &mut state,
+                        chunk.flag,
+                        &chunk.data,
+                        crate::tonemap::ToneMapOperator::Filmic,
+                    )
+                    .expect("per-tile IDAT decode failed");
+                    tiles.push(tile);
+                }
+                t if t == CHUNK_IEND => break,
+                _ => {} // eXIF/jSON/iCCP/xMPd and unknown ancillary chunks: irrelevant here
+            }
+        }
+        tiles
+    }
+
+    /// Asserts `tiles` (in `y` order) reassemble, via simple row-major
+    /// copy, into exactly `expected_rgba` — the shared assertion body for
+    /// the direct-color and indexed row-strip parity tests below.
+    fn assert_tiles_reassemble_to(tiles: &[Tile], width: u32, height: u32, expected_rgba: &[u8]) {
+        assert!(!tiles.is_empty(), "expected at least one tile");
+        let mut reassembled = vec![0u8; expected_rgba.len()];
+        let mut rows_covered = 0u32;
+        for tile in tiles {
+            assert_eq!(tile.x, 0, "row-strip tile must start at x=0");
+            assert_eq!(tile.width, width, "row-strip tile must span full width");
+            assert_eq!(tile.y, rows_covered, "tiles must be contiguous, in order");
+            assert_eq!(
+                tile.pixels.len(),
+                (tile.width * tile.height * 4) as usize,
+                "tile pixel buffer size must match width*height*4"
+            );
+            let dst_start = (tile.y * width * 4) as usize;
+            let dst_end = dst_start + tile.pixels.len();
+            reassembled[dst_start..dst_end].copy_from_slice(&tile.pixels);
+            rows_covered += tile.height;
+        }
+        assert_eq!(
+            rows_covered, height,
+            "tiles must cover the whole image height"
+        );
+        assert_eq!(
+            reassembled, expected_rgba,
+            "per-tile decode must match whole-image decode pixel-for-pixel"
+        );
+    }
+
+    /// Fase 2 (streaming-prep) parity test, direct-color path (RGBA): the
+    /// concatenation of tiles produced by `decode_idat_chunk_as_tile_row_strip`
+    /// must be byte-for-byte identical to what `decode_bytes()` produces for
+    /// the same file. This is the regression test guarding the new per-tile
+    /// decode path introduced for the future streaming `Decoder<R: Read>` —
+    /// a divergence here would mean `next_tile()` silently produces
+    /// different pixels than the existing whole-image decoder.
+    #[test]
+    fn test_decode_idat_as_tile_row_strip_matches_whole_image_decode() {
+        let width = 48u32;
+        let height = 37u32; // deliberately not a multiple of tile_rows
+        let mut img_data = vec![0u8; (width * height * 4) as usize];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = ((y * width + x) * 4) as usize;
+                img_data[idx] = (x * 3) as u8;
+                img_data[idx + 1] = (y * 5) as u8;
+                img_data[idx + 2] = ((x + y) % 256) as u8;
+                img_data[idx + 3] = 255;
+            }
+        }
+
+        let img = image::RgbaImage::from_raw(width, height, img_data.clone())
+            .expect("failed to create image");
+        let temp_dir = std::env::temp_dir();
+        let input_path = temp_dir
+            .join("test_tile_parity_input.png")
+            .to_string_lossy()
+            .to_string();
+        img.save(&input_path).expect("failed to save PNG");
+
+        let opts = EncodeOptions {
+            use_filter: true,
+            tile_rows: 8, // multiple row-strip tiles, including a partial last one
+            level: 10,
+            ..EncodeOptions::default()
+        };
+        let cafe_path = temp_dir
+            .join("test_tile_parity.cafe")
+            .to_string_lossy()
+            .to_string();
+        encode(&input_path, &cafe_path, &opts).expect("failed to encode");
+
+        let buf = std::fs::read(&cafe_path).expect("failed to read encoded file");
+        let (whole_image_pixels, whole_image_result) =
+            decode_bytes(&buf).expect("whole-image decode failed");
+
+        let tiles = decode_all_tiles_row_strip(&buf);
+        assert_tiles_reassemble_to(&tiles, width, height, &whole_image_pixels);
+        assert_eq!(whole_image_result.width, width);
+        assert_eq!(whole_image_result.height, height);
+    }
+
+    /// Fase 2 (streaming-prep) parity test, indexed-palette path
+    /// (`color_type=3`): same guarantee as
+    /// `test_decode_idat_as_tile_row_strip_matches_whole_image_decode`, but
+    /// exercising `decode_idat_as_tile_row_strip`'s indexed branch (palette
+    /// dequantization + sub-byte-depth index unpacking per row) instead of
+    /// the direct-color branch.
+    #[test]
+    fn test_decode_idat_as_tile_row_strip_matches_whole_image_decode_indexed() {
+        let width = 40u32;
+        let height = 33u32; // deliberately not a multiple of tile_rows
+        let mut img_data = vec![0u8; (width * height * 4) as usize];
+        // Few solid colors (< 256) so quantization is lossless.
+        let colors = [
+            [255u8, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 0, 255],
+        ];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = ((y * width + x) * 4) as usize;
+                let c = colors[((x + y) as usize) % colors.len()];
+                img_data[idx..idx + 4].copy_from_slice(&c);
+            }
+        }
+
+        let img = image::RgbaImage::from_raw(width, height, img_data.clone())
+            .expect("failed to create image");
+        let temp_dir = std::env::temp_dir();
+        let input_path = temp_dir
+            .join("test_tile_parity_indexed_input.png")
+            .to_string_lossy()
+            .to_string();
+        img.save(&input_path).expect("failed to save PNG");
+
+        let opts = EncodeOptions {
+            use_filter: true,
+            tile_rows: 8, // multiple row-strip tiles, including a partial last one
+            level: 10,
+            ..EncodeOptions::default()
+        };
+        let cafe_path = temp_dir
+            .join("test_tile_parity_indexed.cafe")
+            .to_string_lossy()
+            .to_string();
+        encode_indexed(&input_path, &cafe_path, &opts).expect("failed to encode_indexed");
+
+        let buf = std::fs::read(&cafe_path).expect("failed to read encoded file");
+        let (whole_image_pixels, whole_image_result) =
+            decode_bytes(&buf).expect("whole-image decode failed");
+
+        let tiles = decode_all_tiles_row_strip(&buf);
+        assert_tiles_reassemble_to(&tiles, width, height, &whole_image_pixels);
+        assert_eq!(whole_image_result.width, width);
+        assert_eq!(whole_image_result.height, height);
+    }
+
+    // --- Tests for Phase 3: `Decoder<R: Read>` streaming API ---
+
+    /// Builds a small encoded CAFE file (row-strip, non-indexed) and
+    /// returns its bytes, for `Decoder<R>` tests that don't need to vary
+    /// dimensions/content — kept separate from
+    /// `decode_all_tiles_row_strip`'s own test fixtures above since those
+    /// are tied to specific width/height/content per test.
+    fn build_simple_cafe_bytes(width: u32, height: u32, tile_rows: u32) -> Vec<u8> {
+        let mut img_data = vec![0u8; (width * height * 4) as usize];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = ((y * width + x) * 4) as usize;
+                img_data[idx] = (x * 7) as u8;
+                img_data[idx + 1] = (y * 11) as u8;
+                img_data[idx + 2] = ((x + y) % 256) as u8;
+                img_data[idx + 3] = 255;
+            }
+        }
+        let img =
+            image::RgbaImage::from_raw(width, height, img_data).expect("failed to create image");
+        let temp_dir = std::env::temp_dir();
+        let input_path = temp_dir
+            .join(format!(
+                "test_decoder_stream_input_{width}x{height}_{tile_rows}.png"
+            ))
+            .to_string_lossy()
+            .to_string();
+        img.save(&input_path).expect("failed to save PNG");
+
+        let opts = EncodeOptions {
+            use_filter: true,
+            tile_rows,
+            level: 5,
+            ..EncodeOptions::default()
+        };
+        let cafe_path = temp_dir
+            .join(format!(
+                "test_decoder_stream_{width}x{height}_{tile_rows}.cafe"
+            ))
+            .to_string_lossy()
+            .to_string();
+        encode(&input_path, &cafe_path, &opts).expect("failed to encode");
+        std::fs::read(&cafe_path).expect("failed to read encoded file")
+    }
+
+    /// `read_info()` must report the same width/height as the whole-image
+    /// decoder, and `supports_streaming_tiles` must be `true` for a plain
+    /// row-strip (non-iDIM, non-interlaced) file.
+    #[test]
+    fn test_decoder_read_info_matches_whole_image_dimensions() {
+        let buf = build_simple_cafe_bytes(48, 37, 8);
+        let (_pixels, whole_result) = decode_bytes(&buf).expect("whole-image decode failed");
+
+        let cursor = std::io::Cursor::new(buf.as_slice());
+        let mut decoder = Decoder::new(cursor);
+        let info = decoder.read_info().expect("read_info failed");
+
+        assert_eq!(info.width, whole_result.width);
+        assert_eq!(info.height, whole_result.height);
+        assert_eq!(info.color_type, COLOR_TYPE_RGBA);
+        assert_eq!(info.bit_depth, 8);
+        assert!(info.supports_streaming_tiles);
+    }
+
+    /// Calling `next_tile()` in a loop until `Ok(None)` must reassemble to
+    /// exactly the same pixels as `decode_bytes()` — the core end-to-end
+    /// guarantee of the streaming API, exercised over a real `Read`
+    /// (`Cursor`) rather than calling the per-tile helper functions
+    /// directly (unlike `decode_all_tiles_row_strip`, which bypasses
+    /// `Decoder` entirely).
+    #[test]
+    fn test_decoder_next_tile_loop_matches_whole_image_decode() {
+        let buf = build_simple_cafe_bytes(48, 37, 8);
+        let (whole_pixels, whole_result) = decode_bytes(&buf).expect("whole-image decode failed");
+
+        let cursor = std::io::Cursor::new(buf.as_slice());
+        let mut decoder = Decoder::new(cursor);
+        let info = decoder.read_info().expect("read_info failed");
+        assert!(info.supports_streaming_tiles);
+
+        let mut tiles = Vec::new();
+        while let Some(tile) = decoder.next_tile().expect("next_tile failed") {
+            tiles.push(tile);
+        }
+        // Idempotent after exhaustion.
+        assert!(decoder
+            .next_tile()
+            .expect("next_tile after None failed")
+            .is_none());
+
+        assert_tiles_reassemble_to(&tiles, info.width, info.height, &whole_pixels);
+        assert_eq!(info.width, whole_result.width);
+        assert_eq!(info.height, whole_result.height);
+    }
+
+    /// Same end-to-end guarantee, indexed-palette path (`color_type=3`):
+    /// `PLTE` must be consumed correctly by `read_info()` before the first
+    /// `next_tile()` call.
+    #[test]
+    fn test_decoder_next_tile_loop_matches_whole_image_decode_indexed() {
+        let width = 40u32;
+        let height = 33u32;
+        let mut img_data = vec![0u8; (width * height * 4) as usize];
+        let colors = [
+            [255u8, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 0, 255],
+        ];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = ((y * width + x) * 4) as usize;
+                let c = colors[((x + y) as usize) % colors.len()];
+                img_data[idx..idx + 4].copy_from_slice(&c);
+            }
+        }
+        let img =
+            image::RgbaImage::from_raw(width, height, img_data).expect("failed to create image");
+        let temp_dir = std::env::temp_dir();
+        let input_path = temp_dir
+            .join("test_decoder_stream_indexed_input.png")
+            .to_string_lossy()
+            .to_string();
+        img.save(&input_path).expect("failed to save PNG");
+
+        let opts = EncodeOptions {
+            use_filter: true,
+            tile_rows: 8,
+            level: 5,
+            ..EncodeOptions::default()
+        };
+        let cafe_path = temp_dir
+            .join("test_decoder_stream_indexed.cafe")
+            .to_string_lossy()
+            .to_string();
+        encode_indexed(&input_path, &cafe_path, &opts).expect("failed to encode_indexed");
+        let buf = std::fs::read(&cafe_path).expect("failed to read encoded file");
+
+        let (whole_pixels, _whole_result) = decode_bytes(&buf).expect("whole-image decode failed");
+
+        let cursor = std::io::Cursor::new(buf.as_slice());
+        let mut decoder = Decoder::new(cursor);
+        let info = decoder.read_info().expect("read_info failed");
+        assert_eq!(info.color_type, COLOR_TYPE_INDEXED);
+        assert!(info.supports_streaming_tiles);
+
+        let mut tiles = Vec::new();
+        while let Some(tile) = decoder.next_tile().expect("next_tile failed") {
+            tiles.push(tile);
+        }
+        assert_tiles_reassemble_to(&tiles, width, height, &whole_pixels);
+    }
+
+    /// `finish()` must return the same ancillary metadata (`eXIF`/`jSON`)
+    /// that `decode_bytes_with_opts` returns in its `DecodeResult`,
+    /// regardless of whether it's called after draining all tiles via
+    /// `next_tile()` or immediately after `read_info()` (mid-stream,
+    /// draining the remaining IDATs itself).
+    #[test]
+    fn test_decoder_finish_returns_same_metadata_as_whole_image_decode() {
+        let width = 16u32;
+        let height = 16u32;
+        let img_data = vec![128u8; (width * height * 4) as usize];
+        let img =
+            image::RgbaImage::from_raw(width, height, img_data).expect("failed to create image");
+        let temp_dir = std::env::temp_dir();
+        let input_path = temp_dir
+            .join("test_decoder_finish_input.png")
+            .to_string_lossy()
+            .to_string();
+        img.save(&input_path).expect("failed to save PNG");
+
+        let mut json_metadata = HashMap::new();
+        json_metadata.insert("test".to_string(), serde_json::json!({"hello": "world"}));
+        let opts = EncodeOptions {
+            use_filter: true,
+            tile_rows: 4,
+            level: 5,
+            exif: Some(vec![0x49, 0x49, 0x2A, 0x00, 0, 0, 0, 0]), // minimal fake TIFF/EXIF header
+            json_metadata,
+            ..EncodeOptions::default()
+        };
+        let cafe_path = temp_dir
+            .join("test_decoder_finish.cafe")
+            .to_string_lossy()
+            .to_string();
+        encode(&input_path, &cafe_path, &opts).expect("failed to encode");
+        let buf = std::fs::read(&cafe_path).expect("failed to read encoded file");
+
+        let (_whole_pixels, whole_result) =
+            decode_bytes_with_opts(&buf, &opts).expect("whole-image decode failed");
+
+        // Case 1: drain all tiles first, then finish().
+        let cursor = std::io::Cursor::new(buf.as_slice());
+        let mut decoder = Decoder::new(cursor);
+        decoder.read_info().expect("read_info failed");
+        while decoder.next_tile().expect("next_tile failed").is_some() {}
+        let result = decoder.finish().expect("finish failed");
+        assert_eq!(result.width, whole_result.width);
+        assert_eq!(result.height, whole_result.height);
+        assert_eq!(result.exif, whole_result.exif);
+        assert_eq!(result.json_metadata, whole_result.json_metadata);
+
+        // Case 2: finish() immediately after read_info(), without ever
+        // calling next_tile() — must still drain remaining IDATs (subject
+        // to the CWE-409 budget) and reach the same metadata.
+        let cursor2 = std::io::Cursor::new(buf.as_slice());
+        let mut decoder2 = Decoder::new(cursor2);
+        decoder2.read_info().expect("read_info failed");
+        let result2 = decoder2.finish().expect("finish failed");
+        assert_eq!(result2.exif, whole_result.exif);
+        assert_eq!(result2.json_metadata, whole_result.json_metadata);
+    }
+
+    /// A file using 2D tiling (`iDIM`) must be reported as not supporting
+    /// streaming tiles, and `next_tile()` must reject it with a clear
+    /// error rather than silently misinterpreting `iDIM` tile payloads as
+    /// row-strips.
+    #[test]
+    fn test_decoder_next_tile_rejects_idim_2d_tiling() {
+        let width = 32u32;
+        let height = 32u32;
+        let img_data = vec![64u8; (width * height * 4) as usize];
+        let img =
+            image::RgbaImage::from_raw(width, height, img_data).expect("failed to create image");
+        let temp_dir = std::env::temp_dir();
+        let input_path = temp_dir
+            .join("test_decoder_idim_input.png")
+            .to_string_lossy()
+            .to_string();
+        img.save(&input_path).expect("failed to save PNG");
+
+        let opts = EncodeOptions {
+            use_filter: true,
+            level: 5,
+            idim: Some(iDim {
+                tile_width: 16,
+                tile_height: 16,
+                tiles_x: 2,
+                tiles_y: 2,
+                scan_order: 0,
+            }),
+            ..EncodeOptions::default()
+        };
+        let cafe_path = temp_dir
+            .join("test_decoder_idim.cafe")
+            .to_string_lossy()
+            .to_string();
+        encode(&input_path, &cafe_path, &opts).expect("failed to encode");
+        let buf = std::fs::read(&cafe_path).expect("failed to read encoded file");
+
+        let cursor = std::io::Cursor::new(buf.as_slice());
+        let mut decoder = Decoder::new(cursor);
+        let info = decoder.read_info().expect("read_info failed");
+        assert!(!info.supports_streaming_tiles);
+        assert!(matches!(
+            decoder.next_tile(),
+            Err(CafeError::UnsupportedFeature(_))
+        ));
+    }
+
+    /// Calling `next_tile()` before `read_info()` must error clearly
+    /// instead of panicking (e.g. on an unwrap of `self.info`).
+    #[test]
+    fn test_decoder_next_tile_before_read_info_errors() {
+        let buf = build_simple_cafe_bytes(8, 8, 4);
+        let cursor = std::io::Cursor::new(buf.as_slice());
+        let mut decoder = Decoder::new(cursor);
+        assert!(matches!(
+            decoder.next_tile(),
+            Err(CafeError::UnsupportedFeature(_))
+        ));
+    }
+
+    /// A stream truncated mid-header (before the first `IDAT`/`IEND`) must
+    /// surface as `TruncatedFile`, not panic, and not silently succeed.
+    #[test]
+    fn test_decoder_read_info_truncated_stream_errors() {
+        let buf = build_simple_cafe_bytes(8, 8, 4);
+        // Cut off partway through, before the first IDAT (IHDR is 14 bytes
+        // payload + 9 bytes header/footer = 23 bytes; the signature is
+        // another 9 bytes, so 20 total bytes lands inside the IHDR chunk).
+        let truncated = &buf[0..20];
+        let cursor = std::io::Cursor::new(truncated);
+        let mut decoder = Decoder::new(cursor);
+        assert!(matches!(
+            decoder.read_info(),
+            Err(CafeError::TruncatedFile(_))
+        ));
+    }
+
+    /// Calling `read_info()` twice must error rather than silently
+    /// re-parsing (which would double-apply IHDR/duplicate-chunk checks
+    /// against a stream position that has already moved past them).
+    #[test]
+    fn test_decoder_read_info_called_twice_errors() {
+        let buf = build_simple_cafe_bytes(8, 8, 4);
+        let cursor = std::io::Cursor::new(buf.as_slice());
+        let mut decoder = Decoder::new(cursor);
+        decoder.read_info().expect("first read_info failed");
+        assert!(matches!(
+            decoder.read_info(),
+            Err(CafeError::UnsupportedFeature(_))
+        ));
     }
 
     // --- Tests for Phase 1: Bit depths 1, 2, 4 (v1.0) ---
