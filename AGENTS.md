@@ -527,6 +527,10 @@ This **is not** optional — it's part of the safe decoding contract.
 
 **Accumulated ceiling per image (IDATs):** in addition to the per-chunk ceiling, the decoder calculates a total decompression budget derived from IHDR (`compute_decompress_budget` in `src/cafe.rs`): `bytes_per_row × height` (+margin), `width × height` for indexed, and `width × height × 4 + passes` for interlace. Each IDAT is decompressed via `decompress_chunk_dict_limited` limited to the remaining budget — multiple IDATs cannot sum to gigabytes when the image is small.
 
+**Tile-count ceiling (`iDIM`, v1.5 round-10 fix):** `MAX_DECOMPRESSED_CHUNK_SIZE` bounds ZSTD *decompression* output; it does **not** bound allocations sized directly from small chunk-header fields with no decompression involved. `iDim::tile_order()` (`src/types.rs`) allocates one `(u16, u16)` tuple per tile (`tiles_x × tiles_y`) up front, from a 9-byte `iDIM` chunk, before any `IDAT` is read — `tiles_x = tiles_y = 65535` (individually valid, and reconcilable against `IHDR` via `tile_width = tile_height = 1`) previously caused a ~17 GiB allocation attempt from a ~71-byte file, aborting the process. `handle_idim_chunk` now rejects `tiles_x as u64 * tiles_y as u64 > MAX_TILE_COUNT` (1,048,576) before calling `tile_order()`. See `docs/SECURITY_AUDIT.md` round 10.
+
+**Palette entry-count ceiling (`PLTE`, v1.5 round-10 fix):** similarly, `read_plte_chunk` (`src/cafe.rs`) now rejects a `PLTE` chunk declaring more than `MAX_PALETTE_ENTRIES` (256 — the maximum any bit depth ∈ {1,2,4,8} can ever address) entries, before allocating the `Vec<PaletteEntry>` — previously bounded only by the generic 1 GiB `MAX_DECOMPRESSED_CHUNK_SIZE`, allowing disproportionate amplification for data no valid pixel index could reference.
+
 ### 12.3 Absence of Upper Limit for Width/Height
 
 Intentionally there is no maximum. Decoder should reconstruct **incrementally** from the actual data received in IDAT, not pre-allocate `width × height × bytes_per_pixel` before validation.

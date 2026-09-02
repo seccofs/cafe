@@ -267,3 +267,61 @@ New `src/simd.rs` module added for AVX2 optimization of Filters 1, 2, 3:
 **Audited by**: OpenCode Security Analysis  
 **Version**: 1.1 (rounds 1-9)  
 **Next review**: 2027-08-05
+
+---
+
+## Round 10 — Unbounded `iDIM` Tile Count + `PLTE` Entry Count (v1.5, September 2026)
+
+Follow-up audit performed after the v1.5 compression-focused audit, targeting the decode path's remaining pre-`IDAT` allocation sites (chunk-header-driven allocations, i.e. `Vec` sizes derived directly from a small ancillary/critical chunk field rather than from bytes actually received and validated).
+
+### 1. 🔴 Unbounded Tile Count in `iDIM` (`iDim::tile_order()`) - FIXED
+
+**Severity**: HIGH
+**CWE**: CWE-789 (Memory Allocation with Excessive Size Value) / CWE-409-class (Uncontrolled Resource Consumption)
+**Location**: `src/types.rs` — `iDim::tile_order()`; triggered from `src/cafe.rs` — `handle_idim_chunk()`
+
+**Problem**:
+- `handle_idim_chunk` validated `tiles_x`/`tiles_y` as individually nonzero `u16` values and cross-checked their consistency against `IHDR`'s `width`/`height` via `div_ceil` (satisfiable by an attacker declaring `IHDR width=height=65535` and `iDIM tile_width=tile_height=1`), but enforced **no absolute ceiling** on their product.
+- `state.idim_tile_order = Some(idim.tile_order()?)` was then called **eagerly, before any `IDAT` is read**, allocating a `Vec<(u16, u16)>` sized `tiles_x × tiles_y` (row-major: 4 bytes/entry; Z-order: an additional temporary `Vec<(u16,u16,u64)>` at 12 bytes/entry, plus a `sort_by_key` pass).
+- **Proven exploit**: a **71-byte** crafted file (signature + `IHDR` + `iDIM` with `tiles_x=tiles_y=65535` + `IEND`, no `IDAT` needed at all) made the decoder attempt a **~17.2 GiB** allocation (row-major case), which the Rust global allocator aborts on (`memory allocation of 17179344900 bytes failed`, process exit code `-1073740791` on Windows) — a hard process abort, not a handleable `Result::Err`. Verified against the real crate via `decode_bytes`, not just the extracted allocation logic.
+- The pre-existing 1 GiB `MAX_DECOMPRESSED_CHUNK_SIZE` ceiling (CWE-409 protection, round 4 above) does **not** apply here: it bounds ZSTD *decompression* output per chunk, while this allocation is driven purely by two `u16` header fields in a 9-byte, uncompressed-relevant `iDIM` payload — no decompression is involved.
+
+**Risk**: Denial of Service (DoS) / process crash with a ~71-byte input — untrusted input can abort the process before a single `IDAT` byte is read.
+
+**Patch**:
+- New `MAX_TILE_COUNT` constant (`src/constants.rs`, 1,048,576 = 1024×1024 tiles) — comfortably covers every legitimate streaming/2D-tiling use case in section 4.2 of the spec while keeping `tile_order()`'s allocation to at most a few dozen MiB.
+- `handle_idim_chunk` (`src/cafe.rs`) now computes `tile_count = tiles_x as u64 * tiles_y as u64` (widened to `u64` to avoid any overflow in the multiplication itself) and rejects with `CafeError::UnsupportedFeature` if `tile_count > MAX_TILE_COUNT`, **before** calling `idim.tile_order()`.
+
+**Regression test** (`src/cafe.rs`): `test_decode_adversarial_idim_excessive_tile_count` — reproduces the exact 71-byte `tiles_x=tiles_y=65535` PoC via `decode_bytes`, asserts a clean `Err` mentioning the tile-count limit.
+
+**Status**: ✅ FIXED (verified: pre-patch PoC aborted the process in release mode with an allocation-failure exit code; post-patch, the same input returns `Err` in under 1µs, no allocation attempted)
+
+---
+
+### 2. ⚠️ Unbounded Entry Count in `PLTE` (`read_plte_chunk`) - FIXED
+
+**Severity**: LOW-MEDIUM
+**CWE**: CWE-789-class (disproportionate memory amplification from a small declared/implied count)
+**Location**: `src/cafe.rs` — `read_plte_chunk()`
+
+**Problem**:
+- A legitimate indexed-color `PLTE` never needs more than 256 entries (bit depths 1/2/4/8 all top out at 256 distinct pixel indices, section 4.1.2) — the encoder already enforces this limit (`encode_indexed`, `src/cafe.rs`).
+- The decoder's `read_plte_chunk`, however, relied solely on the generic 1 GiB `MAX_DECOMPRESSED_CHUNK_SIZE` chunk-decompression ceiling, allowing a single crafted (or ZSTD-compressed, amplifying further) `PLTE` chunk to populate a `Vec<PaletteEntry>` with up to ~357 million entries (1 GiB ÷ 3 bytes/entry) — data that can never be addressed by any valid pixel index for any supported bit depth.
+
+**Risk**: Disproportionate memory amplification (up to several GiB) from a chunk whose legitimate payload never exceeds ~1 KB (256 × 4 bytes).
+
+**Patch**:
+- New `MAX_PALETTE_ENTRIES` constant (`src/constants.rs`, 256), mirroring the encoder's existing limit.
+- `read_plte_chunk` now computes the declared entry count (`data_payload.len() / bytes_per_entry`) and rejects with `CafeError::UnsupportedFeature` if it exceeds `MAX_PALETTE_ENTRIES`, **before** allocating/populating the `entries` `Vec` (previously `Vec::new()` + incremental `.push()`; now `Vec::with_capacity(declared_entries)` only after the check passes, avoiding an oversized upfront reservation too).
+
+**Regression test** (`src/cafe.rs`): `test_decode_adversarial_plte_excessive_entries` — forges a 300-entry `PLTE` chunk (above the 256 limit) via `decode_bytes`, asserts a clean `Err` mentioning the entry-count limit.
+
+**Status**: ✅ FIXED (verified in debug and release; `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` all pass with zero regressions — 290 lib tests, up from 288)
+
+---
+
+**Round 10 methodology note**: both issues were found via a systematic re-scan (post-v1.5) for allocation sites in `src/cafe.rs`/`src/types.rs`/`src/interlace.rs` sized directly from a small chunk-header field rather than from bytes actually received/validated — the same class of risk as round 3's interlace-dimension bug, but for `iDIM`/`PLTE` instead of `IHDR`. Every other allocation site reviewed in this pass (interlace reconstruction buffers, `pixel_rows` incremental accumulation, iDIM's per-image pixel buffer) was confirmed to either gate allocation on already-received/validated byte counts, or be inherently 1:1 with `IHDR`'s declared width×height (an accepted, documented tradeoff per spec §12.3) rather than a novel multiplicative amplification from an independent small field — see inventory in the round 10 audit conversation for the full list.
+
+**Audited by**: OpenCode Security Analysis
+**Version**: 1.5 (round 10)
+**Next review**: 2027-09-02

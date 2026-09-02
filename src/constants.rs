@@ -97,3 +97,33 @@ pub const BPP: usize = 4; // bytes per pixel for RGBA (8 bits/channel)
 /// exhaust all the memory available to the process. 1 GiB is generous for
 /// realistic images (even at very high resolution), but finite.
 pub const MAX_DECOMPRESSED_CHUNK_SIZE: u64 = 1024 * 1024 * 1024; // 1 GiB
+
+/// Maximum number of tiles (`tiles_x * tiles_y`) accepted from an `iDIM`
+/// chunk. Protection against a memory-allocation DoS (CWE-789/CWE-409-class):
+/// `iDim::tile_order()` allocates one `(u16, u16)` tuple per tile (12 bytes
+/// per entry in the Z-order path, which additionally sorts the buffer) up
+/// front, from a 9-byte ancillary chunk, *before* any `IDAT` is read or
+/// validated. Without this cap, `tiles_x = tiles_y = 65535` (both
+/// individually valid `u16` values, and satisfiable against a consistent
+/// `IHDR` via `tile_width = tile_height = 1`) makes the decoder attempt a
+/// ~17 GiB (row-major) or ~51 GiB (Z-order, pre-sort) allocation from a
+/// ~71-byte crafted file, aborting the process instead of returning a
+/// handleable `Err`. 1,048,576 (1024 × 1024) comfortably covers every
+/// legitimate streaming/tiling use case described in section 4.2 of the
+/// spec (the reference encoder's default `DEFAULT_TILE_ROWS = 64` implies
+/// far fewer tiles even for very large images) while keeping the resulting
+/// `tile_order()` allocation on the order of a few dozen MiB at most.
+pub const MAX_TILE_COUNT: u64 = 1024 * 1024; // 1,048,576 tiles
+
+/// Maximum number of entries accepted from a `PLTE` chunk. Protection
+/// against a disproportionate memory-allocation amplification: a legitimate
+/// indexed-color `PLTE` never needs more than 256 entries (bit depths 1, 2,
+/// 4, 8 all top out at 256 distinct indices, section 4.1.2), but without
+/// this cap the only limit on `read_plte_chunk`'s `Vec<PaletteEntry>` size
+/// is the generic 1 GiB `MAX_DECOMPRESSED_CHUNK_SIZE` chunk-decompression
+/// ceiling — allowing a single crafted `PLTE` chunk to balloon into
+/// gigabytes of `PaletteEntry` structs (4 bytes on disk vs. 4 bytes in
+/// memory per entry, but up to ~357M entries from a 1 GiB payload) for data
+/// that can never be addressed by any valid pixel index. The encoder
+/// already enforces this same 256 limit (see `encode_indexed`).
+pub const MAX_PALETTE_ENTRIES: usize = 256;

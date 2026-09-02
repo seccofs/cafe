@@ -1554,6 +1554,23 @@ fn handle_idim_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) -> Result<(
                 expected_tiles_y
             )));
         }
+        // SECURITY (CWE-789/CWE-409-class): reject an excessive tile count
+        // *before* calling tile_order(), which allocates one (u16, u16)
+        // tuple per tile (plus a temporary (u16, u16, u64) buffer + sort in
+        // the Z-order path) up front, from this 9-byte chunk alone, with no
+        // IDAT read yet. tiles_x/tiles_y are individually valid u16 values
+        // (already checked nonzero and consistent with IHDR above), but
+        // their product has no inherent ceiling - see MAX_TILE_COUNT's doc
+        // comment for the exploit this closes (tiles_x=tiles_y=65535 via
+        // tile_width=tile_height=1 => ~17 GiB allocation from a ~71-byte
+        // file).
+        let tile_count = (idim.tiles_x as u64) * (idim.tiles_y as u64);
+        if tile_count > MAX_TILE_COUNT {
+            return Err(CafeError::UnsupportedFeature(format!(
+                "iDIM: tiles_x * tiles_y = {} exceeds maximum allowed tile count ({})",
+                tile_count, MAX_TILE_COUNT
+            )));
+        }
         // Compute the tile visitation order once here (not per-IDAT in
         // handle_idat_tile_idim) - see the doc comment on
         // DecodeState::idim_tile_order for why this matters.
@@ -2417,8 +2434,23 @@ fn read_plte_chunk(flag: u8, data: &[u8]) -> Result<Palette> {
     let entry_format = data[0];
     let has_alpha = entry_format != 0;
     let bytes_per_entry = if has_alpha { 4 } else { 3 };
-    let mut entries = Vec::new();
+    // SECURITY (memory-amplification): a legitimate indexed-color PLTE never
+    // needs more than MAX_PALETTE_ENTRIES (256, section 4.1.2 - bit depths
+    // 1/2/4/8 all top out at 256 distinct indices). Without this check, the
+    // only limit on this Vec<PaletteEntry>'s size is the generic 1 GiB
+    // MAX_DECOMPRESSED_CHUNK_SIZE chunk-decompression ceiling, allowing a
+    // single crafted PLTE chunk to balloon into hundreds of millions of
+    // PaletteEntry structs that can never be addressed by any valid pixel
+    // index. Reject early, before allocating/populating `entries`.
     let data_payload = &data[1..];
+    let declared_entries = data_payload.len() / bytes_per_entry;
+    if declared_entries > MAX_PALETTE_ENTRIES {
+        return Err(CafeError::UnsupportedFeature(format!(
+            "PLTE: {} entries exceeds maximum allowed ({})",
+            declared_entries, MAX_PALETTE_ENTRIES
+        )));
+    }
+    let mut entries = Vec::with_capacity(declared_entries);
     for i in (0..data_payload.len()).step_by(bytes_per_entry) {
         if i + bytes_per_entry > data_payload.len() {
             break;
@@ -2865,6 +2897,58 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_adversarial_idim_excessive_tile_count() {
+        // SECURITY (CWE-789/CWE-409-class): tiles_x=tiles_y=65535 (both
+        // individually valid u16 values) with tile_width=tile_height=1 is
+        // consistent with an IHDR declaring width=height=65535 via the
+        // usual div_ceil check - but iDim::tile_order() would then allocate
+        // a Vec<(u16,u16)> of ~4.29 billion entries (~17 GiB) from this
+        // ~71-byte file, before any IDAT is read. Confirmed via a
+        // standalone PoC to abort the process with a real allocation
+        // failure. handle_idim_chunk must now reject tile_count >
+        // MAX_TILE_COUNT before ever calling tile_order().
+        let mut evil = Vec::new();
+        evil.extend_from_slice(&SIGNATURE);
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&65_535u32.to_be_bytes());
+        ihdr.extend_from_slice(&65_535u32.to_be_bytes());
+        ihdr.push(8); // bit_depth
+        ihdr.push(SAMPLE_FORMAT_UINT);
+        ihdr.push(COLOR_TYPE_RGBA);
+        ihdr.push(COMPRESSION_METHOD_ZSTD_BIT);
+        ihdr.push(FILTER_METHOD_NONE);
+        ihdr.push(INTERLACE_NONE);
+        evil.extend_from_slice(&write_chunk(CHUNK_IHDR, FLAG_RAW, &ihdr));
+
+        let mut idim = Vec::new();
+        idim.extend_from_slice(&1u16.to_be_bytes()); // tile_width = 1
+        idim.extend_from_slice(&1u16.to_be_bytes()); // tile_height = 1
+        idim.extend_from_slice(&65_535u16.to_be_bytes()); // tiles_x
+        idim.extend_from_slice(&65_535u16.to_be_bytes()); // tiles_y
+        idim.push(0); // scan_order
+        evil.extend_from_slice(&write_chunk(CHUNK_IDIM, FLAG_RAW, &idim));
+        evil.extend_from_slice(&write_chunk(CHUNK_IEND, FLAG_RAW, &[]));
+
+        assert!(
+            evil.len() < 100,
+            "PoC file should be tiny (was {} bytes)",
+            evil.len()
+        );
+
+        let result = decode_bytes(&evil);
+        match result {
+            Ok(_) => panic!("excessive iDIM tile count must be rejected"),
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("tile count") || msg.contains("tiles_x"),
+                    "expected tile-count-limit error, got: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_idim_tile_dimensions_saturates_on_inconsistent_geometry() {
         // Defense-in-depth unit test for iDim::tile_dimensions itself:
         // since all iDim fields are `pub`, a caller (or a future code path)
@@ -3086,6 +3170,54 @@ mod tests {
             result.unwrap().is_err(),
             "INDEXED without PLTE must be rejected"
         );
+    }
+
+    #[test]
+    fn test_decode_adversarial_plte_excessive_entries() {
+        // SECURITY (memory-amplification): a PLTE chunk declaring more than
+        // MAX_PALETTE_ENTRIES (256) entries. A legitimate indexed-color
+        // palette never needs more than 256 entries (bit depths 1/2/4/8 all
+        // top out at 256 distinct indices, section 4.1.2), but before this
+        // fix the only limit on read_plte_chunk's Vec<PaletteEntry> was the
+        // generic 1 GiB MAX_DECOMPRESSED_CHUNK_SIZE chunk-decompression
+        // ceiling, allowing amplification far beyond what any valid pixel
+        // index could ever address. Must be rejected immediately with a
+        // clean error, not silently truncated or allowed through.
+        let mut evil = Vec::new();
+        evil.extend_from_slice(&SIGNATURE);
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&2u32.to_be_bytes());
+        ihdr.extend_from_slice(&2u32.to_be_bytes());
+        ihdr.push(8); // bit_depth
+        ihdr.push(SAMPLE_FORMAT_UINT);
+        ihdr.push(COLOR_TYPE_INDEXED);
+        ihdr.push(COMPRESSION_METHOD_ZSTD_BIT);
+        ihdr.push(FILTER_METHOD_NONE);
+        ihdr.push(INTERLACE_NONE);
+        evil.extend_from_slice(&write_chunk(CHUNK_IHDR, FLAG_RAW, &ihdr));
+
+        // 300 RGB entries (900 bytes) > MAX_PALETTE_ENTRIES (256).
+        let mut plte_payload = Vec::new();
+        plte_payload.push(0u8); // entry_format = 0 (RGB, no alpha)
+        for i in 0..300u32 {
+            plte_payload.push((i % 256) as u8);
+            plte_payload.push((i % 256) as u8);
+            plte_payload.push((i % 256) as u8);
+        }
+        evil.extend_from_slice(&write_chunk(CHUNK_PLTE, FLAG_RAW, &plte_payload));
+        evil.extend_from_slice(&write_chunk(CHUNK_IEND, FLAG_RAW, &[]));
+
+        let result = decode_bytes(&evil);
+        match result {
+            Ok(_) => panic!("PLTE with 300 entries must be rejected"),
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("PLTE") && msg.contains("300"),
+                    "expected PLTE entry-count-limit error, got: {msg}"
+                );
+            }
+        }
     }
 
     #[test]
