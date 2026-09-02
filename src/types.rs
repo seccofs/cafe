@@ -31,6 +31,49 @@ impl PaletteEntry {
         let da = (self.a as i32) - (other.a as i32);
         (dr * dr + dg * dg + db * db + da * da) as u32
     }
+
+    /// Perceptually-weighted color distance ("redmean" approximation, see
+    /// <https://www.compuphase.com/cmetric.htm>), used by
+    /// `PaletteAlgorithm::NearestNeighborWeighted` (v1.5). Unlike
+    /// `distance_squared` (plain unweighted Euclidean distance, used by
+    /// `NearestNeighbor`/`MedianCut`), this weights each channel's squared
+    /// difference by a factor that depends on the mean red level of the two
+    /// colors being compared — an inexpensive integer approximation of human
+    /// color perception (red and blue contributions are weighted more or
+    /// less depending on where the pair sits in the red range; green is
+    /// always weighted most heavily, matching its dominant contribution to
+    /// perceived luminance). Formula (integer, no floating point, no
+    /// `sqrt` — monotonic with the textbook redmean distance, which is all
+    /// that's needed for nearest-neighbor comparisons):
+    ///
+    /// ```text
+    /// rmean = (r1 + r2) / 2
+    /// dist  = (512 + rmean) * dr^2  +  1024 * dg^2  +  (767 - rmean) * db^2  +  1024 * da^2
+    /// ```
+    ///
+    /// This is the classic redmean formula scaled by 256 (dropping its
+    /// `>> 8` step) to stay integer-only. The alpha term is not part of the
+    /// original redmean formula — which predates alpha-compositing use
+    /// cases — and is added here with the same weight as green, since there
+    /// is no equivalent perceptual-weighting literature for alpha and
+    /// green's weight is a reasonable, unbiased default.
+    ///
+    /// Maximum possible value: `767 * 255² + 1024 * 255² + 767 * 255² + 1024
+    /// * 255²` ≈ 232,919,550, comfortably within `u32::MAX` (~4.29 billion)
+    /// despite the larger weighted magnitudes compared to
+    /// `distance_squared`'s unweighted maximum (~260,100) — no overflow risk.
+    pub fn redmean_distance(&self, other: &PaletteEntry) -> u32 {
+        let r1 = self.r as i64;
+        let r2 = other.r as i64;
+        let rmean = (r1 + r2) / 2;
+        let dr = r1 - r2;
+        let dg = self.g as i64 - other.g as i64;
+        let db = self.b as i64 - other.b as i64;
+        let da = self.a as i64 - other.a as i64;
+        let dist =
+            (512 + rmean) * dr * dr + 1024 * dg * dg + (767 - rmean) * db * db + 1024 * da * da;
+        dist as u32
+    }
 }
 
 /// Palette (list of indexed colors, section 4.1.2)
@@ -303,6 +346,17 @@ pub struct EncodeOptions {
     pub tile_rows: u32,
     pub level: i32,
     pub use_filter: bool,
+    /// Selects the predictive filter independently per row instead of once
+    /// per whole tile (v1.5, `FILTER_METHOD_PREDICTIVE_PER_ROW`). Only takes
+    /// effect when `use_filter` is also `true`; mutually exclusive with
+    /// `use_byte_shuffle` (byte-shuffle takes precedence, same as
+    /// `use_filter`). Only `FilterHeuristic::Entropy` and
+    /// `FilterHeuristic::Msad` are supported in this mode — any other value
+    /// of `filter_heuristic` causes `encode()`/`encode_indexed()` to return
+    /// `CafeError::UnsupportedFeature`. Trades 1 extra filter-code byte per
+    /// row for finer-grained adaptation to local content changes within a
+    /// tile. Default: `false` (existing per-tile behavior).
+    pub use_filter_per_row: bool,
     pub adaptive_analysis: bool,
     pub target_color_type: u8,
     /// Target bit depth for the uint sample format (section 4.1). Valid: GRAY and
@@ -328,6 +382,20 @@ pub struct EncodeOptions {
     /// Automatically train a ZSTD dictionary from the image data when
     /// `zstd_dictionary` is None. Useful for improving compression of
     /// small or repetitive images. Default: false (for backward compatibility).
+    ///
+    /// **Non-regression guarantee (v1.5):** enabling this option never
+    /// produces a larger output file than leaving it disabled. The encoder
+    /// compresses every IDAT both with and without the trained dictionary
+    /// and keeps the smaller result per tile (`compress_with_fallback_dict`
+    /// in `codec.rs`); if the dictionary wins at least one tile, it then
+    /// compares the *whole-file* total (the `zDIC` chunk's own overhead plus
+    /// all IDATs) against re-encoding every IDAT with no dictionary at all,
+    /// and keeps whichever total is smaller (see the IDAT/zDIC section of
+    /// `encode()` in `cafe.rs`). This guarantee only applies to the
+    /// auto-trained dictionary; an explicitly supplied `zstd_dictionary` is
+    /// always honored and always emitted, since that is a deliberate
+    /// caller decision (e.g. a shared dictionary trained offline across a
+    /// batch of related images), not a heuristic.
     pub auto_dictionary: bool,
     /// Palette quantization algorithm for indexed mode (v1.1).
     /// Default: NearestNeighbor (existing behavior).
@@ -337,13 +405,22 @@ pub struct EncodeOptions {
     pub tonemap_operator: crate::tonemap::ToneMapOperator,
 }
 
-/// Palette quantization algorithm selector (v1.1)
+/// Palette quantization algorithm selector (v1.1, extended v1.5)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaletteAlgorithm {
     /// Simple greedy nearest-neighbor (existing behavior, fastest)
     NearestNeighbor,
     /// Median-cut algorithm: recursively splits color space for better quality
     MedianCut,
+    /// Same greedy strategy as `NearestNeighbor`, but matching uses a
+    /// perceptually-weighted ("redmean") distance instead of plain
+    /// unweighted Euclidean distance (v1.5). See
+    /// `PaletteEntry::redmean_distance` for the formula. Typically produces
+    /// palette assignments that better match human color perception (fewer
+    /// visually-jarring mismatches, especially around red/blue extremes) at
+    /// the cost of always running the scalar (non-SIMD) matching path —
+    /// see `quantize_nearest_neighbor_weighted` in `cafe.rs`.
+    NearestNeighborWeighted,
 }
 
 impl std::str::FromStr for PaletteAlgorithm {
@@ -352,8 +429,9 @@ impl std::str::FromStr for PaletteAlgorithm {
         match s.to_lowercase().as_str() {
             "nearest" | "nearest-neighbor" | "nn" => Ok(PaletteAlgorithm::NearestNeighbor),
             "median-cut" | "mediancut" | "median" => Ok(PaletteAlgorithm::MedianCut),
+            "weighted" | "perceptual" | "redmean" => Ok(PaletteAlgorithm::NearestNeighborWeighted),
             other => Err(format!(
-                "unknown palette algorithm '{}': use 'nearest' or 'median-cut'",
+                "unknown palette algorithm '{}': use 'nearest', 'median-cut', or 'weighted'",
                 other
             )),
         }
@@ -366,6 +444,7 @@ impl Default for EncodeOptions {
             tile_rows: crate::constants::DEFAULT_TILE_ROWS,
             level: crate::constants::ZSTD_LEVEL,
             use_filter: true,
+            use_filter_per_row: false,
             adaptive_analysis: false,
             target_color_type: crate::constants::COLOR_TYPE_RGBA,
             target_bit_depth: None,
@@ -414,4 +493,122 @@ pub struct DecodeResult {
     pub xmp_metadata: Option<String>,
     pub zstd_dictionary: Option<Vec<u8>>,
     pub chdr_metadata: Option<cHDR>, // HDR metadata (v1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_redmean_distance_zero_for_identical_colors() {
+        let c = PaletteEntry {
+            r: 120,
+            g: 200,
+            b: 30,
+            a: 255,
+        };
+        assert_eq!(c.redmean_distance(&c), 0);
+        assert_eq!(c.distance_squared(&c), 0);
+    }
+
+    #[test]
+    fn test_redmean_distance_symmetric() {
+        let a = PaletteEntry {
+            r: 10,
+            g: 20,
+            b: 30,
+            a: 255,
+        };
+        let b = PaletteEntry {
+            r: 200,
+            g: 50,
+            b: 5,
+            a: 128,
+        };
+        assert_eq!(a.redmean_distance(&b), b.redmean_distance(&a));
+    }
+
+    #[test]
+    fn test_redmean_distance_differs_from_unweighted_for_non_gray_pairs() {
+        // Redmean weights channels asymmetrically based on mean red level,
+        // so for a pair with distinct per-channel deltas the two metrics
+        // should generally disagree (this is the whole point of the
+        // perceptual weighting) — pick a pair where they provably differ.
+        let a = PaletteEntry {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let b = PaletteEntry {
+            r: 0,
+            g: 0,
+            b: 255,
+            a: 255,
+        };
+        // Unweighted: dr=255, db=255 -> 255^2 + 255^2 = 130050
+        assert_eq!(a.distance_squared(&b), 130_050);
+        // Redmean: rmean=(255+0)/2=127, weight_r=512+127=639, weight_b=767-127=640
+        // dist = 639*255^2 + 640*255^2 = (639+640)*65025 = 1279*65025
+        assert_eq!(a.redmean_distance(&b), 1279 * 65_025);
+        assert_ne!(a.distance_squared(&b), a.redmean_distance(&b));
+    }
+
+    #[test]
+    fn test_redmean_distance_no_overflow_at_extremes() {
+        let black = PaletteEntry {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        };
+        let white = PaletteEntry {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        };
+        // Should not panic (debug overflow check) and should stay within u32.
+        let dist = black.redmean_distance(&white);
+        assert!(dist > 0);
+        assert!(dist < u32::MAX);
+    }
+
+    #[test]
+    fn test_palette_algorithm_from_str_weighted_variants() {
+        assert_eq!(
+            PaletteAlgorithm::from_str("weighted").unwrap(),
+            PaletteAlgorithm::NearestNeighborWeighted
+        );
+        assert_eq!(
+            PaletteAlgorithm::from_str("perceptual").unwrap(),
+            PaletteAlgorithm::NearestNeighborWeighted
+        );
+        assert_eq!(
+            PaletteAlgorithm::from_str("redmean").unwrap(),
+            PaletteAlgorithm::NearestNeighborWeighted
+        );
+        assert_eq!(
+            PaletteAlgorithm::from_str("WEIGHTED").unwrap(),
+            PaletteAlgorithm::NearestNeighborWeighted
+        );
+    }
+
+    #[test]
+    fn test_palette_algorithm_from_str_still_accepts_existing_variants() {
+        assert_eq!(
+            PaletteAlgorithm::from_str("nearest").unwrap(),
+            PaletteAlgorithm::NearestNeighbor
+        );
+        assert_eq!(
+            PaletteAlgorithm::from_str("median-cut").unwrap(),
+            PaletteAlgorithm::MedianCut
+        );
+    }
+
+    #[test]
+    fn test_palette_algorithm_from_str_rejects_unknown() {
+        assert!(PaletteAlgorithm::from_str("bogus").is_err());
+    }
 }

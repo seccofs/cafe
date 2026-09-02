@@ -13,9 +13,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Real ARM hardware validation on physical devices (Raspberry Pi, mobile, Apple Silicon) beyond QEMU emulation
 - Cache-friendly blocking in scalar byte-shuffle fallback
 - Runtime CPU detection for optional SIMD forcing
-- Benchmarking suite with Criterion framework
-- k-means palette quantization algorithm
-- Tone-mapping on encode (SDR → HDR inverse operation)
+- k-means palette quantization algorithm (clustering-based, as opposed to the greedy/median-cut/redmean-weighted strategies already implemented)
+- Tone-mapping on encode (SDR → HDR inverse operation), including operator selection via CLI
+
+---
+
+## [1.5.0] - 2026-09-02
+
+A comparative audit of the CAFE algorithm was done to separate genuine compression gains from mere engineering/performance gains, yielding 5 prioritized improvements (items #1-#5 below).
+
+### Added
+
+- **Per-row predictive filter** (`FILTER_METHOD_PREDICTIVE_PER_ROW = 3`, spec section 4.3.1.1): finer-grained filter adaptation than the existing per-tile filter — one filter byte per row instead of one per whole tile — at the cost of one extra byte per row before compression. Supports the `Entropy` and `Msad` heuristics (the cheap ones); incompatible with iDIM (2D tiling) and byte-shuffle, same as the existing per-tile predictive filter.
+- **Real compression benchmarks + CI regression gate**: `tests/compression_regression.rs` asserts compressed size stays within tolerance across representative content types on every CI run; `benches/encode_decode.rs` (Criterion) gives detailed timing/ratio profiles for manual analysis.
+- **`auto_dictionary` non-regression guarantee**: an auto-trained ZSTD dictionary is only emitted (and only used) when doing so produces a strictly smaller file than the no-dictionary equivalent. Checked both per-`IDAT` (`src/codec.rs::compress_with_fallback_dict`) and whole-file (`src/cafe.rs::encode`, comparing `zDIC` chunk + IDATs vs. no-dict IDATs — the whole-file check recompresses without a dictionary only when at least one tile's dictionary-compressed candidate won, to catch the case where per-tile savings don't outweigh the `zDIC` chunk's own overhead). `tests/dictionary_regression.rs` guards this across 13 pattern/size/tile_rows/level combinations. A caller-supplied dictionary (not auto-trained) is always honored unconditionally, since that's a deliberate choice by the caller.
+- **Perceptually-weighted palette quantization**: `PaletteEntry::redmean_distance` (`src/types.rs`) implements the "redmean" approximation of human color perception (<https://www.compuphase.com/cmetric.htm>) as an integer-only, sqrt-free formula, extended with an alpha term (weight 1024, matching green) since the original redmean formula predates alpha compositing. Wired into a new opt-in `PaletteAlgorithm::NearestNeighborWeighted` variant (`src/cafe.rs::quantize_nearest_neighbor_weighted`), deliberately scalar-only — the redmean weight depends on `(r1+r2)/2` per comparison, unlike the fixed-weight Euclidean distance the existing SIMD-accelerated `NearestNeighbor` path uses. Existing `NearestNeighbor`/`MedianCut` behavior is unchanged. CLI: `--palette-algorithm weighted` (also accepts `perceptual`/`redmean`).
+- **`tests/tile_rows_benchmark.rs`**: permanent benchmark suite for `EncodeOptions::tile_rows` tuning — a compression-size sweep across 5 content types and 2 image sizes, an extreme-values probe (`tile_rows` up to "no tiling at all"), and a wall-clock encode-time-vs-size tradeoff probe. Not regression-gated on absolute values (machine/content dependent); prints a data table with `--nocapture` for manual analysis.
+
+### Changed
+
+- Nothing in the default encoding pipeline changed behavior for existing callers: `use_filter_per_row` and the new `PaletteAlgorithm::NearestNeighborWeighted` are both opt-in; `auto_dictionary`'s non-regression guarantee only makes that (already-opt-in) option *more* conservative, never less.
+
+### Investigated (no code change)
+
+- **`DEFAULT_TILE_ROWS` retuning** (`src/constants.rs`): benchmarked before deciding whether to change the default (currently `64`). Compressed size improves monotonically as row-tile size grows across every tested content type — up to and including "no tiling at all" — with no reversal at any tested size. However, tile compression is parallelized across a rayon thread pool, so wall-clock encode time follows the opposite, U-shaped curve: too many small tiles adds per-tile scheduling/framing overhead, while too few large tiles leaves insufficient parallel work for a multi-core machine. On both a 24-core machine and a 4-core-limited run, the time-vs-`tile_rows` minimum falls in the `64..=128` range — very close to the current default. **Decision: kept `DEFAULT_TILE_ROWS = 64`**, trading roughly 5-15% compressed size (vs. much larger tiles) for a 5-10x encode-time improvement. Documented quantitatively in `docs/CAFE-spec.md`/`docs/CAFE-spec.pt.md` section 10 and in `tests/tile_rows_benchmark.rs`'s module doc comment.
+
+### Notes
+
+- Full test suite: 288 lib tests (up from 273) + all integration suites (`compression_regression.rs`, `dictionary_regression.rs`, `palette_algorithm_test.rs`, `tile_rows_benchmark.rs`, plus all pre-existing suites) pass with zero regressions.
+- Validated: `cargo build --release`, `cargo test` (full suite), `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` all pass.
 
 ---
 

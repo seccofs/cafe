@@ -747,6 +747,161 @@ fn choose_best_block_filter(
     (best_ftype, best_filtered)
 }
 
+/// Chooses the best filter for a single row, independent of neighboring rows
+/// (v1.5, `FILTER_METHOD_PREDICTIVE_PER_ROW`). Tests each of the
+/// `NUM_FILTERS_PER_ROW` candidates (all filters except F_WEIGHTED, whose
+/// adaptive state requires running across multiple consecutive rows — see
+/// module docs) and picks the best-scoring one via `Entropy` or `Msad`
+/// (the only two heuristics cheap enough to run per row; `CompressionTest`,
+/// `QuickPrune` and `AdaptiveEntropy` are designed to reason about a whole
+/// block's statistics, not a single row, and are rejected by
+/// `apply_predictive_filter_per_row` below).
+fn choose_best_row_filter(
+    row: &[u8],
+    prev_row: Option<&[u8]>,
+    prev_prev_row: Option<&[u8]>,
+    bpp: usize,
+    heuristic: FilterHeuristic,
+) -> (u8, Vec<u8>) {
+    let mut best_ftype = F_NONE;
+    let mut best_score = f64::INFINITY;
+    let mut best_filtered = Vec::new();
+
+    for ftype in 0..NUM_FILTERS_PER_ROW {
+        let filtered = filter_row(row, prev_row, prev_prev_row, ftype, bpp);
+        let score = match heuristic {
+            FilterHeuristic::Entropy => shannon_entropy(&filtered),
+            FilterHeuristic::Msad => filtered.iter().map(|&b| u64::from(b)).sum::<u64>() as f64,
+            // Unreachable: apply_predictive_filter_per_row rejects any other
+            // heuristic before calling this function.
+            _ => unreachable!("per-row filter selection only supports Entropy/Msad"),
+        };
+        if score < best_score {
+            best_score = score;
+            best_ftype = ftype;
+            best_filtered = filtered;
+        }
+    }
+    (best_ftype, best_filtered)
+}
+
+/// Filters a whole tile with an independently-chosen filter per row (v1.5,
+/// `FILTER_METHOD_PREDICTIVE_PER_ROW`, section 4.3.1 extension). Each row is
+/// prefixed with its own 1-byte filter code, unlike `apply_predictive_filter`
+/// which shares a single code across the whole block. This trades 1 extra
+/// byte of overhead per row for finer-grained adaptation to local content
+/// changes within a tile (the same advantage PNG's per-scanline filtering
+/// has over a hypothetical per-image filter choice).
+///
+/// Only `FilterHeuristic::Entropy` and `FilterHeuristic::Msad` are supported
+/// (cheap enough per row); other heuristics return `UnsupportedFeature`.
+///
+/// # Security
+/// - Validates that tile_raw contains exactly tile_height × bytes_per_row bytes
+/// - Returns Err on insufficient data (untrusted input)
+pub(crate) fn apply_predictive_filter_per_row(
+    tile_raw: &[u8],
+    tile_height: usize,
+    bytes_per_row: usize,
+    bpp: usize,
+    heuristic: FilterHeuristic,
+) -> Result<Vec<u8>> {
+    if !matches!(heuristic, FilterHeuristic::Entropy | FilterHeuristic::Msad) {
+        return Err(CafeError::UnsupportedFeature(format!(
+            "per-row predictive filter only supports Entropy/Msad heuristics, got {heuristic:?}"
+        )));
+    }
+
+    let expected_size = tile_height.checked_mul(bytes_per_row).ok_or_else(|| {
+        CafeError::TruncatedFile(
+            "apply_predictive_filter_per_row: overflow in tile_height × bytes_per_row".into(),
+        )
+    })?;
+    if tile_raw.len() < expected_size {
+        return Err(CafeError::TruncatedFile(format!(
+             "apply_predictive_filter_per_row: insufficient data. expected {} bytes (tile_height={} × bytes_per_row={}), got {}",
+            expected_size, tile_height, bytes_per_row, tile_raw.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(tile_height * (bytes_per_row + 1));
+    let mut prev_row: Option<&[u8]> = None;
+    let mut prev_prev_row: Option<&[u8]> = None;
+    for r in 0..tile_height {
+        let row = &tile_raw[r * bytes_per_row..(r + 1) * bytes_per_row];
+        let (ftype, filtered) =
+            choose_best_row_filter(row, prev_row, prev_prev_row, bpp, heuristic);
+        out.push(ftype);
+        out.extend_from_slice(&filtered);
+        prev_prev_row = prev_row;
+        prev_row = Some(row);
+    }
+    Ok(out)
+}
+
+/// Reverses the per-row predictive filter of a whole tile (v1.5,
+/// `FILTER_METHOD_PREDICTIVE_PER_ROW`): reads a filter code byte at the start
+/// of each row and reverses the corresponding operation, using the
+/// already-reconstructed previous rows as neighbors.
+pub(crate) fn undo_predictive_filter_per_row(
+    tile_data: &[u8],
+    tile_height: usize,
+    bytes_per_row: usize,
+    bpp: usize,
+) -> Result<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::with_capacity(tile_height * bytes_per_row);
+    let mut offset = 0usize;
+    for _ in 0..tile_height {
+        // SECURITY: Validates that we have at least 1 byte (filter code) before reading
+        if offset >= tile_data.len() {
+            return Err(CafeError::TruncatedFile(
+                "Insufficient per-row filter data: file truncated when reading filter code".into(),
+            ));
+        }
+        let ftype = tile_data[offset];
+        // The filter byte comes straight from the file (untrusted): validate
+        // before using it, so `predict()`'s fallback path is never reached
+        // with a malicious/corrupted file. F_WEIGHTED (15) is deliberately
+        // rejected here: per-row mode never encodes it (see
+        // `NUM_FILTERS_PER_ROW`), so a file claiming it is malformed/hostile.
+        if ftype >= NUM_FILTERS_PER_ROW {
+            return Err(CafeError::UnsupportedFeature(format!(
+                "invalid per-row filter code: {ftype} (maximum allowed: {})",
+                NUM_FILTERS_PER_ROW - 1
+            )));
+        }
+        offset += 1;
+
+        let needed = offset.checked_add(bytes_per_row).ok_or_else(|| {
+            CafeError::TruncatedFile(
+                "undo_predictive_filter_per_row: overflow in byte count calculation".into(),
+            )
+        })?;
+        if tile_data.len() < needed {
+            return Err(CafeError::TruncatedFile(format!(
+                "Insufficient per-row filter data: expected {} bytes at row start, but only {} available",
+                needed, tile_data.len()
+            )));
+        }
+        let filtered = &tile_data[offset..offset + bytes_per_row];
+        offset += bytes_per_row;
+
+        let prev_row = if out.len() >= bytes_per_row {
+            Some(&out[out.len() - bytes_per_row..])
+        } else {
+            None
+        };
+        let prev_prev_row = if out.len() >= 2 * bytes_per_row {
+            Some(&out[out.len() - 2 * bytes_per_row..out.len() - bytes_per_row])
+        } else {
+            None
+        };
+        let row = unfilter_row(filtered, prev_row, prev_prev_row, ftype, bpp);
+        out.extend_from_slice(&row);
+    }
+    Ok(out)
+}
+
 /// Filters a whole tile with a single filter chosen for the entire block
 /// (v1.0, section 4.3.1). The filter code is prefixed as 1 byte at the start
 /// of the block; all the tile's rows share the same predictor.
@@ -878,6 +1033,103 @@ mod tests {
         assert_eq!(NUM_FILTERS, 16);
         assert_eq!(F_TR_DIRECTIONAL, 14);
         assert_eq!(F_WEIGHTED, 15);
+    }
+
+    // ========================================================================
+    // Tests for per-row predictive filter (v1.5, FILTER_METHOD_PREDICTIVE_PER_ROW)
+    // ========================================================================
+
+    #[test]
+    fn test_per_row_roundtrip_entropy() {
+        let data: Vec<u8> = (0..960).map(|i| ((i * 37) % 256) as u8).collect();
+        for bpp in [1usize, 4usize] {
+            let out = apply_predictive_filter_per_row(&data, 8, 120, bpp, FilterHeuristic::Entropy)
+                .unwrap();
+            let undone = undo_predictive_filter_per_row(&out, 8, 120, bpp).unwrap();
+            assert_eq!(undone, data, "per-row roundtrip (Entropy) bpp={bpp}");
+        }
+    }
+
+    #[test]
+    fn test_per_row_roundtrip_msad() {
+        let data: Vec<u8> = (0..960).map(|i| ((i * 53 + 7) % 256) as u8).collect();
+        for bpp in [1usize, 4usize] {
+            let out =
+                apply_predictive_filter_per_row(&data, 8, 120, bpp, FilterHeuristic::Msad).unwrap();
+            let undone = undo_predictive_filter_per_row(&out, 8, 120, bpp).unwrap();
+            assert_eq!(undone, data, "per-row roundtrip (Msad) bpp={bpp}");
+        }
+    }
+
+    #[test]
+    fn test_per_row_rejects_unsupported_heuristics() {
+        let data = vec![0u8; 8 * 40];
+        for heuristic in [
+            FilterHeuristic::CompressionTest,
+            FilterHeuristic::QuickPrune,
+            FilterHeuristic::AdaptiveEntropy,
+        ] {
+            let result = apply_predictive_filter_per_row(&data, 8, 40, 4, heuristic);
+            assert!(
+                matches!(result, Err(CafeError::UnsupportedFeature(_))),
+                "expected UnsupportedFeature for heuristic {heuristic:?}, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_per_row_uses_different_filters_across_rows() {
+        // Top half: horizontal gradient (favors F_SUB). Bottom half: vertical
+        // gradient (favors F_UP). Per-row selection should pick differently
+        // for at least one row in each half.
+        let w = 64;
+        let h = 16;
+        let mut data = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                data[y * w + x] = if y < h / 2 {
+                    (x % 256) as u8
+                } else {
+                    (y % 256) as u8
+                };
+            }
+        }
+        let out =
+            apply_predictive_filter_per_row(&data, h, w, 1, FilterHeuristic::Entropy).unwrap();
+
+        // Extract the filter code chosen for each row.
+        let mut offset = 0usize;
+        let mut codes = Vec::new();
+        for _ in 0..h {
+            codes.push(out[offset]);
+            offset += 1 + w;
+        }
+        let unique: std::collections::HashSet<_> = codes.iter().collect();
+        assert!(
+            unique.len() > 1,
+            "expected per-row selection to vary across rows, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn test_per_row_rejects_invalid_filter_code() {
+        // ftype 15 (F_WEIGHTED) is excluded from per-row mode — must be rejected.
+        let mut data = vec![F_WEIGHTED];
+        data.extend_from_slice(&[0u8; 40]);
+        match undo_predictive_filter_per_row(&data, 1, 40, 4) {
+            Err(CafeError::UnsupportedFeature(msg)) => {
+                assert!(msg.contains("invalid per-row filter code"));
+            }
+            other => panic!("expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_per_row_rejects_truncated_data() {
+        // Only 1 filter byte + partial row data.
+        let data = vec![F_NONE, 0, 1, 2];
+        let result = undo_predictive_filter_per_row(&data, 2, 40, 4);
+        assert!(matches!(result, Err(CafeError::TruncatedFile(_))));
     }
 
     #[test]

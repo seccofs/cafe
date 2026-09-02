@@ -377,3 +377,105 @@ fn test_roundtrip_diagonal_pattern_pixel_exact() {
         let _ = fs::remove_file(&output_png);
     }
 }
+
+/// End-to-end roundtrip with the v1.5 per-row predictive filter
+/// (`use_filter_per_row: true`, `filter_method=3`): exercises both supported
+/// heuristics (Entropy, Msad) through the public `encode`/`decode` API on a
+/// non-tile-aligned image, with exact pixel-for-pixel comparison against the
+/// source image.
+#[test]
+fn test_roundtrip_per_row_filter_pixel_exact() {
+    let temp_dir = temp_test_dir();
+    let width = 193u32; // not a multiple of the tile size, exercises block edges
+    let height = 137u32;
+    let pixels = generate_test_image(width, height, "diagonal");
+
+    for (heuristic_name, heuristic) in [
+        ("entropy", FilterHeuristic::Entropy),
+        ("msad", FilterHeuristic::Msad),
+    ] {
+        let input_png = format!("{}/input_per_row_{}.png", temp_dir, heuristic_name);
+        let output_cafe = format!("{}/output_per_row_{}.cafe", temp_dir, heuristic_name);
+        let output_png = format!("{}/output_per_row_{}.png", temp_dir, heuristic_name);
+
+        let image_buffer = image::RgbaImage::from_raw(width, height, pixels.clone()).unwrap();
+        image_buffer
+            .save(&input_png)
+            .expect("Failed to save input PNG");
+
+        let opts = EncodeOptions {
+            use_filter: true,
+            use_filter_per_row: true,
+            level: 12,
+            target_color_type: 6,
+            filter_heuristic: heuristic,
+            ..Default::default()
+        };
+
+        encode(&input_png, &output_cafe, &opts).expect("Encode failed");
+        let result = decode(&output_cafe, &output_png).expect("Decode failed");
+
+        assert_eq!(result.width, width);
+        assert_eq!(result.height, height);
+
+        let decoded_image = image::open(&output_png)
+            .expect("Failed to open decoded PNG")
+            .to_rgba8();
+        assert_eq!(
+            decoded_image.into_raw(),
+            pixels,
+            "pixel mismatch for per-row heuristic {heuristic_name}"
+        );
+
+        let _ = fs::remove_file(&input_png);
+        let _ = fs::remove_file(&output_cafe);
+        let _ = fs::remove_file(&output_png);
+    }
+}
+
+/// `use_filter_per_row: true` must be rejected upfront (before any tile is
+/// processed) when combined with an unsupported heuristic, with interlace, or
+/// with iDIM (2D tiling) — see `AGENTS.md`'s v1.5 per-row filter design notes.
+#[test]
+fn test_per_row_filter_rejects_unsupported_combinations() {
+    let temp_dir = temp_test_dir();
+    let width = 16u32;
+    let height = 16u32;
+    let pixels = generate_test_image(width, height, "checkerboard");
+    let input_png = format!("{}/input_per_row_rejects.png", temp_dir);
+    let image_buffer = image::RgbaImage::from_raw(width, height, pixels).unwrap();
+    image_buffer
+        .save(&input_png)
+        .expect("Failed to save input PNG");
+
+    // Unsupported heuristic (only Entropy/Msad are allowed per-row).
+    let output_cafe = format!("{}/output_per_row_bad_heuristic.cafe", temp_dir);
+    let opts = EncodeOptions {
+        use_filter: true,
+        use_filter_per_row: true,
+        target_color_type: 6,
+        filter_heuristic: FilterHeuristic::CompressionTest,
+        ..Default::default()
+    };
+    assert!(
+        encode(&input_png, &output_cafe, &opts).is_err(),
+        "expected error for use_filter_per_row with CompressionTest heuristic"
+    );
+
+    // Incompatible with interlace.
+    let output_cafe = format!("{}/output_per_row_interlace.cafe", temp_dir);
+    let opts = EncodeOptions {
+        use_filter: true,
+        use_filter_per_row: true,
+        target_color_type: 6,
+        filter_heuristic: FilterHeuristic::Entropy,
+        interlace_method: constants::INTERLACE_ADAM7,
+        ..Default::default()
+    };
+    assert!(
+        encode(&input_png, &output_cafe, &opts).is_err(),
+        "expected error for use_filter_per_row with interlace"
+    );
+
+    let _ = fs::remove_file(&input_png);
+}

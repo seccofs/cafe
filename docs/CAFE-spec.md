@@ -101,7 +101,7 @@ That is, the `0x00` (raw) candidate always competes — if compression does not 
 | Sample format | 1 byte | `0`=uint, `1`=float, `2`=half-float (fp16) |
 | Color type | 1 byte | `0`=gray, `2`=RGB, `3`=indexed (requires PLTE), `4`=gray+alpha, `6`=RGBA (**default**) |
 | Compression method | 1 byte | Bitmask of codecs used in the file — `bit0`=ZSTD, remaining bits reserved (0) for future algorithms |
-| Filter method | 1 byte | `0`=none, `1`=byte-shuffle (implemented, section 4.3.2), `2`=predictive (code per block, see complete enum in section 4.3.1) |
+| Filter method | 1 byte | `0`=none, `1`=byte-shuffle (implemented, section 4.3.2), `2`=predictive (code per block, see complete enum in section 4.3.1), `3`=predictive per-row (code per line, section 4.3.1.1, implemented since v1.5) |
 | Interlace method | 1 byte | `0`=none, `1`=Adam7, `2`=even/odd |
 
 > Alpha channel by default: `Color type = 6` (RGBA) is the recommended value. If the source image has no alpha, the encoder fills with `0xFF` (opaque).
@@ -144,6 +144,7 @@ Supports indexed color palettes (images with few distinct colors — icons, pixe
 - **Sample format** must be `0` (uint). Index as float is invalid.
 - **Filter method**: the predictive filters from section 4.3.1 operate on already-packed bytes (not on indices/individual bits), valid for any `bit depth`. Byte-shuffle (section 4.3.2) **does not** apply to palettes: indices have 1 byte/pixel (`bytes per pixel = 1`, outside the required `{2, 4, 8, 16}` set), and an encoder must not write `Filter method = 1` with `Color type = 3`.
 - If the decoder finds `Color type = 3` without a preceding `PLTE` chunk, it must reject the file.
+- **Palette quantization algorithm (encoder-only, not part of the decoding contract)**: how an encoder picks which colors go into `PLTE` and which palette entry each pixel maps to is entirely an encoder-side decision — the decoder only ever reads whatever finished `PLTE` + indices it's given, so this has no bearing on file format compliance or interoperability (analogous to the filter-selection heuristics of section 4.3.1, which are also not part of the decoding contract). The reference implementation offers three interchangeable strategies: a simple greedy incremental nearest-neighbor collector (fastest, default), a median-cut algorithm (recursively splits color space for better average quality), and a nearest-neighbor variant using a perceptually-weighted ("redmean") distance metric instead of plain Euclidean distance for its nearest-match comparisons (v1.5) — the latter weights each channel's contribution based on the mean red level of the compared colors (see <https://www.compuphase.com/cmetric.htm>), an inexpensive approximation of human color perception that tends to produce fewer visually-jarring mismatches than unweighted Euclidean distance, particularly for palettes/images with colors near the red or blue extremes.
 
 #### 4.1.3 Pixel Byte Layout
 
@@ -184,6 +185,7 @@ Contains the pixels (or palette indices) of a block/tile of the image. Each `IDA
 ```
 raw pixels of block/tile (or packed palette indices, section 4.1.2)
     → (if Filter method = 2) apply predictive filter per block (section 4.3.1)
+    → (if Filter method = 3) apply predictive filter per row (section 4.3.1.1)
     → (if Filter method = 1) apply byte-shuffle per block/tile (section 4.3.2)
     → (if interlace ≠ 0) prefix pass_number
     → apply compression fallback rule (section 3.2), optionally with
@@ -196,7 +198,7 @@ raw pixels of block/tile (or packed palette indices, section 4.1.2)
 [pass_number: 1 byte][block lines, already filtered if Filter method = 2]
 ```
 
-When interlace = 0, the payload is directly the block/tile lines (already filtered if applicable), with no additional header beyond what section 4.3.1 describes.
+When interlace = 0, the payload is directly the block/tile lines (already filtered if applicable), with no additional header beyond what section 4.3.1 or 4.3.1.1 describes. `Filter method = 3` is never combined with interlace ≠ 0 (see section 4.3.1.1).
 
 Interlacing (Adam7 and even/odd, section 5) applies to both direct RGBA images and indexed palette images — in the latter case, the reference implementation converts indices to RGBA before interlacing, since the 7 Adam7 passes (of different resolutions) do not combine directly with variable-sized palettes per pass.
 
@@ -318,6 +320,27 @@ An encoder is free to implement any of these (or another) without breaking compa
 **Bytes per pixel (bpp)**, used to locate the "left neighbor": `bpp = bytes_per_sample × channels`, where `bytes_per_sample` is `1` for `bit depth ≤ 8` (including `1, 2, 4` packed — in that case the "channel" is already the packed byte, sections 4.1.1/4.1.2), `2` for `bit depth = 10, 12, 16` (16-bit container, section 4.1.3), and `4` for `bit depth = 32`. Minimum `bpp = 1`.
 
 **Tile edges:** since each `IDAT` is independent (streaming), the "above" neighbor only exists if the line **is not the first of the tile** — in the first line of each tile, the filter treats the above neighbor as all-zero, same convention as PNG for the first line of the entire image. This slightly reduces efficiency at small tile edges, but preserves the independence required by streaming (section 6). The same principle applies to extended neighbors of 2nd Order filter (`8`): `LL` is treated as zero when fewer than two columns are available left (`x < 2×bpp`), and `UU` is treated as zero when fewer than two lines are available above within the tile (first **or** second line of tile). Top-right neighbors of filters `14` and `15` follow the same convention: `TR` is treated as zero at the tile right edge (`x + bpp ≥ bytes_per_line`) or in the first line. The adaptive state of Weighted filter (`15`) is reset at the start of each block/tile and shared across all lines of the block — the decoder derives the same state in the same scan order.
+
+#### 4.3.1.1 Predictive Filter Per-Row (`Filter method = 3`) — implemented in reference since v1.5
+
+Variant of section 4.3.1 that chooses a predictor **independently for each line** of the block/tile, instead of a single predictor for the entire block. This trades 1 extra header byte per line (instead of 1 byte per block) for finer-grained adaptation to local content changes within a tile — useful when a tile mixes regions of different character (e.g., flat area followed by a sharp edge) that would otherwise be forced to share a single compromise predictor.
+
+**Payload layout:**
+
+```
+for each line of the block, in order:
+    [filter code: 1 byte][filtered line: bytes_per_row bytes]
+```
+
+Unlike section 4.3.1 (1 filter byte for the whole block, followed by all filtered lines concatenated), each line here carries its own filter code immediately before its data.
+
+**Available filter codes:** the same table as section 4.3.1, **codes `0`-`14`** (None through TR-Directional) — **excluding filter `15` (Weighted)**. Weighted requires its adaptive weight state to evolve continuously across consecutive lines of the same block under a single predictor; switching predictors line-to-line would leave that state's meaning undefined between lines using different filters. A decoder finding filter code `15` (or any code `≥ 15`) while `Filter method = 3` is active must reject the file with a recoverable error (`UnsupportedFeature`) — never fall back silently to another filter or treat it as filter `0`.
+
+**Heuristic restriction:** because the encoder must evaluate candidate filters once per line (rather than once per block), only the two cheapest heuristics from the table in section 4.3.1 are appropriate: **Sum of absolute values of residuals (MSAD)** and **Shannon Entropy**. The real-compression-test, QuickPrune, and AdaptiveEntropy heuristics are designed around block-level statistics or per-candidate compression cost and are not defined for per-row selection in the reference implementation; an encoder configured with `Filter method = 3` and one of those heuristics must reject the request before writing any data (`UnsupportedFeature`), rather than silently falling back to a block-level heuristic.
+
+**Compatibility:** `Filter method = 3` is mutually exclusive with byte-shuffle (`Filter method = 1`) and is **not** combined with interlace (Adam7/even-odd, section 5) or with `iDIM` 2D tiling (section 4.2) in the reference implementation — both combinations must be rejected by the encoder before writing, and a decoder encountering `Filter method = 3` together with `Interlace method ≠ 0` in `IHDR` must reject the file (same "declared-but-never-produced-together" logic already applied to `Filter method = 1` + interlace, section 4.3.2). Row-tiled `IDAT`s (section 4.3, non-2D-tiled path) are the only supported placement.
+
+**Tile edges:** the "above"/`UL`/`UU`/`TR` neighbor conventions from section 4.3.1 (all-zero at tile boundaries) apply identically per line here — each line's filter choice does not change how neighbors are located, only which predictor is applied to them.
 
 #### 4.3.2 Byte-shuffle (`Filter method = 1`) — implemented in reference since v1.1
 
@@ -443,10 +466,11 @@ Stores a ZSTD dictionary used to **improve compression of `IDAT` chunks** — es
 | Payload | rest of `Data` | Raw ZSTD dictionary (format defined by ZSTD library — may be a formally trained dictionary with embedded `Dictionary_ID`, or a "raw content dictionary" without such formality) |
 
 - **Scope**: the dictionary applies **only to `IDAT` chunks** of the file — not to `eXIF`, `jSON`, `iCCP`, or `xMPd`, which continue using ZSTD without dictionary. This scope restriction simplifies implementation and keeps metadata decodable regardless of `zDIC` presence/absence.
-- **Real use in compression (functional, not decorative)**: when present, **all** `IDAT` chunks with `Flag = 0x01` (ZSTD) in the file were compressed using this dictionary — mixing `IDAT` with and without dictionary in the same file is not permitted. Decoder must provide the same dictionary to decompressor when processing any `IDAT`.
+- **Real use in compression (functional, not decorative)**: when present, decoder must provide this dictionary to the decompressor when processing any `IDAT` with `Flag = 0x01` (ZSTD). Not every such `IDAT` is required to have actually been compressed *with* the dictionary — a decoder-configured dictionary is transparently ignored by ZSTD when decompressing a frame that was compressed without one, and used normally when the frame was compressed with it, since ZSTD frame headers self-describe dictionary usage (see the encoder non-regression guarantee below, which relies on exactly this property to mix dictionary and non-dictionary `IDAT`s in the same file when beneficial).
 - **Mandatory position**: before first `IDAT` (decoder needs dictionary available before processing any chunk depending on it).
 - **Behavior with formally trained dictionary**: if the dictionary was generated with a formal training tool (contains `Dictionary_ID`), decompression **fails explicitly** (`Dictionary mismatch`) if decoder tries a different dictionary or none — this is a property of ZSTD format itself, not something CAFE needs to implement separately.
 - **Single instance per file.**
+- **Encoder non-regression guarantee for auto-trained dictionaries (v1.5)**: a dictionary trained automatically from the image's own data (as opposed to one explicitly supplied by the caller) is only emitted — and only used to compress `IDAT`s — when doing so produces a strictly smaller file than not using a dictionary at all. This is not a decoder-side requirement (a `zDIC` chunk, once present, is always used exactly as described above); it is a recommendation for encoders that auto-train dictionaries: a ZSTD dictionary-mode frame carries fixed per-frame overhead that a plain frame doesn't, and this overhead can outweigh the compression gained from dictionary matches on small or highly-redundant tiles — measured up to ~78% *larger* output on synthetic repetitive content when this precaution isn't taken. An encoder implementing this guarantee should compare compression with and without the dictionary per `IDAT`, and additionally compare the whole-file total (the `zDIC` chunk's own size plus all `IDAT`s) against the equivalent no-dictionary encode, keeping whichever is smaller. A caller-supplied dictionary (i.e., not auto-trained) is exempt from this recommendation, since the caller made a deliberate choice to use it (e.g., a shared dictionary trained offline across a batch of related images).
 
 ### 4.10 `IEND` (critical, marks end of file)
 
@@ -517,7 +541,7 @@ A decoder without HDR support encountering `cHDR` should ignore it (ancillary ch
 | 9 | Sample format | 0=uint, 1=float, 2=half-float |
 | 10 | Color type | 0, 2, 3, 4, 6 (default: 6 = RGBA; 3 requires PLTE) |
 | 11 | Compression method | bitmask: bit0=ZSTD, other bits reserved for future algorithms |
-| 12 | Filter method | `0`=none, `1`=byte-shuffle (section 4.3.2, implemented), `2`=predictive (code per block, section 4.3.1) |
+| 12 | Filter method | `0`=none, `1`=byte-shuffle (section 4.3.2, implemented), `2`=predictive (code per block, section 4.3.1), `3`=predictive per-row (code per line, section 4.3.1.1, since v1.5) |
 | 13 | Interlace method | 0=none, 1=Adam7, 2=even/odd |
 
 **Total: 14 bytes payload in IHDR.**
@@ -548,7 +572,7 @@ IEND                  (mandatory, last)
 - **Fallback per chunk** (not per file) avoids compression overhead on high-entropy blocks (noise, already-lossy-compressed data).
 - **CRC per chunk** detects corruption without decompressing entire file.
 - **Critical/ancillary convention** allows adding new chunks (e.g., `iCCP`, `xMPd`, future geometric annotation chunk) without breaking old decoders.
-- Tile size is a trade-off: smaller tiles = more granular streaming, but more header/CRC overhead per chunk **and** lower predictive filter efficiency (section 4.3.1), since each tile restarts prediction on first line.
+- Tile size is a trade-off: smaller tiles = more granular streaming, but more header/CRC overhead per chunk **and** lower predictive filter efficiency (section 4.3.1), since each tile restarts prediction on first line. Empirically (reference encoder, v1.5 audit), compressed size improves monotonically as row-tile size grows — up to and including "no tiling at all" — across every content type tested (smooth, high-frequency, photo-like, and mixed/transitional content), with no reversal at any tested tile size. However, the reference encoder parallelizes tile compression across a thread pool, so wall-clock **encode time** follows the opposite, U-shaped curve: too many small tiles adds per-tile scheduling/framing overhead, while too few large tiles leaves insufficient parallel work for a multi-core machine, so each large ZSTD call runs largely serially. The reference encoder's default row-tile size (64 rows) sits at or near the empirical minimum of that time curve on both many-core and few-core machines, trading roughly 5-15% compressed size (vs. much larger tiles) for a 5-10x encode-time improvement — this is an encoder-side tuning decision, not a format requirement; other encoders may choose different defaults or expose tile size as a user-facing option.
 - **Predictive filter must not be confused with compression**: it reduces data entropy before ZSTD acts, but does not replace compression step nor fallback rule from section 3.2 — both techniques work together.
 
 ---

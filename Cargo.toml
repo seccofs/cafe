@@ -55,4 +55,8 @@ opt-level = 1
 
 [[bench]]
 name = "encode_decode"
-harness = true
+harness = false
+
+[[bench]]
+name = "simd_performance"
+harness = false

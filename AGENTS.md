@@ -584,6 +584,7 @@ cargo deny check                     # Security and license audit (requires: car
 | **v1.4** | **ARM NEON SIMD extended to all remaining modules**: `simd_packing.rs` (1/2/4-bit pack/unpack), `simd_sample_conversion.rs` (8↔16-bit expand/reduce, RGBA→luma8), `simd_shuffle.rs` (byte-shuffle via `vqtbl1q_u8`), `simd_quantize.rs` (nearest-palette search via widened `i32` distance + `vminvq_s32` reduction) — no SIMD module is AVX2-only anymore, 273 unit tests + 7 integration tests still passing on x86_64, cross-compile validated via `cargo check`/`cargo clippy --target aarch64-unknown-linux-gnu` | ✅ |
 | **v1.4.1** | **Real ARM execution validation (QEMU emulation via Docker)**: ran the full test suite natively on aarch64 for the first time (not just `cargo check`/`clippy` cross-compile) — found and fixed a real index-calculation bug in `simd_quantize.rs`'s NEON path that cross-compilation could never have caught (see "v1.4.1" notes below) | ✅ |
 | **v1.4.2** | **CI: ARM64 Cross-Compile Check job** — new `aarch64-cross-compile` job in `.github/workflows/ci.yml` runs `cargo check`/`cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` on every push/PR (Ubuntu runner + `gcc-aarch64-linux-gnu` cross-compiler, no `zig cc` needed since `apt` provides a native GNU cross-toolchain in CI), preventing future aarch64 regressions from merging unnoticed | ✅ |
+| **v1.5** | **Compression-focused audit (5 items)**: per-row predictive filter (`Filter method=3`, finer-grained adaptation than per-tile), real compression benchmarks + CI regression gate (`tests/compression_regression.rs`, `benches/encode_decode.rs`), `auto_dictionary` non-regression guarantee (never emits a `zDIC`-using encode larger than the no-dictionary equivalent), perceptually-weighted palette quantization (`PaletteAlgorithm::NearestNeighborWeighted`, redmean distance), `DEFAULT_TILE_ROWS` retuning investigation (benchmarked, kept at 64 — see "v1.5" notes below) | ✅ |
 | Future | Real hardware validation on physical ARM devices, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
 
 ---
@@ -654,7 +655,7 @@ cargo build --release --no-default-features
 2. **Real ARM hardware validation on physical devices** — QEMU emulation (v1.4.1) already caught and fixed one real NEON bug (see "v1.4.1" notes below); running the suite on actual ARM64 hardware (Raspberry Pi, mobile, Apple Silicon) would add confidence beyond emulation (e.g. timing-sensitive or alignment-sensitive behavior QEMU might not reproduce exactly)
 3. **Advanced 2D tiling** — iDIM with per-tile IDAT already implemented (row-major and Z-order); evolve with preview/progressive streaming
 4. **Optimized interlace** — Adam7 and even/odd already supported; optimize progressiveness and SIMD of passes
-5. **Optimized indexed palette** — Currently uses nearest-neighbor; could use k-means
+5. **Optimized indexed palette** — `NearestNeighbor`, `MedianCut`, and a perceptually-weighted (`NearestNeighborWeighted`, redmean distance, v1.5) variant already exist; could still use k-means clustering for the palette-building step itself (all three current algorithms use either greedy incremental collection or median-cut bucket splitting, not iterative clustering)
 6. **Automatic ZSTD dictionary** — Train dictionary for small images
 7. **Tone-mapping on encode (SDR→HDR)** — Inverse of decode; also operator selection (Reinhard/Filmic) via CLI
 8. **In-depth tone-mapping** — Validate color conversions in real HDR scenarios; look-up tables
@@ -697,7 +698,29 @@ cargo doc --open
 
 ---
 
-**Last updated:** September 1, 2026 | **Project version:** v1.4.2 | **ARM NEON SIMD Phase (Sep 1/2026):**
+**Last updated:** September 2, 2026 | **Project version:** v1.5 | **ARM NEON SIMD Phase (Sep 1/2026) + Compression-Focused Audit (Sep 2/2026):**
+
+### v1.5 - Compression-focused audit (5 items)
+
+A comparative audit of the CAFE algorithm was done to separate genuine compression gains from mere engineering/performance gains, yielding 5 prioritized improvements. Items #1-#4 are documented in detail inline (doc comments in `src/types.rs`, `src/cafe.rs`, `src/codec.rs`, `src/filter.rs`, `src/constants.rs`) and in `docs/CAFE-spec.md`/`docs/CAFE-spec.pt.md` (sections 4.1.2, 4.3.1.1, 4.9, 10); a summary of each, plus item #5's investigation in full, follows:
+
+1. **Per-row predictive filter** (`FILTER_METHOD_PREDICTIVE_PER_ROW = 3`, section 4.3.1.1 of the spec) — finer-grained filter adaptation than the existing per-tile filter (one filter byte per row instead of one per whole tile), at the cost of one extra byte per row before compression.
+2. **Real compression benchmarks + CI regression gate** — `tests/compression_regression.rs` asserts compressed size stays within tolerance across representative content types on every CI run; `benches/encode_decode.rs` (Criterion) gives detailed timing/ratio profiles for manual analysis.
+3. **`auto_dictionary` non-regression guarantee** — an auto-trained ZSTD dictionary is only emitted (and only used) when doing so produces a strictly smaller file than the no-dictionary equivalent, checked both per-`IDAT` (`src/codec.rs::compress_with_fallback_dict`) and whole-file (`src/cafe.rs::encode`, comparing `zDIC` chunk + IDATs vs. no-dict IDATs). `tests/dictionary_regression.rs` guards this across 13 pattern/size/tile_rows/level combinations. A caller-supplied dictionary (not auto-trained) is always honored unconditionally, since that's a deliberate choice by the caller.
+4. **Perceptually-weighted palette quantization** — `PaletteEntry::redmean_distance` (`src/types.rs`) implements the "redmean" approximation of human color perception (<https://www.compuphase.com/cmetric.htm>) as an integer-only, sqrt-free formula; wired into a new opt-in `PaletteAlgorithm::NearestNeighborWeighted` variant (`src/cafe.rs::quantize_nearest_neighbor_weighted`), deliberately scalar-only (the redmean weight depends on `(r1+r2)/2` per comparison, unlike the fixed-weight Euclidean distance the existing SIMD-accelerated `NearestNeighbor` path uses via `PaletteSoa`). Existing `NearestNeighbor`/`MedianCut` behavior is unchanged — this is purely additive.
+5. **`DEFAULT_TILE_ROWS` retuning investigation** — see below.
+
+**Item #5 investigation and conclusion (`DEFAULT_TILE_ROWS`, `src/constants.rs`):**
+
+The audit's premise was "benchmark first, decide later" — no production code was changed until data was collected. Three data sets were gathered, all in `tests/tile_rows_benchmark.rs`:
+
+- **Compression-size sweep** (`tile_rows_sweep_by_content_type`): 5 content types (checkerboard, gradient, repetitive4color, photo, vertical_bands) at 256×256 and 1024×1024, with and without per-row filtering, across `tile_rows ∈ {4,8,16,32,64,128,256}`. **Every case monotonically favored larger `tile_rows`** — no content type or size reversed the trend.
+- **Extreme-value probe** (`tile_rows_extreme_values_probe`): extended to `tile_rows` up to `100000` (i.e., no tiling — one `IDAT` for the whole image), on content deliberately crafted to reward small tiles (an abrupt gradient→checkerboard transition at the vertical midpoint of a 256×256 image) and on a large 2048×2048 gradient. **The trend never reversed** even at this extreme — compressed size kept improving (or plateaued) all the way to "no tiling at all," meaning there is no compression-only sweet spot smaller than "as large as possible."
+- **Speed-vs-size probe** (`tile_rows_speed_vs_size_tradeoff`): since `src/cafe.rs` parallelizes tile compression across a rayon thread pool, fewer/bigger tiles means less independent work to spread across cores. Measuring **wall-clock encode time** (not just size) revealed a clear U-shaped curve: too many small tiles adds per-tile scheduling/framing overhead; too few huge tiles leaves each individual ZSTD-19 call large and largely serial, starving a multi-core machine of parallel work. Tested on both a 24-core machine and a 4-core-limited run (`RAYON_NUM_THREADS=4`): in both cases the time-vs-`tile_rows` minimum fell in the `64..=128` range, very close to the existing default. Concretely, on a 1024×1024 photo-like image (24 cores): `tile_rows=64` → 1,203,271 bytes / ~250ms, vs. `tile_rows=1024` → 1,070,921 bytes / ~2,820ms — an ~11% size improvement costs an ~11x slowdown once tiles get large enough to run out of parallel work.
+
+**Decision: `DEFAULT_TILE_ROWS` stays at `64`.** Compression ratio alone would favor an arbitrarily large tile size (or no tiling), but that ignores encode-time cost: `64` already sits at or very near the empirical minimum of the time-vs-`tile_rows` curve on both many-core and few-core machines, while staying within single-digit-to-low-double-digit percent of the best observed compressed size at each tested dimension. Streaming granularity (spec sections 4.2/6 — each `IDAT` independently decodable) is a secondary benefit of not going arbitrarily large. This is a "keep + document the trade-off" outcome, not a code change; the trade-off itself is now documented quantitatively in `docs/CAFE-spec.md`/`docs/CAFE-spec.pt.md` section 10 and in `tests/tile_rows_benchmark.rs`'s module doc comment.
+
+**Validation:** `cargo build --release`, `cargo test` (full suite, including all three `tile_rows_benchmark.rs` tests and all pre-existing tests), `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` all pass with zero regressions.
 
 ### v1.3.0 - ARM NEON SIMD (aarch64)
 

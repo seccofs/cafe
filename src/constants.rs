@@ -22,6 +22,13 @@ pub const COMPRESSION_METHOD_ZSTD_BIT: u8 = 0b0000_0001;
 pub const FILTER_METHOD_NONE: u8 = 0;
 pub const FILTER_METHOD_BYTE_SHUFFLE: u8 = 1;
 pub const FILTER_METHOD_PREDICTIVE: u8 = 2;
+/// Per-row predictive filter (v1.5): unlike `FILTER_METHOD_PREDICTIVE` (one
+/// filter code for the whole tile), each row within a tile carries its own
+/// 1-byte filter code, chosen independently. F_WEIGHTED (15) is excluded
+/// from the per-row candidate set (see `NUM_FILTERS_PER_ROW`) because its
+/// adaptive state is only well-defined when the same filter runs across
+/// consecutive rows of a block.
+pub const FILTER_METHOD_PREDICTIVE_PER_ROW: u8 = 3;
 pub const INTERLACE_NONE: u8 = 0;
 
 pub const CHUNK_IHDR: &[u8; 4] = b"IHDR";
@@ -54,6 +61,11 @@ pub const F_CONTEXT: u8 = 13; // Context-Based: Detects edges and chooses dynami
 pub const F_TR_DIRECTIONAL: u8 = 14; // TR-aware Directional: bilinear average with top-right neighbor (WebP Predictor 10, v1.1)
 pub const F_WEIGHTED: u8 = 15; // Adaptive Weighted: adaptive weighted predictor (inspired by JPEG-XL, v1.1)
 pub const NUM_FILTERS: u8 = 16;
+/// Number of filter candidates considered for per-row selection (v1.5,
+/// `FILTER_METHOD_PREDICTIVE_PER_ROW`). Excludes F_WEIGHTED (15), whose
+/// adaptive state is only meaningful across multiple consecutive rows of the
+/// same filter — see module docs in `filter.rs`.
+pub const NUM_FILTERS_PER_ROW: u8 = 15;
 
 // --- Adam7 Interlace (section 5, v1.0 Phase 3) ---
 pub const INTERLACE_ADAM7: u8 = 1;

@@ -58,7 +58,10 @@ fn usage() {
         "                           Useful for small/repetitive images, improves compression"
     );
     eprintln!("  --palette-algorithm <a>  Palette quantization algorithm (v1.1, indexed only):");
-    eprintln!("                           nearest (default, fast), median-cut (better quality)");
+    eprintln!("                           nearest (default, fast), median-cut (better quality),");
+    eprintln!(
+        "                           weighted (v1.5, perceptual/redmean distance, scalar-only)"
+    );
     eprintln!("  --color-type <type>      Color type (default: auto-detect):");
     eprintln!("                           0=GRAY (1 byte/px, -75%), 2=RGB (3 bytes/px, -25%)");
     eprintln!("                           4=GRAY_ALPHA (2 bytes/px), 6=RGBA (4 bytes/px)");
@@ -125,7 +128,7 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
     let user_specified_indexed = args.iter().any(|a| a == "--indexed");
     let auto_dictionary = args.iter().any(|a| a == "--auto-dict");
 
-    // Parse --palette-algorithm <nearest|median-cut>
+    // Parse --palette-algorithm <nearest|median-cut|weighted>
     let palette_algorithm = if let Some(pos) = args.iter().position(|a| a == "--palette-algorithm")
     {
         let algo = require_arg_value(args, pos, "--palette-algorithm")?;

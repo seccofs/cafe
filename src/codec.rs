@@ -53,23 +53,51 @@ pub(crate) fn decompress_chunk(flag: u8, data: &[u8]) -> Result<Vec<u8>> {
 /// Same as `compress_with_fallback`, but using a ZSTD dictionary when
 /// provided (section 4.9, zDIC). Scope: used only for IDAT chunks — the
 /// dictionary does not apply to other chunks (eXIF, jSON, iCCP, xMPd).
+///
+/// **Dictionary fallback guarantee (v1.5):** a ZSTD dictionary trained from a
+/// handful of sample tiles (see `train_zstd_dictionary` in `cafe.rs`) can
+/// backfire badly on small/highly-redundant payloads — the dictionary-mode
+/// ZSTD frame carries extra framing overhead that a plain (non-dictionary)
+/// frame doesn't, and this overhead can outweigh any actual gain from
+/// dictionary matches (measured up to ~78% *larger* output on synthetic
+/// checkerboard/repetitive content during the v1.4.2 compression audit).
+/// To make `dict` strictly non-regressive, this function always also tries
+/// compressing without the dictionary and keeps whichever of
+/// `{raw, zstd-no-dict, zstd-with-dict}` is smallest. Decoding a
+/// no-dictionary frame with a dictionary-configured decoder (or vice versa)
+/// is safe — ZSTD frame headers self-describe whether a dictionary was used,
+/// so `decompress_chunk_dict_limited` does not need to know in advance
+/// whether a given IDAT actually used the dictionary.
+///
+/// Returns `(flag, compressed_bytes, used_dict)` — `used_dict` tells the
+/// caller whether the dictionary was the winning candidate for this chunk,
+/// so callers (see `append_zdic_chunk_if_present` call sites in `cafe.rs`)
+/// can skip emitting the `zDIC` chunk entirely when no IDAT ends up using it.
 pub(crate) fn compress_with_fallback_dict(
     raw: &[u8],
     level: i32,
     dict: Option<&[u8]>,
-) -> Result<(u8, Vec<u8>)> {
-    let compressed = match dict {
+) -> Result<(u8, Vec<u8>, bool)> {
+    let no_dict_compressed = zstd::encode_all(raw, level).map_err(CafeError::Zstd)?;
+
+    let (best_compressed, used_dict) = match dict {
         Some(d) => {
             let mut compressor =
                 zstd::bulk::Compressor::with_dictionary(level, d).map_err(CafeError::Zstd)?;
-            compressor.compress(raw).map_err(CafeError::Zstd)?
+            let dict_compressed = compressor.compress(raw).map_err(CafeError::Zstd)?;
+            if dict_compressed.len() < no_dict_compressed.len() {
+                (dict_compressed, true)
+            } else {
+                (no_dict_compressed, false)
+            }
         }
-        None => zstd::encode_all(raw, level).map_err(CafeError::Zstd)?,
+        None => (no_dict_compressed, false),
     };
-    if compressed.len() < raw.len() {
-        Ok((FLAG_ZSTD, compressed))
+
+    if best_compressed.len() < raw.len() {
+        Ok((FLAG_ZSTD, best_compressed, used_dict))
     } else {
-        Ok((FLAG_RAW, raw.to_vec()))
+        Ok((FLAG_RAW, raw.to_vec(), false))
     }
 }
 
