@@ -419,6 +419,78 @@ reversal, budget enforcement) is shared, not duplicated. `decode_bytes`/
 on an in-memory `&[u8]` — `Decoder<R>` is an additional, independent API,
 not a replacement.
 
+#### Streaming Encoder (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`, v1.6+)
+
+Symmetric counterpart to `Decoder<R>`: writes `IHDR` and each row-strip
+`IDAT` immediately as tiles arrive, instead of requiring the whole image in
+memory before `encode()` can produce any output.
+
+```rust
+pub struct Encoder<W: Write> { /* ... */ }
+
+impl<W: Write> Encoder<W> {
+    pub fn new(writer: W, width: u32, height: u32, opts: &EncoderOptions) -> Result<Self>
+    pub fn tile_rows(&self) -> u32                    // suggested, not enforced
+    pub fn add_tile(&mut self, rgba_tile: &[u8]) -> Result<()> // width*tile_height*4 bytes RGBA
+    pub fn finish(self) -> Result<W>                  // conservative compression_method
+}
+
+impl<W: Write + Seek> Encoder<W> {
+    pub fn finish_exact(self) -> Result<W>            // patched, exact compression_method
+}
+
+pub struct EncoderOptions { /* tile_rows, level, use_filter(_per_row), target_color_type,
+                               target_bit_depth, exif, json_metadata, icc_profile,
+                               xmp_metadata, zstd_dictionary, sample_format, chdr_metadata,
+                               filter_heuristic, use_byte_shuffle */ }
+```
+
+**Call order**: `new()` once (writes signature + `IHDR` + pre-IDAT
+ancillary chunks immediately), then `add_tile()` any number of times with
+row-strip buffers (`width * tile_height * 4` bytes RGBA — `tile_height` is
+inferred from the buffer, not required to equal `EncoderOptions::tile_rows`
+or be constant across calls), then `finish()`/`finish_exact()` once all
+`height` rows have been submitted. See `examples/streaming_encode.rs` for a
+complete runnable example.
+
+**Limitations (v1 of this API, see `EncoderOptions`'s doc comment for the
+full rationale)**: no indexed palette (`COLOR_TYPE_INDEXED` — palette
+quantization needs the whole image upfront; use `encode_indexed()`
+instead), no `iDIM` (2D tiling), no interlace (Adam7/even-odd), no
+`auto_dictionary` (training needs to sample several tiles before
+compressing any). Only row-strip tiling and direct color types
+(Gray/RGB/GrayAlpha/RGBA), mirroring `Decoder<R>`'s existing limitation for
+symmetry between the two streaming APIs. An explicit, caller-supplied
+`zstd_dictionary` remains supported.
+
+**`compression_method` (`IHDR` field, section 4.1) semantics**: `Encoder<W:
+Write>` cannot know in advance whether any tile will end up using ZSTD, and
+(being `Write`-only) cannot seek back to patch `IHDR` after the fact — so
+`finish()` leaves the ZSTD bit set unconditionally, an overestimate that is
+always safe (a decoder may reject the file as needing a codec it doesn't
+actually need, but never accepts a file it can't actually decompress).
+`Encoder<W: Write + Seek>::finish_exact()` instead patches the byte (and
+recomputes `IHDR`'s CRC32) to the exact value once every chunk is known,
+identical to what `encode()`'s `patch_ihdr_compression_method` produces for
+the same pixels/options — verified byte-for-byte in
+`tests/streaming_encode.rs::test_streaming_encoder_matches_whole_file_encode_byte_for_byte`.
+The CRC recomputation avoids requiring `W: Read` (which `Write + Seek`
+alone does not guarantee) by keeping an in-memory copy of the 19
+already-written `IHDR` chunk bytes (Type + Flag + Data) from `new()`,
+rather than seeking back and re-reading them from `writer`.
+
+**Implementation note**: tiles are compressed sequentially as `add_tile()`
+receives them — no rayon parallelism across tiles, unlike `encode()`'s
+whole-image path, since there's no independent future work to farm out to
+a thread pool when the caller controls the pace of tile submission. Two
+helpers were factored out of `encode()`'s tile pipeline to be shared with
+`add_tile()` without duplication: `apply_single_tile_filter` (byte-shuffle/
+predictive/predictive-per-row/none dispatch for one tile) and
+`bytes_per_row_for_direct_color` (stride calculation for direct color
+types). `append_common_metadata_chunks`'s signature was also generalized
+(primitive parameters instead of `&EncodeOptions`) so both `encode()` and
+`Encoder::new()` can call it for `eXIF`/`jSON`/`iCCP`/`xMPd`.
+
 ### Color Conversion Functions
 
 Implemented in `src/color.rs`:
@@ -648,6 +720,7 @@ cargo deny check                     # Security and license audit (requires: car
 | **v1.4.1** | **Real ARM execution validation (QEMU emulation via Docker)**: ran the full test suite natively on aarch64 for the first time (not just `cargo check`/`clippy` cross-compile) — found and fixed a real index-calculation bug in `simd_quantize.rs`'s NEON path that cross-compilation could never have caught (see "v1.4.1" notes below) | ✅ |
 | **v1.4.2** | **CI: ARM64 Cross-Compile Check job** — new `aarch64-cross-compile` job in `.github/workflows/ci.yml` runs `cargo check`/`cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` on every push/PR (Ubuntu runner + `gcc-aarch64-linux-gnu` cross-compiler, no `zig cc` needed since `apt` provides a native GNU cross-toolchain in CI), preventing future aarch64 regressions from merging unnoticed | ✅ |
 | **v1.5** | **Compression-focused audit (5 items)**: per-row predictive filter (`Filter method=3`, finer-grained adaptation than per-tile), real compression benchmarks + CI regression gate (`tests/compression_regression.rs`, `benches/encode_decode.rs`), `auto_dictionary` non-regression guarantee (never emits a `zDIC`-using encode larger than the no-dictionary equivalent), perceptually-weighted palette quantization (`PaletteAlgorithm::NearestNeighborWeighted`, redmean distance), `DEFAULT_TILE_ROWS` retuning investigation (benchmarked, kept at 64 — see "v1.5" notes below) | ✅ |
+| **v1.6** | **Streaming Encoder** (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to v1.5's `Decoder<R: Read>`): writes `IHDR` + ancillary chunks + row-strip `IDAT`s incrementally as tiles arrive instead of requiring the whole image in memory first; `finish()` leaves `compression_method`'s ZSTD bit conservatively set (safe overestimate) for `Write`-only destinations, `finish_exact()` patches it to the exact value (byte-for-byte identical to `encode()`) when `W` also supports `Seek` — see "v1.6" notes below | ✅ |
 | Future | Real hardware validation on physical ARM devices, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
 
 ---
@@ -761,7 +834,23 @@ cargo doc --open
 
 ---
 
-**Last updated:** September 2, 2026 | **Project version:** v1.5 | **ARM NEON SIMD Phase (Sep 1/2026) + Compression-Focused Audit (Sep 2/2026):**
+**Last updated:** September 3, 2026 | **Project version:** v1.6 | **ARM NEON SIMD Phase (Sep 1/2026) + Compression-Focused Audit (Sep 2/2026) + Streaming Encoder (Sep 3/2026):**
+
+### v1.6 - Streaming Encoder (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`)
+
+Symmetric counterpart to v1.5's `Decoder<R: Read>` (see "Streaming Decoder" under "Reference Implementation" above): writes `IHDR` and each row-strip `IDAT` immediately as tiles arrive via `add_tile()`, instead of requiring `encode()`'s whole-image-in-memory path before any output can be produced.
+
+- **`EncoderOptions`** (`src/types.rs`): a deliberately smaller sibling of `EncodeOptions`, omitting `auto_dictionary` (needs to sample several tiles before compressing any — incompatible with incremental submission), `idim`/2D tiling (needs the full tile grid upfront), `interlace_method` (Adam7/even-odd need the whole image's pixels to interleave), and indexed-palette support (`target_color_type` restricted to direct color types — quantization needs to see every pixel before a single index can be emitted; `encode_indexed()` remains the only path for `COLOR_TYPE_INDEXED`).
+- **`Encoder::new(writer, width, height, opts)`**: validates dimensions/color-type/filter combinations (same rules as `encode()`), writes the signature + `IHDR` + all pre-`IDAT` ancillary chunks (`cHDR`/`eXIF`/`jSON`/`iCCP`/`xMPd`/`zDIC`) immediately.
+- **`Encoder::add_tile(rgba_tile)`**: infers tile height from the buffer's length (`len / (width*4)`), so callers may submit irregular tile sizes rather than being locked to `EncoderOptions::tile_rows` (a suggestion only, exposed via the `tile_rows()` getter). Compresses and writes one `IDAT` per call, sequentially (no rayon parallelism across tiles, unlike `encode()`'s whole-image path — there's no independent future work to farm out when the caller controls submission pace).
+- **`Encoder::finish()` / `Encoder::finish_exact()`**: both require every declared row to have been submitted first (`UnsupportedFeature` otherwise, preventing a silently-truncated image from being accepted as valid). `finish()` (`W: Write`) leaves `IHDR`'s `compression_method` ZSTD bit conservatively set from `new()` — an intentional overestimate, since a `Write`-only destination cannot seek back to correct it, and overestimating is the only safe direction for that field (see spec section 4.1's new note). `finish_exact()` (`W: Write + Seek`) instead patches the byte to its exact, non-conservative value and recomputes `IHDR`'s CRC32, matching `encode()`'s own `patch_ihdr_compression_method` byte-for-byte.
+- **Avoiding a `Read` bound on `finish_exact()`**: the first implementation attempt re-read the already-written stream (via a `read_chunk_from`-based scan) to determine whether any chunk used ZSTD — but `W: Write + Seek` does not guarantee `Read` (e.g. some socket/pipe wrappers), so that approach didn't compile in the general case. Fixed by tracking `uses_zstd: bool` incrementally as a struct field (updated in both `new()`, for ancillary chunks, and `add_tile()`, for each `IDAT`'s actual compression outcome) and keeping an in-memory copy of the 19 already-written `IHDR` chunk bytes (`ihdr_type_flag_data: [u8; 19]`, Type+Flag+Data) from `new()` — `finish_exact()` patches the copy and recomputes the CRC32 purely from memory, then seeks only to *write* (never read) the two patched spans.
+- **Code reuse with `encode()`**: two helpers were extracted from `encode()`'s existing tile pipeline specifically so `add_tile()` could reuse them without duplicating logic — `apply_single_tile_filter` (byte-shuffle/predictive/predictive-per-row/none dispatch for a single tile) and `bytes_per_row_for_direct_color` (stride calculation for direct color types). `append_common_metadata_chunks`'s signature was also generalized to take primitive parameters instead of `&EncodeOptions`, so both `encode()`/`encode_indexed()` and `Encoder::new()` can call it.
+- **Testing**: `tests/streaming_encode.rs` (17 tests) covers pixel-exact round-trips through both `finish()` and `finish_exact()`, the conservative-vs-exact `compression_method` byte in each case, irregular/variable tile heights, every documented error path (non-multiple-of-row-width tile, single-call and cumulative height overflow, incomplete `finish()`/`finish_exact()`, `COLOR_TYPE_INDEXED` rejection, zero dimensions, unsupported per-row heuristic), non-default color types (Gray) and byte-shuffle/per-row-filter through the streaming path, and — most importantly — a byte-for-byte comparison (`test_streaming_encoder_matches_whole_file_encode_byte_for_byte`) confirming `Encoder<W>::finish_exact()`'s output is bit-identical to `encode()`'s whole-file output for the same pixels/options, not just pixel-equivalent after decoding.
+- **Example**: `examples/streaming_encode.rs`, symmetric to `examples/streaming_decode.rs`, demonstrates feeding row-strip tiles read from a whole-image `image::open()` call (a real streaming producer would instead hand tiles to `add_tile()` as they become available, e.g. from a renderer or another format's `Decoder<R>`).
+- **Docs**: `docs/CAFE-spec.md`/`docs/CAFE-spec.pt.md` gained a new subsection 6.1 (streaming encode) and a note under section 4.1's `Compression method` field explaining the conservative-overestimation semantics for non-seekable destinations.
+
+**Validation:** `cargo build --lib`, `cargo test` (full suite — 311 lib tests + all integration suites including the new 17-test `streaming_encode.rs`, plus doc-tests), `cargo clippy --tests -- -D warnings`, `cargo fmt --check` all pass with zero regressions. `cargo run --example streaming_encode` manually verified end-to-end against a generated PNG, decoded back via `cargo run --example basic_decode` to confirm output byte size matches the source.
 
 ### v1.5 - Compression-focused audit (5 items)
 

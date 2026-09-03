@@ -7,7 +7,7 @@
 
 A modern chunk-based image format inspired by PNG, with support for ZSTD compression, advanced predictive filters (16 types), indexed palette, structured metadata (EXIF, JSON, ICC, XMP), and progressive interlacing.
 
-**Version**: 1.5.0  
+**Version**: 1.6.0  
 **Status**: ✅ Complete, audited, and SIMD-accelerated  
 **Compatibility**: Rust 2021+
 
@@ -44,6 +44,7 @@ A modern chunk-based image format inspired by PNG, with support for ZSTD compres
 - **Interlacing**: Adam7 (7 passes) or Even/Odd (2 passes)
 - Incremental decoding (chunk-by-chunk)
 - **`Decoder<R: Read>` streaming API**: decode tile-by-tile directly off any `Read` source (file, socket, `Cursor`) without buffering the whole compressed file or the whole decoded image in memory — see `examples/streaming_decode.rs` and the "Library API" section below (row-strip tiling only; falls back to `decode`/`decode_bytes` for 2D-tiled or interlaced files)
+- **`Encoder<W: Write>` streaming API** (v1.6): symmetric counterpart — write `IHDR` and each row-strip `IDAT` immediately as tiles arrive via `add_tile()`, instead of requiring the whole image in memory before `encode()` can produce output; `Encoder<W: Write + Seek>::finish_exact()` patches `compression_method` to its exact value (byte-for-byte identical to `encode()`), while plain `Write` destinations get a conservative (always-safe) overestimate — see `examples/streaming_encode.rs` and the "Library API" section below (no indexed palette, 2D tiling, or interlace in this v1)
 
 ### Compression Audit (v1.5)
 - **Per-row predictive filter** (`Filter method=3`): finer-grained adaptation than per-tile filtering
@@ -91,7 +92,7 @@ cafe/
 │   ├── cafe-encode.rs            # Encoder binary
 │   └── cafe-decode.rs            # Decoder binary
 ├── docs/                          # Documentation
-│   ├── CAFE-spec.md              # Complete specification (v1.1, updated through v1.5)
+│   ├── CAFE-spec.md              # Complete specification (v1.1, updated through v1.6)
 │   ├── CAFE-spec.pt.md           # Portuguese version of the spec
 │   ├── SECURITY_AUDIT.md         # Security audit
 │   └── DEVELOPER_GUIDE.md        # Developer guide
@@ -200,6 +201,28 @@ See `examples/streaming_decode.rs` for a complete runnable example, including
 the fallback path for files using 2D tiling (`iDIM`) or interlacing, which
 `next_tile()` does not support (check `info.supports_streaming_tiles`).
 
+#### Streaming encode (large images / incremental producers)
+
+```rust
+use cafe::{Encoder, EncoderOptions};
+use std::fs::File;
+
+let file = File::create("output.cafe")?;
+let opts = EncoderOptions::default();
+let mut encoder = Encoder::new(file, width, height, &opts)?; // writes IHDR immediately
+
+for row_strip in tiles {
+    encoder.add_tile(&row_strip)?; // width * tile_height * 4 bytes RGBA per call
+}
+
+let _file = encoder.finish_exact()?; // exact compression_method (requires Seek)
+// or encoder.finish()? for Write-only destinations (conservative compression_method)
+```
+
+See `examples/streaming_encode.rs` for a complete runnable example. `Encoder<W>`
+v1 supports row-strip tiling and direct color types only (no indexed palette,
+2D tiling, or interlace — see `EncoderOptions`'s doc comment).
+
 ### CLI
 
 ```bash
@@ -301,6 +324,7 @@ Contributions welcome! High-potential areas:
 - [x] **Automatic ZSTD dictionary non-regression guarantee** — *complete in v1.5* (`auto_dictionary` only used when it strictly shrinks the file)
 - [x] **Perceptually-weighted palette quantization** — *complete in v1.5* (`PaletteAlgorithm::NearestNeighborWeighted`, redmean distance)
 - [x] **Real compression benchmarks + CI regression gate** — *complete in v1.5* (`tests/compression_regression.rs`, `benches/encode_decode.rs`)
+- [x] **Streaming encoder** — *complete in v1.6* (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`)
 
 ---
 
@@ -317,6 +341,7 @@ Contributions welcome! High-potential areas:
 | **v1.4.1** | **Real ARM execution validation (QEMU emulation)**: full test suite run natively on aarch64 for the first time — found and fixed a real NEON index-calculation bug that cross-compile checks alone couldn't catch | ✅ Complete |
 | **v1.4.2** | **CI: ARM64 cross-compile check** — new `aarch64-cross-compile` job runs `cargo check`/`clippy --target aarch64-unknown-linux-gnu` on every push/PR, preventing future aarch64 regressions from merging unnoticed | ✅ Complete |
 | **v1.5** | **Compression-focused audit (5 items)**: per-row predictive filter (`Filter method=3`), real compression benchmarks + CI regression gate, `auto_dictionary` non-regression guarantee, perceptually-weighted palette quantization (redmean distance), `DEFAULT_TILE_ROWS` retuning investigation (kept at 64, documented trade-off) | ✅ Complete |
+| **v1.6** | **Streaming Encoder** (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`): writes `IHDR` + ancillary chunks + row-strip `IDAT`s incrementally as tiles arrive, symmetric counterpart to v1.5's `Decoder<R: Read>`; `finish()` sets a conservative `compression_method` for `Write`-only destinations, `finish_exact()` patches it to the exact value (byte-for-byte identical to `encode()`) when `W` also supports `Seek` | ✅ Complete |
 | **Future** | Real hardware validation on physical ARM devices, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR) | 🔮 Planned |
 
 ---
@@ -349,6 +374,6 @@ Architecture, specification, Rust reference implementation (v1.1)
 
 ---
 
-**Last updated**: 2026-09-02 (v1.5: compression-focused audit — per-row predictive filter, dictionary non-regression guarantee, redmean-weighted palette, compression regression CI gate)  
-**Test Coverage**: 288 lib tests + 12 integration test suites (roundtrip, SIMD, compression regression, dictionary regression, palette algorithm, tile_rows benchmarks, etc.)  
+**Last updated**: 2026-09-03 (v1.6: streaming encoder — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`)  
+**Test Coverage**: 311 lib tests + 13 integration test suites (roundtrip, streaming encode, SIMD, compression regression, dictionary regression, palette algorithm, tile_rows benchmarks, etc.)  
 **Next security audit**: 2027-08-04

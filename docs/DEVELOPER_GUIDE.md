@@ -4,7 +4,7 @@
 
 CAFE (Compression Adaptive Filtering Experiment) is a modern chunk-based image format, inspired by PNG, with support for ZSTD compression, advanced predictive filters, indexed palette, and structured metadata (EXIF, JSON, ICC, XMP).
 
-**Specification:** `docs/CAFE-spec.md` (722 lines, v1.1, updated through v1.5)
+**Specification:** `docs/CAFE-spec.md` (v1.1, updated through v1.6)
 **Implementation:** Rust 2021 with BSD-3-Clause license
 
 ---
@@ -47,7 +47,7 @@ Cafe/
 │   ├── basic_encode.rs   # Basic encoding example
 │   └── basic_decode.rs   # Basic decoding example
 ├── docs/                 # Spec, security audit, dev guide
-│   ├── CAFE-spec.md      # Complete format specification (v1.1, updated through v1.5)
+│   ├── CAFE-spec.md      # Complete format specification (v1.1, updated through v1.6)
 │   ├── CAFE-spec.pt.md   # Portuguese version of the spec
 │   ├── SECURITY_AUDIT.md # Security audit report
 │   └── DEVELOPER_GUIDE.md # Developer guide
@@ -368,6 +368,75 @@ pub struct DecodeResult {
 }
 ```
 
+#### Streaming Decoder (`Decoder<R: Read>`, v1.5+)
+
+For large images or memory-constrained environments, `Decoder<R: Read>`
+decodes tile-by-tile directly off any `Read` source (file, socket, in-memory
+`Cursor`) instead of requiring the whole compressed file or the whole
+decoded image to be materialized in memory up front.
+
+```rust
+pub struct Decoder<R: Read> { /* ... */ }
+
+impl<R: Read> Decoder<R> {
+    pub fn new(reader: R) -> Self
+    pub fn read_info(&mut self) -> Result<DecodeInfo>       // reads signature + all pre-IDAT chunks
+    pub fn next_tile(&mut self) -> Result<Option<Tile>>     // one IDAT -> one Tile, None at IEND
+    pub fn finish(self) -> Result<DecodeResult>             // drains remaining IDATs, returns metadata
+}
+```
+
+**Call order**: `read_info()` exactly once, then `next_tile()` in a loop
+until `Ok(None)`, then optionally `finish()` for ancillary metadata.
+`next_tile()` returns `UnsupportedFeature` for files with `iDIM` (2D tiling)
+or Adam7/even-odd interlacing — check `DecodeInfo::supports_streaming_tiles`
+first and fall back to `decode`/`decode_bytes` for those. See
+`examples/streaming_decode.rs` for a complete runnable example, and
+`AGENTS.md`'s "Streaming Decoder" section for full field-by-field detail.
+
+#### Streaming Encoder (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`, v1.6+)
+
+Symmetric counterpart to `Decoder<R>`: writes `IHDR` and each row-strip
+`IDAT` immediately as tiles arrive, instead of requiring the whole image in
+memory before `encode()` can produce any output.
+
+```rust
+pub struct Encoder<W: Write> { /* ... */ }
+
+impl<W: Write> Encoder<W> {
+    pub fn new(writer: W, width: u32, height: u32, opts: &EncoderOptions) -> Result<Self>
+    pub fn tile_rows(&self) -> u32                    // suggested, not enforced
+    pub fn add_tile(&mut self, rgba_tile: &[u8]) -> Result<()> // width*tile_height*4 bytes RGBA
+    pub fn finish(self) -> Result<W>                  // conservative compression_method
+}
+
+impl<W: Write + Seek> Encoder<W> {
+    pub fn finish_exact(self) -> Result<W>            // patched, exact compression_method
+}
+```
+
+**Call order**: `new()` once (writes signature + `IHDR` + pre-IDAT
+ancillary chunks immediately), then `add_tile()` any number of times with
+row-strip buffers (`width * tile_height * 4` bytes RGBA — `tile_height` is
+inferred from the buffer, not required to be constant across calls), then
+`finish()`/`finish_exact()` once all `height` rows have been submitted.
+
+**Limitations (v1)**: no indexed palette (`COLOR_TYPE_INDEXED` —
+`encode_indexed()` remains the only path for that), no `iDIM` (2D tiling),
+no interlace (Adam7/even-odd), no `auto_dictionary`. Only row-strip tiling
+and direct color types (Gray/RGB/GrayAlpha/RGBA), mirroring `Decoder<R>`'s
+existing limitation. An explicit, caller-supplied `zstd_dictionary` remains
+supported.
+
+**`compression_method` semantics**: `finish()` (`W: Write`, cannot seek
+back) leaves the ZSTD bit set unconditionally — a safe overestimate, never
+an underestimate. `finish_exact()` (`W: Write + Seek`) instead patches the
+byte (and recomputes `IHDR`'s CRC32) to its exact value once every chunk is
+known, byte-for-byte identical to `encode()`'s own output for the same
+pixels/options. See `examples/streaming_encode.rs` for a complete runnable
+example, and `AGENTS.md`'s "Streaming Encoder" section for full
+implementation detail.
+
 ### Color Conversion Functions
 
 Implemented in `src/color.rs`:
@@ -591,6 +660,7 @@ cargo deny check                     # Security and license audit (requires: car
 | **v1.4.1** | **Real ARM execution validation (QEMU emulation)**: ran the full test suite natively on aarch64 for the first time — found and fixed a real NEON index-calculation bug in `simd_quantize.rs` that cross-compilation alone could never have caught | ✅ |
 | **v1.4.2** | **CI: ARM64 Cross-Compile Check job** — new `aarch64-cross-compile` job in `.github/workflows/ci.yml` runs `cargo check`/`cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` on every push/PR (Ubuntu runner + `gcc-aarch64-linux-gnu`), preventing future aarch64 regressions from merging unnoticed | ✅ |
 | **v1.5** | **Compression-focused audit (5 items)**: per-row predictive filter (`Filter method=3`), real compression benchmarks + CI regression gate (`tests/compression_regression.rs`, `benches/encode_decode.rs`), `auto_dictionary` non-regression guarantee, perceptually-weighted palette quantization (`PaletteAlgorithm::NearestNeighborWeighted`, redmean distance), `DEFAULT_TILE_ROWS` retuning investigation (benchmarked, kept at 64) | ✅ |
+| **v1.6** | **Streaming Encoder** (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to v1.5's `Decoder<R: Read>`): writes `IHDR` + ancillary chunks + row-strip `IDAT`s incrementally as tiles arrive; `finish()` sets a conservative `compression_method` for `Write`-only destinations, `finish_exact()` patches it to the exact value (byte-for-byte identical to `encode()`) when `W` also supports `Seek` | ✅ |
 | Future | Real hardware validation on physical ARM devices, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
 
 ---
@@ -690,4 +760,4 @@ cargo doc --open
 
 ---
 
-**Last updated:** September 2, 2026 (v1.5: compression-focused audit — per-row predictive filter, dictionary non-regression guarantee, redmean-weighted palette, compression regression CI gate) | **Project version:** v1.5.0
+**Last updated:** September 3, 2026 (v1.6: streaming encoder — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`) | **Project version:** v1.6.0

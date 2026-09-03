@@ -109,6 +109,8 @@ That is, the `0x00` (raw) candidate always competes — if compression does not 
 > **`Filter method = 1` (byte-shuffle, implemented since v1.1):** preprocessing technique for multi-byte samples (bytes per pixel ∈ `{2, 4, 8, 16}`), designed especially for float/HDR data: reorders bytes by position within the sample — all least significant bytes of all pixels first, then most significant — which typically compresses float data much better than natural interleaved order (correlation between bytes of the same position survives compression better). The exact layout, restrictions, and pipeline order are in section 4.3.2. An old decoder finding `Filter method = 1` must **explicitly reject the file** (it is an `IHDR` field, therefore critical — same logic as section 5.1 for `Interlace method`), never treat it silently as equivalent to `0` (no filter).
 
 > **Compression method (bitmask):** the encoder sets `bit0` if at least one chunk in the file uses `Flag = 0x01` (ZSTD). Additional bits are reserved for future compression algorithms. This allows the decoder to verify, immediately after reading `IHDR`, if it supports all codecs present in the file — and reject the file immediately if it does not support some, instead of failing in the middle of decompressing an `IDAT`.
+>
+> **Conservative overestimation for non-seekable encoders (v1.6+, reference implementation):** a streaming encoder that writes `IHDR` before knowing whether any later chunk will actually use ZSTD (i.e. before compressing a single tile) cannot compute this bitmask's exact value in advance, and — if its output destination does not support seeking back to patch it — cannot correct it afterward either. The reference implementation's `Encoder<W: Write>` (section 6, streaming encode) handles this by setting `bit0` unconditionally and upfront, which can only ever *overestimate* (declare ZSTD support required even if every chunk happened to fall back to raw storage), never *underestimate* — a decoder that rejects the file for lacking ZSTD support when it wasn't actually needed is unnecessarily strict but still safe; a decoder that accepts a file it cannot actually decompress is not. This is the only direction of inaccuracy this field may ever have and still satisfy its stated purpose (decoder capability pre-check). When the destination does support seeking (`Encoder<W: Write + Seek>`), the reference implementation patches this byte (and `IHDR`'s CRC32) to its exact value once the final chunk is known, identical to the whole-file `encode()` path — see section 6.1.
 
 **Total: 14 bytes of payload in IHDR.**
 
@@ -517,6 +519,17 @@ Requirements for incremental decoding:
 2. `iDIM`, if present, informs the tile scheme before any `IDAT`, allowing client to set up a full-image placeholder.
 3. Each `IDAT` is self-contained and can be decoded as soon as it arrives, without waiting for others — except when `zDIC` is present, in which case the dictionary (read before first `IDAT`) must be available when processing any subsequent `IDAT`.
 4. Combining `scan_order = 1` (Z-order) with `Interlace = 1` is recommended for best progressive loading experience (low-quality preview of entire image, refining over time).
+
+### 6.1 Streaming encode (`Encoder<W>`, reference implementation, v1.6+)
+
+Symmetric to streaming decode: an encoder can write `IHDR` and each row-strip `IDAT` incrementally as tiles become available, instead of requiring the whole image in memory before producing any output. The reference implementation's `Encoder<W: Write>` supports this for direct color types only (`gray`/`RGB`/`gray+alpha`/`RGBA` — not indexed, since palette quantization needs to see every pixel before a single index can be emitted) and row-strip tiling only (not `iDIM` 2D tiling, which needs the full tile grid upfront, and not Adam7/even-odd interlacing, which needs the whole image's pixels to interleave).
+
+Two variants exist, differing only in how precisely they can fill in `IHDR`'s `Compression method` field (section 4.1) once it's already been written to the output:
+
+- **`W: Write` only** (e.g. a raw socket, or any destination that cannot seek backward): `Compression method`'s ZSTD bit is set unconditionally, before any tile is even compressed — an overestimate in the safe direction (see the note in section 4.1). The rest of `IHDR` (dimensions, bit depth, sample format, color type, filter method) is exact from the start, since none of those fields depend on later chunk contents.
+- **`W: Write + Seek`** (e.g. a local file, or an in-memory buffer): once the last tile is submitted, the encoder seeks back and patches `Compression method` (and recomputes `IHDR`'s CRC32) to its exact value — bit-for-bit identical to what the whole-file encode path would have produced for the same pixels and options.
+
+Because per-tile parallelism (used internally when compressing an already fully in-memory image) requires knowing about every tile's independent work upfront, a streaming encoder that receives tiles one at a time as the caller produces them necessarily compresses each sequentially instead.
 
 ---
 

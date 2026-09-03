@@ -44,7 +44,7 @@ mod tonemap;
 pub use error::{CafeError, Result};
 pub use tonemap::ToneMapOperator;
 pub use types::{
-    cHDR, iDim, DecodeInfo, DecodeResult, EncodeOptions, FilterHeuristic, Palette,
+    cHDR, iDim, DecodeInfo, DecodeResult, EncodeOptions, EncoderOptions, FilterHeuristic, Palette,
     PaletteAlgorithm, PaletteEntry, Tile,
 };
 
@@ -74,7 +74,7 @@ use crate::codec::{
 use crate::chunk::{read_chunk, read_chunk_from, write_chunk, ReadChunk};
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use rayon::prelude::*;
 use serde_json::Value;
@@ -120,6 +120,44 @@ fn compute_decompress_budget(
                     .unwrap_or(u64::MAX)
             }
         }
+    }
+}
+
+/// Computes bytes-per-row for a direct (non-indexed) color type + bit depth
+/// (section 4.3.1): for bit_depth < 8 with GRAY/GRAY_ALPHA, rows are packed
+/// sub-byte (`ceil(width * bpp_multiplier * bit_depth / 8)`); otherwise it's
+/// simply `width * bpp`. `bpp` must already be the value
+/// `bytes_per_pixel(color_type, bit_depth)` returned for this combination.
+/// Shared by `encode()` and `Encoder<W>::new()` — the same calculation, only
+/// ever duplicated once before (see AGENTS.md "Encoder<W>" notes).
+fn bytes_per_row_for_direct_color(
+    width: u32,
+    color_type: u8,
+    bit_depth: u8,
+    bpp: usize,
+) -> Result<usize> {
+    if bit_depth < 8 && (color_type == COLOR_TYPE_GRAY || color_type == COLOR_TYPE_GRAY_ALPHA) {
+        let bpp_multiplier = match color_type {
+            COLOR_TYPE_GRAY => 1,
+            COLOR_TYPE_GRAY_ALPHA => 2,
+            _ => 1,
+        };
+        // Computes ceil(width * bpp_multiplier * bit_depth / 8)
+        let bits_total = (width as u64)
+            .checked_mul(bpp_multiplier as u64)
+            .and_then(|b| b.checked_mul(bit_depth as u64))
+            .ok_or_else(|| {
+                CafeError::UnsupportedFeature(
+                    "bytes_per_row calculation would overflow during encode".into(),
+                )
+            })? as usize;
+        Ok(bits_total.div_ceil(8))
+    } else {
+        (width as usize).checked_mul(bpp).ok_or_else(|| {
+            CafeError::UnsupportedFeature(
+                "bytes_per_row calculation would overflow during encode".into(),
+            )
+        })
     }
 }
 
@@ -266,6 +304,37 @@ fn build_interlaced_idats(
 /// `encode_indexed()`), since it must be rejected before any per-tile work
 /// is spawned on the thread pool, not per-tile inside this closure.
 #[allow(clippy::too_many_arguments)]
+fn apply_single_tile_filter(
+    tile_raw: &[u8],
+    tile_h: usize,
+    bytes_per_row: usize,
+    bpp: usize,
+    stride_width: u32,
+    use_byte_shuffle: bool,
+    use_filter: bool,
+    use_filter_per_row: bool,
+    filter_heuristic: FilterHeuristic,
+    level: i32,
+) -> Result<Vec<u8>> {
+    if use_byte_shuffle {
+        shuffle::apply_byte_shuffle(tile_raw, bpp, stride_width, tile_h as u32)
+    } else if use_filter && use_filter_per_row {
+        apply_predictive_filter_per_row(tile_raw, tile_h, bytes_per_row, bpp, filter_heuristic)
+    } else if use_filter {
+        apply_predictive_filter(
+            tile_raw,
+            tile_h,
+            bytes_per_row,
+            bpp,
+            filter_heuristic,
+            level,
+        )
+    } else {
+        Ok(tile_raw.to_vec())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_row_tiled_idats<F>(
     height: u32,
     tile_rows: u32,
@@ -300,28 +369,18 @@ where
             let tile_h = row_end - row_start;
             let tile_raw = build_tile_raw(row_start, row_end)?;
 
-            let tile_payload = if use_byte_shuffle {
-                shuffle::apply_byte_shuffle(&tile_raw, bpp, stride_width, tile_h as u32)?
-            } else if use_filter && use_filter_per_row {
-                apply_predictive_filter_per_row(
-                    &tile_raw,
-                    tile_h,
-                    bytes_per_row,
-                    bpp,
-                    filter_heuristic,
-                )?
-            } else if use_filter {
-                apply_predictive_filter(
-                    &tile_raw,
-                    tile_h,
-                    bytes_per_row,
-                    bpp,
-                    filter_heuristic,
-                    level,
-                )?
-            } else {
-                tile_raw
-            };
+            let tile_payload = apply_single_tile_filter(
+                &tile_raw,
+                tile_h,
+                bytes_per_row,
+                bpp,
+                stride_width,
+                use_byte_shuffle,
+                use_filter,
+                use_filter_per_row,
+                filter_heuristic,
+                level,
+            )?;
 
             build_idat_chunk(&tile_payload, level, zstd_dict)
         })
@@ -354,39 +413,51 @@ fn append_idim_chunk_if_present(out: &mut Vec<u8>, opts: &EncodeOptions) -> Resu
 }
 
 /// Writes the eXIF, jSON, iCCP, and xMPd ancillary chunks shared between
-/// `encode()` and `encode_indexed()`, in spec order (sections 4.5-4.8).
-/// Deduplicates a block that was previously copy-pasted between the two
-/// encoders — a past divergence between the copies caused `encode_indexed()`
-/// to silently omit the zDIC chunk despite using the dictionary to compress
-/// IDATs (see `append_zdic_chunk_if_present`). Returns whether any chunk used
-/// ZSTD.
-fn append_common_metadata_chunks(out: &mut Vec<u8>, opts: &EncodeOptions) -> Result<bool> {
+/// `encode()`, `encode_indexed()`, and `Encoder<W>::new()`, in spec order
+/// (sections 4.5-4.8). Deduplicates a block that was previously copy-pasted
+/// between the two path-based encoders — a past divergence between the
+/// copies caused `encode_indexed()` to silently omit the zDIC chunk despite
+/// using the dictionary to compress IDATs (see
+/// `append_zdic_chunk_if_present`). Returns whether any chunk used ZSTD.
+///
+/// Takes individual fields rather than `&EncodeOptions` so that
+/// `Encoder<W>::new()` (which uses the distinct `EncoderOptions` struct —
+/// see `types.rs`) can share this logic too, instead of duplicating it or
+/// constructing a throwaway `EncodeOptions` just to satisfy the signature.
+fn append_common_metadata_chunks(
+    out: &mut Vec<u8>,
+    exif: Option<&[u8]>,
+    json_metadata: &HashMap<String, Value>,
+    icc_profile: Option<&[u8]>,
+    xmp_metadata: Option<&str>,
+    level: i32,
+) -> Result<bool> {
     let mut uses_zstd = false;
 
     // --- eXIF (optional, single instance, section 4.5) ---
-    if let Some(exif_bytes) = &opts.exif {
-        let (flag, data) = compress_with_fallback(exif_bytes, opts.level)?;
+    if let Some(exif_bytes) = exif {
+        let (flag, data) = compress_with_fallback(exif_bytes, level)?;
         uses_zstd |= flag == FLAG_ZSTD;
         out.extend_from_slice(&write_chunk(CHUNK_EXIF, flag, &data));
     }
 
     // --- jSON (optional, one per namespace, section 4.6) ---
-    for (namespace, obj) in &opts.json_metadata {
-        let chunk = write_json_chunk(namespace, obj, opts.level)?;
+    for (namespace, obj) in json_metadata {
+        let chunk = write_json_chunk(namespace, obj, level)?;
         uses_zstd |= chunk_uses_zstd(&chunk);
         out.extend_from_slice(&chunk);
     }
 
     // --- iCCP (optional, single instance, section 4.7) ---
-    if let Some(icc) = &opts.icc_profile {
-        let chunk = write_iccp_chunk(icc, opts.level)?;
+    if let Some(icc) = icc_profile {
+        let chunk = write_iccp_chunk(icc, level)?;
         uses_zstd |= chunk_uses_zstd(&chunk);
         out.extend_from_slice(&chunk);
     }
 
     // --- xMPd (optional, single instance, section 4.8) ---
-    if let Some(xmp) = &opts.xmp_metadata {
-        let chunk = write_xmpd_chunk(xmp, opts.level)?;
+    if let Some(xmp) = xmp_metadata {
+        let chunk = write_xmpd_chunk(xmp, level)?;
         uses_zstd |= chunk_uses_zstd(&chunk);
         out.extend_from_slice(&chunk);
     }
@@ -509,31 +580,7 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
 
     // For bit_depth < 8, uses bytes_per_row_for_bit_depth (which computes the ceil of packed bits)
     // Otherwise, uses the normal bpp
-    let bytes_per_row = if bit_depth < 8
-        && (target_color_type == COLOR_TYPE_GRAY || target_color_type == COLOR_TYPE_GRAY_ALPHA)
-    {
-        let bpp_multiplier = match target_color_type {
-            COLOR_TYPE_GRAY => 1,
-            COLOR_TYPE_GRAY_ALPHA => 2,
-            _ => 1,
-        };
-        // Computes ceil(width * bpp_multiplier * bit_depth / 8)
-        let bits_total = (width as u64)
-            .checked_mul(bpp_multiplier as u64)
-            .and_then(|b| b.checked_mul(bit_depth as u64))
-            .ok_or_else(|| {
-                CafeError::UnsupportedFeature(
-                    "bytes_per_row calculation would overflow during encode".into(),
-                )
-            })? as usize;
-        bits_total.div_ceil(8)
-    } else {
-        (width as usize).checked_mul(bpp).ok_or_else(|| {
-            CafeError::UnsupportedFeature(
-                "bytes_per_row calculation would overflow during encode".into(),
-            )
-        })?
-    };
+    let bytes_per_row = bytes_per_row_for_direct_color(width, target_color_type, bit_depth, bpp)?;
 
     let filter_method = if opts.use_byte_shuffle {
         FILTER_METHOD_BYTE_SHUFFLE
@@ -632,7 +679,14 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
     }
 
     // --- eXIF, jSON, iCCP, xMPd (optional, sections 4.5-4.8) ---
-    uses_zstd |= append_common_metadata_chunks(&mut out, opts)?;
+    uses_zstd |= append_common_metadata_chunks(
+        &mut out,
+        opts.exif.as_deref(),
+        &opts.json_metadata,
+        opts.icc_profile.as_deref(),
+        opts.xmp_metadata.as_deref(),
+        opts.level,
+    )?;
 
     // --- Auto-dictionary training (v1.1, opt-in) ---
     // If auto_dictionary is enabled and no explicit dictionary provided,
@@ -2518,6 +2572,428 @@ impl<R: Read> Decoder<R> {
     }
 }
 
+/// Streaming encoder: writes a `.cafe` file incrementally to any `W: Write`
+/// destination (a file, a `Vec<u8>`, a socket, ...) one row-strip tile at a
+/// time via `add_tile()`, instead of requiring the whole image to be
+/// buffered in RGBA form before any byte can be written — the encode-side
+/// counterpart to `Decoder<R: Read>`.
+///
+/// # Usage
+/// ```no_run
+/// use cafe::{Encoder, EncoderOptions};
+/// use std::fs::File;
+///
+/// let file = File::create("out.cafe")?;
+/// let opts = EncoderOptions::default();
+/// let mut encoder = Encoder::new(file, 256, 128, &opts)?;
+/// for row_start in (0..128).step_by(opts.tile_rows as usize) {
+///     let row_end = (row_start + opts.tile_rows).min(128);
+///     let tile_h = (row_end - row_start) as usize;
+///     let rgba_tile = vec![0u8; 256 * tile_h * 4]; // caller-supplied pixels
+///     encoder.add_tile(&rgba_tile)?;
+/// }
+/// encoder.finish()?;
+/// # Ok::<(), cafe::CafeError>(())
+/// ```
+///
+/// # `compression_method` semantics (section 3.2) — conservative
+/// Because `W` offers no `Seek`, this encoder cannot go back and patch the
+/// `IHDR`'s `compression_method` byte after compressing tiles the way
+/// `encode()`/`encode_indexed()` do (see `patch_ihdr_compression_method`).
+/// Instead, **`compression_method`'s ZSTD bit is always set unconditionally
+/// up front**, in `IHDR`, before any tile is compressed — this can
+/// overestimate (declare ZSTD support required even if every tile happened
+/// to fall back to raw storage) but never underestimate (a decoder that
+/// only understands raw chunks would incorrectly accept a file that
+/// actually contains ZSTD-compressed IDATs). This matches the safe
+/// direction required by the spec's stated purpose for the bit (decoder
+/// capability pre-check, section 3.2) — see `Encoder::<W: Write + Seek>`
+/// below for the exact (non-conservative) alternative when the destination
+/// supports seeking.
+///
+/// # Limitations (v1 of this API, see `EncoderOptions`)
+/// No `auto_dictionary`, no `iDIM` (2D tiling), no interlace (Adam7/
+/// even-odd), no indexed palette (`COLOR_TYPE_INDEXED`) — see
+/// `EncoderOptions`'s doc comment for why each is out of scope. Only
+/// row-strip tiling is supported, mirroring `Decoder<R>`'s existing
+/// limitation for symmetry between the two streaming APIs.
+pub struct Encoder<W: Write> {
+    writer: W,
+    width: u32,
+    height: u32,
+    opts_level: i32,
+    opts_tile_rows: u32,
+    target_color_type: u8,
+    bit_depth: u8,
+    sample_format: u8,
+    bpp: usize,
+    bytes_per_row: usize,
+    use_byte_shuffle: bool,
+    use_filter: bool,
+    use_filter_per_row: bool,
+    filter_heuristic: FilterHeuristic,
+    zstd_dictionary: Option<Vec<u8>>,
+    /// Row index (within the full image) of the next row that has not yet
+    /// been submitted via `add_tile()`. Used to reject tiles that would
+    /// overrun `height`, and to compute each tile's height from the number
+    /// of rows in the caller-supplied buffer.
+    rows_written: u32,
+    /// Tracks whether any chunk written so far (ancillary or `IDAT`) used
+    /// ZSTD (`Flag = 0x01`). Used only by `finish_exact()` (`W: Write +
+    /// Seek`) to patch `IHDR`'s `compression_method` byte to its exact
+    /// value; irrelevant for plain `finish()` (`W: Write`), which leaves
+    /// `Encoder::new()`'s conservative always-set bit untouched.
+    uses_zstd: bool,
+    /// A copy of the exact 19 bytes (Type + Flag + Data) already written to
+    /// `writer` for the `IHDR` chunk in `new()`. Kept only so
+    /// `finish_exact()` (`W: Write + Seek`) can patch `compression_method`
+    /// and recompute the CRC32 *without* needing `W: Read` (seeking back to
+    /// re-read the already-written bytes would require it) — the CRC is
+    /// instead recomputed from this in-memory copy and the patched byte
+    /// value, then both are written back at their known offsets.
+    ihdr_type_flag_data: [u8; 19],
+}
+
+impl<W: Write> Encoder<W> {
+    /// Returns the `tile_rows` value from the `EncoderOptions` passed to
+    /// `new()` — a suggested (not enforced) tile height: `add_tile()`
+    /// infers each tile's actual height from the buffer it's given, so
+    /// callers are free to submit differently-sized tiles if they wish
+    /// (e.g. a smaller final tile, or an entirely different tiling
+    /// strategy). Exposed for callers that want to mirror the same
+    /// tile-size default `encode()` would have used.
+    pub fn tile_rows(&self) -> u32 {
+        self.opts_tile_rows
+    }
+}
+
+impl<W: Write> Encoder<W> {
+    /// Creates a new streaming encoder over `writer` and immediately writes
+    /// the signature, `IHDR`, and all pre-IDAT ancillary chunks (`cHDR`,
+    /// `eXIF`, `jSON`, `iCCP`, `xMPd`, `zDIC`), in spec order (section 9).
+    /// `width`/`height` must be known upfront (they go in `IHDR`, the very
+    /// first chunk) — this is the one piece of whole-image knowledge this
+    /// API still requires, same as `Decoder<R>::read_info()` returning them
+    /// from the file rather than the caller supplying them.
+    ///
+    /// # Errors
+    /// - `UnsupportedFeature` if `opts.target_color_type ==
+    ///   COLOR_TYPE_INDEXED`, or if `width`/`height` is 0, or for any
+    ///   invalid color-type/bit-depth/sample-format/filter combination (same
+    ///   validation as `encode()`).
+    /// - Any error from writing to `writer` (`CafeError::Io`).
+    pub fn new(mut writer: W, width: u32, height: u32, opts: &EncoderOptions) -> Result<Self> {
+        if width == 0 || height == 0 {
+            return Err(CafeError::UnsupportedFeature(
+                "Encoder::new() requires width > 0 and height > 0".into(),
+            ));
+        }
+        if opts.target_color_type == COLOR_TYPE_INDEXED {
+            return Err(CafeError::UnsupportedFeature(
+                "Encoder<W> does not support indexed palette (COLOR_TYPE_INDEXED) — palette \
+                 quantization requires seeing the whole image upfront; use encode_indexed() \
+                 instead"
+                    .into(),
+            ));
+        }
+
+        let sample_format_final = opts.sample_format.unwrap_or(SAMPLE_FORMAT_UINT);
+        let bit_depth = match sample_format_final {
+            SAMPLE_FORMAT_FLOAT => 32,
+            SAMPLE_FORMAT_HALF => 16,
+            _ => opts.target_bit_depth.unwrap_or(8),
+        };
+        let target_color_type = opts.target_color_type;
+
+        // Same color-type/bit-depth compatibility validation as encode()
+        // (via bytes_per_pixel returning None for invalid combinations).
+        let bpp = bytes_per_pixel(target_color_type, bit_depth).ok_or_else(|| {
+            CafeError::UnsupportedFeature(format!(
+                "Color type {target_color_type}, bit depth {bit_depth} not supported in Encoder::new()"
+            ))
+        })?;
+        if sample_format_final != SAMPLE_FORMAT_UINT {
+            bytes_per_pixel_with_format(target_color_type, 8, sample_format_final).ok_or_else(
+                || {
+                    CafeError::UnsupportedFeature(format!(
+                        "Color type {target_color_type} incompatible with sample format {sample_format_final}"
+                    ))
+                },
+            )?;
+        }
+
+        let bytes_per_row =
+            bytes_per_row_for_direct_color(width, target_color_type, bit_depth, bpp)?;
+
+        let filter_method = if opts.use_byte_shuffle {
+            FILTER_METHOD_BYTE_SHUFFLE
+        } else if opts.use_filter && opts.use_filter_per_row {
+            FILTER_METHOD_PREDICTIVE_PER_ROW
+        } else if opts.use_filter {
+            FILTER_METHOD_PREDICTIVE
+        } else {
+            FILTER_METHOD_NONE
+        };
+
+        if opts.use_filter
+            && opts.use_filter_per_row
+            && !matches!(
+                opts.filter_heuristic,
+                FilterHeuristic::Entropy | FilterHeuristic::Msad
+            )
+        {
+            return Err(CafeError::UnsupportedFeature(format!(
+                "use_filter_per_row only supports FilterHeuristic::Entropy or ::Msad, got {:?}",
+                opts.filter_heuristic
+            )));
+        }
+
+        if opts.use_byte_shuffle && bpp != 2 && bpp != 4 && bpp != 8 && bpp != 16 {
+            return Err(CafeError::UnsupportedFeature(format!(
+                "Byte-shuffle requires bpp ∈ {{2,4,8,16}}, got {bpp} (color type {target_color_type}, \
+                 bit depth {bit_depth} not compatible)"
+            )));
+        }
+
+        // --- Signature + IHDR ---
+        // compression_method: set the ZSTD bit unconditionally and upfront
+        // (conservative — see struct doc comment) since this Write-only
+        // encoder cannot patch it after the fact.
+        writer.write_all(&SIGNATURE)?;
+        let mut ihdr = Vec::with_capacity(14);
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.push(bit_depth);
+        ihdr.push(sample_format_final);
+        ihdr.push(target_color_type);
+        ihdr.push(COMPRESSION_METHOD_ZSTD_BIT);
+        ihdr.push(filter_method);
+        ihdr.push(INTERLACE_NONE);
+        let ihdr_chunk = write_chunk(CHUNK_IHDR, FLAG_RAW, &ihdr);
+        // Type(4) + Flag(1) + Data(14) = bytes [4..23) of the written chunk
+        // (skipping the 4-byte Length prefix) — exactly the span
+        // `finish_exact()` needs to recompute the CRC after patching
+        // `compression_method` in place, without requiring `W: Read`.
+        let mut ihdr_type_flag_data = [0u8; 19];
+        ihdr_type_flag_data.copy_from_slice(&ihdr_chunk[4..23]);
+        writer.write_all(&ihdr_chunk)?;
+
+        let mut uses_zstd = false;
+
+        // --- cHDR (optional) ---
+        if let Some(chdr) = &opts.chdr_metadata {
+            let chunk = write_chdr_chunk(chdr, opts.level)?;
+            uses_zstd |= chunk_uses_zstd(&chunk);
+            writer.write_all(&chunk)?;
+        }
+
+        // --- eXIF, jSON, iCCP, xMPd (optional) ---
+        let mut ancillary = Vec::new();
+        uses_zstd |= append_common_metadata_chunks(
+            &mut ancillary,
+            opts.exif.as_deref(),
+            &opts.json_metadata,
+            opts.icc_profile.as_deref(),
+            opts.xmp_metadata.as_deref(),
+            opts.level,
+        )?;
+        writer.write_all(&ancillary)?;
+
+        // --- zDIC (optional, explicit dictionary only — no auto-training) ---
+        if let Some(dict) = &opts.zstd_dictionary {
+            let chunk = write_zdic_chunk(dict, opts.level)?;
+            uses_zstd |= chunk_uses_zstd(&chunk);
+            writer.write_all(&chunk)?;
+        }
+
+        Ok(Encoder {
+            writer,
+            width,
+            height,
+            opts_level: opts.level,
+            opts_tile_rows: opts.tile_rows,
+            target_color_type,
+            bit_depth,
+            sample_format: sample_format_final,
+            bpp,
+            bytes_per_row,
+            use_byte_shuffle: opts.use_byte_shuffle,
+            use_filter: opts.use_filter,
+            use_filter_per_row: opts.use_filter_per_row,
+            filter_heuristic: opts.filter_heuristic,
+            zstd_dictionary: opts.zstd_dictionary.clone(),
+            rows_written: 0,
+            uses_zstd,
+            ihdr_type_flag_data,
+        })
+    }
+
+    /// Encodes one row-strip tile of RGBA pixels (`width * tile_height * 4`
+    /// bytes, top-to-bottom, row-major — `tile_height` is inferred from
+    /// `rgba_tile.len()`) and writes the resulting `IDAT` chunk immediately.
+    /// May be called any number of times; `finish()` must be called after
+    /// the last call once all `height` rows have been submitted.
+    ///
+    /// Unlike `encode()`'s whole-image path, tiles are compressed
+    /// sequentially as they arrive (no rayon parallelism across tiles) —
+    /// there is no independent future work to farm out to a thread pool
+    /// when the caller controls the pace of tile submission.
+    ///
+    /// # Errors
+    /// - `UnsupportedFeature` if `rgba_tile.len()` is not a multiple of
+    ///   `width * 4` bytes, or if this call would submit more rows than
+    ///   `height` (declared in `Encoder::new()`).
+    /// - Any error from color conversion, filtering, compression, or
+    ///   writing to the underlying `W`.
+    pub fn add_tile(&mut self, rgba_tile: &[u8]) -> Result<()> {
+        let row_bytes_rgba = (self.width as usize).checked_mul(4).ok_or_else(|| {
+            CafeError::UnsupportedFeature("overflow computing RGBA row size".into())
+        })?;
+        if row_bytes_rgba == 0 || !rgba_tile.len().is_multiple_of(row_bytes_rgba) {
+            return Err(CafeError::UnsupportedFeature(format!(
+                "add_tile(): buffer length {} is not a multiple of width*4={row_bytes_rgba}",
+                rgba_tile.len()
+            )));
+        }
+        let tile_h = rgba_tile.len() / row_bytes_rgba;
+        let tile_h_u32 = u32::try_from(tile_h)
+            .map_err(|_| CafeError::UnsupportedFeature("tile height exceeds u32::MAX".into()))?;
+        let new_rows_written = self.rows_written.checked_add(tile_h_u32).ok_or_else(|| {
+            CafeError::UnsupportedFeature("overflow accumulating rows_written".into())
+        })?;
+        if new_rows_written > self.height {
+            return Err(CafeError::UnsupportedFeature(format!(
+                "add_tile(): submitting {tile_h} rows would exceed the declared height {} \
+                 ({} rows already written)",
+                self.height, self.rows_written
+            )));
+        }
+        if tile_h == 0 {
+            return Ok(());
+        }
+
+        let sample_format_final = self.sample_format;
+        let target_bit_depth = self.bit_depth;
+        let tile_raw = if self.target_color_type == COLOR_TYPE_RGBA
+            && sample_format_final == SAMPLE_FORMAT_UINT
+            && target_bit_depth == 8
+        {
+            // Fast path: RGBA/8/uint is an identity conversion.
+            rgba_tile.to_vec()
+        } else if sample_format_final == SAMPLE_FORMAT_UINT {
+            convert_rgba_to_color_type(
+                rgba_tile,
+                self.width,
+                tile_h_u32,
+                self.target_color_type,
+                target_bit_depth,
+            )?
+        } else {
+            convert_rgba_to_color_type_with_format(
+                rgba_tile,
+                self.width,
+                tile_h_u32,
+                self.target_color_type,
+                target_bit_depth,
+                sample_format_final,
+            )?
+        };
+
+        let tile_payload = apply_single_tile_filter(
+            &tile_raw,
+            tile_h,
+            self.bytes_per_row,
+            self.bpp,
+            self.width,
+            self.use_byte_shuffle,
+            self.use_filter,
+            self.use_filter_per_row,
+            self.filter_heuristic,
+            self.opts_level,
+        )?;
+
+        let (flag, compressed, _used_dict) = compress_with_fallback_dict(
+            &tile_payload,
+            self.opts_level,
+            self.zstd_dictionary.as_deref(),
+        )?;
+        self.uses_zstd |= flag == FLAG_ZSTD;
+        self.writer
+            .write_all(&write_chunk(CHUNK_IDAT, flag, &compressed))?;
+
+        self.rows_written = new_rows_written;
+        Ok(())
+    }
+
+    /// Writes the `IEND` chunk and returns the underlying `writer`. Must be
+    /// called after all `height` rows have been submitted via `add_tile()`
+    /// — returns `UnsupportedFeature` otherwise (a truncated image would
+    /// otherwise be silently accepted as valid).
+    pub fn finish(mut self) -> Result<W> {
+        if self.rows_written != self.height {
+            return Err(CafeError::UnsupportedFeature(format!(
+                "Encoder::finish() called after only {} of {} declared rows were submitted \
+                 via add_tile()",
+                self.rows_written, self.height
+            )));
+        }
+        self.writer
+            .write_all(&write_chunk(CHUNK_IEND, FLAG_RAW, &[]))?;
+        Ok(self.writer)
+    }
+}
+
+impl<W: Write + Seek> Encoder<W> {
+    /// Like `finish()`, but for a `W` that also supports `Seek` (a `File`, a
+    /// `Cursor<Vec<u8>>`, ...): patches the `IHDR`'s `compression_method`
+    /// byte (and recomputes its CRC32) to reflect whether ZSTD was
+    /// *actually* used by any chunk written so far (tracked incrementally
+    /// in `self.uses_zstd` by `new()`/`add_tile()`), instead of leaving the
+    /// conservative (always-set) bit `Encoder::new()` wrote upfront — the
+    /// same exact value `encode()`/`encode_indexed()` compute via
+    /// `patch_ihdr_compression_method`.
+    ///
+    /// Patches the byte and recomputes the CRC32 entirely from the
+    /// in-memory `self.ihdr_type_flag_data` copy kept since `new()`,
+    /// deliberately avoiding any need to seek back and *read* the
+    /// already-written bytes (`W: Write + Seek` alone does not guarantee
+    /// `Read`).
+    pub fn finish_exact(mut self) -> Result<W> {
+        if self.rows_written != self.height {
+            return Err(CafeError::UnsupportedFeature(format!(
+                "Encoder::finish_exact() called after only {} of {} declared rows were submitted \
+                 via add_tile()",
+                self.rows_written, self.height
+            )));
+        }
+        self.writer
+            .write_all(&write_chunk(CHUNK_IEND, FLAG_RAW, &[]))?;
+
+        let compression_method = if self.uses_zstd {
+            COMPRESSION_METHOD_ZSTD_BIT
+        } else {
+            0
+        };
+        // Layout of ihdr_type_flag_data (19 bytes): Type(4) + Flag(1) +
+        // Data(14, IHDR payload) — compression_method is Data byte 11.
+        self.ihdr_type_flag_data[4 + 1 + 11] = compression_method;
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&self.ihdr_type_flag_data);
+        let crc = hasher.finalize();
+
+        // File layout: sig(9) + len(4) + type(4) + flag(1) + data(14) + crc(4).
+        const CM_OFFSET: u64 = 9 + 4 + 4 + 1 + 11; // 29
+        const CRC_OFFSET: u64 = 9 + 4 + 4 + 1 + 14; // 32
+        self.writer.seek(SeekFrom::Start(CM_OFFSET))?;
+        self.writer.write_all(&[compression_method])?;
+        self.writer.seek(SeekFrom::Start(CRC_OFFSET))?;
+        self.writer.write_all(&crc.to_be_bytes())?;
+
+        self.writer.seek(SeekFrom::End(0))?;
+        Ok(self.writer)
+    }
+}
+
 /// Decodes a CAFE buffer with custom decode options (tone-map operator selection, etc.)
 ///
 /// # Arguments
@@ -2657,7 +3133,14 @@ pub fn encode_indexed(input_path: &str, output_path: &str, opts: &EncodeOptions)
     uses_zstd |= append_idim_chunk_if_present(&mut out, opts)?;
 
     // --- eXIF, jSON, iCCP, xMPd (optional, sections 4.5-4.8) ---
-    uses_zstd |= append_common_metadata_chunks(&mut out, opts)?;
+    uses_zstd |= append_common_metadata_chunks(
+        &mut out,
+        opts.exif.as_deref(),
+        &opts.json_metadata,
+        opts.icc_profile.as_deref(),
+        opts.xmp_metadata.as_deref(),
+        opts.level,
+    )?;
 
     // --- IDAT (packed indices, optionally interlaced) ---
     // Built into a separate buffer first (not `out` directly), same pattern

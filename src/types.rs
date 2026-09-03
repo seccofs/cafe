@@ -522,6 +522,106 @@ impl Default for EncodeOptions {
     }
 }
 
+/// Options for the streaming `Encoder<W: Write>` / `Encoder<W: Write +
+/// Seek>` API (v1, see `cafe.rs`), analogous to `EncodeOptions` for the
+/// whole-file `encode()`/`encode_indexed()` path, but deliberately smaller:
+/// a handful of `EncodeOptions` features fundamentally require seeing the
+/// whole image up front (auto-trained dictionary sampling, indexed-palette
+/// quantization) or the whole image geometry ahead of tiling (2D tiling via
+/// `iDIM`, Adam7/even-odd interlacing) — none of these fit a caller that
+/// wants to push tiles through as they become available, so they are not
+/// offered here at all rather than silently ignored or erroring at runtime.
+///
+/// # Out of scope for v1 (by design, not yet implemented)
+/// - **`auto_dictionary`**: training a dictionary requires sampling several
+///   tiles before compressing any of them — incompatible with a caller that
+///   hands tiles over one at a time and expects each to be flushed as it
+///   arrives. An explicit, caller-supplied `zstd_dictionary` (trained
+///   offline, e.g. across a batch of related images) is still supported.
+/// - **`idim` (2D tiling)**: requires knowing the full tile grid upfront and
+///   addressing tiles out of row-major order (Z-order); `Encoder<W>` only
+///   supports row-strip tiling (the same limitation `Decoder<R>` already
+///   has — see its doc comment in `cafe.rs`), for symmetry between the two
+///   streaming APIs.
+/// - **`interlace_method` (Adam7/even-odd)**: each pass needs the whole
+///   image's pixels to interleave rows/columns; incompatible with
+///   incremental tile submission.
+/// - **Indexed palette (`COLOR_TYPE_INDEXED`)**: palette quantization
+///   (median-cut or nearest-neighbor) needs to see every pixel before a
+///   single index can be emitted. `target_color_type` here is therefore
+///   restricted to the direct color types (Gray/RGB/GrayAlpha/RGBA);
+///   `Encoder<W>::new()` rejects `COLOR_TYPE_INDEXED` explicitly.
+///
+/// All of the above remain available through the existing
+/// `encode()`/`encode_indexed()` (`&str` path-based) or `encode_bytes()`
+/// (whole-buffer) APIs, which still require the whole image in memory
+/// first.
+#[derive(Clone, Debug)]
+pub struct EncoderOptions {
+    /// Number of rows per row-strip tile (one `IDAT` per tile, section 4.3).
+    /// Default: `DEFAULT_TILE_ROWS` (64) — same default and same empirically
+    /// measured size/speed trade-off as `EncodeOptions::tile_rows` (see
+    /// AGENTS.md "v1.5" notes on `DEFAULT_TILE_ROWS` retuning).
+    pub tile_rows: u32,
+    /// ZSTD compression level (1-22). Default: `ZSTD_LEVEL` (19).
+    pub level: i32,
+    pub use_filter: bool,
+    /// Selects the predictive filter independently per row instead of once
+    /// per whole tile (`FILTER_METHOD_PREDICTIVE_PER_ROW`). Only takes
+    /// effect when `use_filter` is also `true`; mutually exclusive with
+    /// `use_byte_shuffle` (byte-shuffle takes precedence). Only
+    /// `FilterHeuristic::Entropy` and `FilterHeuristic::Msad` are supported
+    /// in this mode. Default: `false`.
+    pub use_filter_per_row: bool,
+    /// Color type to encode pixels as (section 4.1.3). Must be one of
+    /// `COLOR_TYPE_GRAY`, `COLOR_TYPE_RGB`, `COLOR_TYPE_GRAY_ALPHA`, or
+    /// `COLOR_TYPE_RGBA` — `COLOR_TYPE_INDEXED` is rejected (see struct doc
+    /// comment). Default: `COLOR_TYPE_RGBA`.
+    pub target_color_type: u8,
+    /// Target bit depth for the uint sample format (section 4.1). `None` =
+    /// 8 (default). Ignored by float/half sample formats (which fix 32/16).
+    pub target_bit_depth: Option<u8>,
+    pub exif: Option<Vec<u8>>,
+    pub json_metadata: std::collections::HashMap<String, serde_json::Value>,
+    pub icc_profile: Option<Vec<u8>>,
+    pub xmp_metadata: Option<String>,
+    /// Explicit, caller-supplied ZSTD dictionary (section 4.9, `zDIC`).
+    /// Unlike `EncodeOptions::auto_dictionary`, there is no automatic
+    /// training mode here (see struct doc comment) — this is always honored
+    /// unconditionally when present, same as an explicit
+    /// `EncodeOptions::zstd_dictionary`.
+    pub zstd_dictionary: Option<Vec<u8>>,
+    pub sample_format: Option<u8>, // 0=uint, 1=float, 2=half-float
+    pub chdr_metadata: Option<cHDR>,
+    pub filter_heuristic: FilterHeuristic,
+    /// Uses byte-shuffle (Filter Method = 1) instead of the predictive
+    /// filter. Mutually exclusive with `use_filter` (byte-shuffle takes
+    /// precedence).
+    pub use_byte_shuffle: bool,
+}
+
+impl Default for EncoderOptions {
+    fn default() -> Self {
+        EncoderOptions {
+            tile_rows: crate::constants::DEFAULT_TILE_ROWS,
+            level: crate::constants::ZSTD_LEVEL,
+            use_filter: true,
+            use_filter_per_row: false,
+            target_color_type: crate::constants::COLOR_TYPE_RGBA,
+            target_bit_depth: None,
+            exif: None,
+            json_metadata: std::collections::HashMap::new(),
+            icc_profile: None,
+            xmp_metadata: None,
+            zstd_dictionary: None,
+            sample_format: None,
+            chdr_metadata: None,
+            filter_heuristic: FilterHeuristic::Entropy,
+            use_byte_shuffle: false,
+        }
+    }
+}
+
 /// Chunk statistics
 #[derive(Clone, Debug)]
 pub struct ChunkStats {
