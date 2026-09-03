@@ -9,14 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- **Streaming decoder (`Decoder<R: Read>`)**: decodes a CAFE file tile-by-tile directly off any `Read` source (file, socket, in-memory `Cursor`) instead of requiring the whole compressed file or the whole decoded image to be materialized in memory up front, unlike `decode`/`decode_bytes`. API: `Decoder::new(reader)` / `with_tonemap_operator(reader, op)`, `read_info() -> Result<DecodeInfo>` (reads the signature and every pre-`IDAT` chunk: `IHDR`, `iDIM`, `cHDR`, `eXIF`, `jSON`, `iCCP`, `xMPd`, `zDIC`, `PLTE`), `next_tile() -> Result<Option<Tile>>` (one `IDAT` in, one RGBA `Tile` out, `Ok(None)` at `IEND`), `finish(self) -> Result<DecodeResult>` (drains any remaining `IDAT`s and returns the same ancillary metadata `decode_bytes` returns). New public types `DecodeInfo` and `Tile` in `src/types.rs`.
-  - Built entirely on the existing private `DecodeState`/`handle_*_chunk` machinery and the CWE-409 cumulative decompression budget — the only new low-level primitive is `chunk::read_chunk_from<R: Read>`, a `Read`-based counterpart to the existing slice-based `read_chunk`. `decode_bytes`/`decode`/`decode_bytes_internal` are unchanged and still operate on an in-memory `&[u8]`; `Decoder<R>` is an additional, independent API, not a replacement.
-  - **Limitation (v1 of this API)**: `next_tile()` does not support 2D tiling (`iDIM`) or interlaced (Adam7/even-odd) files — it returns `Err(CafeError::UnsupportedFeature(..))` for those; check `DecodeInfo::supports_streaming_tiles` up front and fall back to `decode_bytes`/`decode` if `false`.
-  - New example: `examples/streaming_decode.rs`. Documented in `README.md`/`README.pt.md` ("Intelligent Streaming" / "Library API" sections) and `AGENTS.md`.
-  - 311 lib tests (up from 303), covering `read_info()`/`next_tile()`/`finish()` parity against `decode_bytes()` (direct-color and indexed-palette paths), call-order errors, truncated-stream handling, and `iDIM` rejection.
-
 ### Planned (Future)
 - Real ARM hardware validation on physical devices (Raspberry Pi, mobile, Apple Silicon) beyond QEMU emulation
 - Cache-friendly blocking in scalar byte-shuffle fallback
@@ -24,6 +16,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - k-means palette quantization algorithm (clustering-based, as opposed to the greedy/median-cut/redmean-weighted strategies already implemented)
 - Tone-mapping on encode (SDR → HDR inverse operation), including operator selection via CLI
 - `Decoder<R: Read>::next_tile()` support for 2D tiling (`iDIM`) and interlaced (Adam7/even-odd) files
+- CLI flags for `EncodeOptions::icc_profile`/`xmp_metadata`, and an `EncoderOptions`-equivalent CLI surface for the streaming encoder
+
+---
+
+## [1.6.0] - 2026-09-03
+
+### Added
+
+- **Streaming decoder (`Decoder<R: Read>`)**: decodes a CAFE file tile-by-tile directly off any `Read` source (file, socket, in-memory `Cursor`) instead of requiring the whole compressed file or the whole decoded image to be materialized in memory up front, unlike `decode`/`decode_bytes`. API: `Decoder::new(reader)` / `with_tonemap_operator(reader, op)`, `read_info() -> Result<DecodeInfo>` (reads the signature and every pre-`IDAT` chunk: `IHDR`, `iDIM`, `cHDR`, `eXIF`, `jSON`, `iCCP`, `xMPd`, `zDIC`, `PLTE`), `next_tile() -> Result<Option<Tile>>` (one `IDAT` in, one RGBA `Tile` out, `Ok(None)` at `IEND`), `finish(self) -> Result<DecodeResult>` (drains any remaining `IDAT`s and returns the same ancillary metadata `decode_bytes` returns). New public types `DecodeInfo` and `Tile` in `src/types.rs`.
+  - Built entirely on the existing private `DecodeState`/`handle_*_chunk` machinery and the CWE-409 cumulative decompression budget — the only new low-level primitive is `chunk::read_chunk_from<R: Read>`, a `Read`-based counterpart to the existing slice-based `read_chunk`. `decode_bytes`/`decode`/`decode_bytes_internal` are unchanged and still operate on an in-memory `&[u8]`; `Decoder<R>` is an additional, independent API, not a replacement.
+  - **Limitation (v1 of this API)**: `next_tile()` does not support 2D tiling (`iDIM`) or interlaced (Adam7/even-odd) files — it returns `Err(CafeError::UnsupportedFeature(..))` for those; check `DecodeInfo::supports_streaming_tiles` up front and fall back to `decode_bytes`/`decode` if `false`.
+  - New example: `examples/streaming_decode.rs`. Documented in `README.md`/`README.pt.md` ("Intelligent Streaming" / "Library API" sections) and `AGENTS.md`.
+  - 311 lib tests (up from 303), covering `read_info()`/`next_tile()`/`finish()` parity against `decode_bytes()` (direct-color and indexed-palette paths), call-order errors, truncated-stream handling, and `iDIM` rejection.
+- **Streaming encoder (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`)**: symmetric counterpart to `Decoder<R: Read>` — writes `IHDR` and each row-strip `IDAT` immediately as tiles arrive via `add_tile()`, instead of requiring `encode()`'s whole-image-in-memory path before any output can be produced. API: `Encoder::new(writer, width, height, opts) -> Result<Self>` (validates dimensions/color-type/filter combinations and writes the signature + `IHDR` + all pre-`IDAT` ancillary chunks immediately), `tile_rows(&self) -> u32` (suggested, not enforced), `add_tile(&mut self, rgba_tile: &[u8]) -> Result<()>` (infers tile height from the buffer's length, so callers may submit irregular tile sizes), `finish(self) -> Result<W>` (conservative `compression_method`), and — only for `W: Write + Seek` — `finish_exact(self) -> Result<W>` (patches `IHDR`'s `compression_method` byte and recomputes its CRC32 to the exact, non-conservative value, byte-for-byte identical to `encode()`'s own output for the same pixels/options). New `EncoderOptions` struct in `src/types.rs`.
+  - **`compression_method` semantics**: `Encoder<W: Write>` cannot know in advance whether any tile will end up using ZSTD, and (being `Write`-only) cannot seek back to patch `IHDR` after the fact, so `finish()` leaves the ZSTD bit set unconditionally — an overestimate that is always safe (a decoder may reject the file as needing a codec it doesn't actually need, but never accepts a file it can't actually decompress). `finish_exact()` avoids requiring `W: Read` by tracking `uses_zstd: bool` incrementally as a struct field and keeping an in-memory copy of the 19 already-written `IHDR` chunk bytes from `new()`, rather than seeking back and re-reading them from `writer`.
+  - **Limitation (v1 of this API)**: `EncoderOptions` is a deliberately smaller struct than `EncodeOptions`, omitting `auto_dictionary` (needs to sample several tiles before compressing any — incompatible with incremental submission), `idim`/2D tiling (needs the full tile grid upfront), `interlace_method` (Adam7/even-odd need the whole image's pixels to interleave), and indexed-palette support (`target_color_type` restricted to direct color types — quantization needs to see every pixel before a single index can be emitted; `encode_indexed()` remains the only path for `COLOR_TYPE_INDEXED`). Tiles are compressed sequentially as `add_tile()` receives them, with no rayon parallelism across tiles (unlike `encode()`'s whole-image path).
+  - Two helpers were extracted from `encode()`'s existing tile pipeline so `add_tile()` could reuse them without duplicating logic: `apply_single_tile_filter` (byte-shuffle/predictive/predictive-per-row/none dispatch for a single tile) and `bytes_per_row_for_direct_color` (stride calculation for direct color types). `append_common_metadata_chunks`'s signature was also generalized to take primitive parameters instead of `&EncodeOptions`, so both `encode()`/`encode_indexed()` and `Encoder::new()` can call it.
+  - New example: `examples/streaming_encode.rs`. Documented in `README.md`/`README.pt.md` ("Intelligent Streaming" / "Library API" sections), `AGENTS.md`, and `docs/CAFE-spec.md`/`docs/CAFE-spec.pt.md` (new subsection 6.1, plus a note under section 4.1's `Compression method` field).
+  - `tests/streaming_encode.rs` (17 tests): pixel-exact round-trips through both `finish()` and `finish_exact()`, the conservative-vs-exact `compression_method` byte in each case, irregular/variable tile heights, every documented error path (non-multiple-of-row-width tile, single-call and cumulative height overflow, incomplete `finish()`/`finish_exact()`, `COLOR_TYPE_INDEXED` rejection, zero dimensions, unsupported per-row heuristic), non-default color types (Gray) and byte-shuffle/per-row-filter through the streaming path, and a byte-for-byte comparison (`test_streaming_encoder_matches_whole_file_encode_byte_for_byte`) confirming `finish_exact()`'s output is bit-identical to `encode()`'s whole-file output for the same pixels/options.
+
+### Notes
+
+- Full test suite: 411 tests across all suites (library + all integration tests, including the new 17-test `streaming_encode.rs`), zero regressions.
+- Validated: `cargo build --lib`, `cargo test`/`cargo test --release` (full suite), `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` all pass.
+- `Cargo.toml` version bumped to `1.6.0`; `README.md`, `README.pt.md`, `AGENTS.md`, and `docs/DEVELOPER_GUIDE.md` updated in lockstep per the project's established release convention.
 
 ---
 
