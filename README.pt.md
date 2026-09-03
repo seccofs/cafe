@@ -7,7 +7,7 @@
 
 Um formato de imagem moderno baseado em chunks, inspirado em PNG, com suporte a compressão ZSTD, filtros preditivos avançados (16 tipos), paleta indexada, metadados estruturados (EXIF, JSON, ICC, XMP) e entrelaçamento progressivo.
 
-**Versão**: 1.5.0  
+**Versão**: 1.6.0  
 **Status**: ✅ Completo, auditado, e com aceleração SIMD  
 **Compatibilidade**: Rust 2021+
 
@@ -44,6 +44,7 @@ Um formato de imagem moderno baseado em chunks, inspirado em PNG, com suporte a 
 - **Entrelaçamento**: Adam7 (7 passes) ou Par/Ímpar (2 passes)
 - Decodificação incremental (chunk-by-chunk)
 - **API de streaming `Decoder<R: Read>`**: decodifica tile por tile diretamente de qualquer fonte `Read` (arquivo, socket, `Cursor`) sem armazenar o arquivo comprimido inteiro nem a imagem decodificada inteira em memória — veja `examples/streaming_decode.rs` e a seção "API de Biblioteca" abaixo (apenas tiling row-strip; recai para `decode`/`decode_bytes` em arquivos com tiling 2D ou entrelaçados)
+- **API de streaming `Encoder<W: Write>`** (v1.6): contraparte simétrica — escreve o `IHDR` e cada `IDAT` row-strip imediatamente à medida que os tiles chegam via `add_tile()`, em vez de exigir a imagem inteira em memória antes que `encode()` possa produzir saída; `Encoder<W: Write + Seek>::finish_exact()` corrige o `compression_method` para seu valor exato (idêntico byte a byte a `encode()`), enquanto destinos apenas `Write` recebem uma superestimativa conservadora (sempre segura) — veja `examples/streaming_encode.rs` e a seção "API de Biblioteca" abaixo (sem paleta indexada, tiling 2D ou entrelaçamento nesta v1)
 
 ### Auditoria de Compressão (v1.5)
 - **Filtro preditivo por linha** (`Filter method=3`): adaptação mais granular que o filtro por tile
@@ -91,7 +92,7 @@ cafe/
 │   ├── cafe-encode.rs            # Binário encoder
 │   └── cafe-decode.rs            # Binário decoder
 ├── docs/                          # Documentação
-│   ├── CAFE-spec.md              # Especificação completa (v1.1, atualizada até v1.5)
+│   ├── CAFE-spec.md              # Especificação completa (v1.1, atualizada até v1.6)
 │   ├── CAFE-spec.pt.md           # Versão portuguesa da especificação
 │   ├── SECURITY_AUDIT.md         # Auditoria de segurança
 │   └── DEVELOPER_GUIDE.md        # Guia técnico para contribuidores
@@ -201,6 +202,29 @@ incluindo o caminho de fallback para arquivos com tiling 2D (`iDIM`) ou
 entrelaçamento, que `next_tile()` não suporta (verifique
 `info.supports_streaming_tiles`).
 
+#### Codificação em streaming (imagens grandes / produtores incrementais)
+
+```rust
+use cafe::{Encoder, EncoderOptions};
+use std::fs::File;
+
+let file = File::create("output.cafe")?;
+let opts = EncoderOptions::default();
+let mut encoder = Encoder::new(file, width, height, &opts)?; // escreve o IHDR imediatamente
+
+for row_strip in tiles {
+    encoder.add_tile(&row_strip)?; // width * tile_height * 4 bytes RGBA por chamada
+}
+
+let _file = encoder.finish_exact()?; // compression_method exato (requer Seek)
+// ou encoder.finish()? para destinos apenas Write (compression_method conservador)
+```
+
+Veja `examples/streaming_encode.rs` para um exemplo completo executável.
+`Encoder<W>` v1 suporta apenas tiling row-strip e color types diretos (sem
+paleta indexada, tiling 2D ou entrelaçamento — veja o doc comment de
+`EncoderOptions`).
+
 ### CLI
 
 ```bash
@@ -305,6 +329,7 @@ Contribuições são bem-vindas! Áreas com potencial:
 - [x] **Garantia de não-regressão do dicionário ZSTD automático** — *completo em v1.5* (`auto_dictionary` só usado quando reduz estritamente o tamanho do arquivo)
 - [x] **Quantização de paleta perceptualmente ponderada** — *completo em v1.5* (`PaletteAlgorithm::NearestNeighborWeighted`, distância redmean)
 - [x] **Benchmarks de compressão reais + gate de regressão no CI** — *completo em v1.5* (`tests/compression_regression.rs`, `benches/encode_decode.rs`)
+- [x] **Encoder em streaming** — *completo em v1.6* (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`, contraparte simétrica do `Decoder<R: Read>` da v1.5)
 
 ---
 
@@ -321,6 +346,7 @@ Contribuições são bem-vindas! Áreas com potencial:
 | **v1.4.1** | **Validação real de execução ARM (emulação QEMU)**: suíte de testes completa rodada nativamente em aarch64 pela primeira vez — encontrado e corrigido um bug real de cálculo de índice no NEON que apenas checagem de cross-compile não conseguiria detectar | ✅ Completo |
 | **v1.4.2** | **CI: verificação de cross-compile ARM64** — novo job `aarch64-cross-compile` roda `cargo check`/`clippy --target aarch64-unknown-linux-gnu` em cada push/PR, evitando que futuras regressões em aarch64 passem despercebidas | ✅ Completo |
 | **v1.5** | **Auditoria focada em compressão (5 itens)**: filtro preditivo por linha (`Filter method=3`), benchmarks de compressão reais + gate de regressão no CI, garantia de não-regressão do `auto_dictionary`, quantização de paleta perceptualmente ponderada (distância redmean), investigação de retuning do `DEFAULT_TILE_ROWS` (mantido em 64, trade-off documentado) | ✅ Completo |
+| **v1.6** | **Encoder em Streaming** (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`): escreve `IHDR` + chunks ancilares + `IDAT`s row-strip incrementalmente à medida que os tiles chegam, contraparte simétrica do `Decoder<R: Read>` da v1.5; `finish()` define um `compression_method` conservador para destinos apenas `Write`, `finish_exact()` corrige para o valor exato (idêntico byte a byte a `encode()`) quando `W` também suporta `Seek` | ✅ Completo |
 | **Futuro** | Validação real em hardware ARM físico, compressores adicionais, paleta k-means, tone-mapping no encode (SDR→HDR) | 🔮 Planejado |
 
 ---
@@ -353,6 +379,6 @@ Arquitetura, especificação, implementação de referência em Rust (v1.1)
 
 ---
 
-**Última atualização**: 2026-09-02 (v1.5: auditoria focada em compressão — filtro preditivo por linha, garantia de não-regressão do dicionário, paleta ponderada por redmean, gate de regressão de compressão no CI)  
-**Cobertura de testes**: 288 testes de lib + 12 suítes de teste de integração (roundtrip, SIMD, regressão de compressão, regressão de dicionário, algoritmo de paleta, benchmarks de tile_rows, etc.)  
+**Última atualização**: 2026-09-03 (v1.6: encoder em streaming — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, contraparte simétrica do `Decoder<R: Read>` da v1.5)  
+**Cobertura de testes**: 311 testes de lib + 13 suítes de teste de integração (roundtrip, encoder em streaming, SIMD, regressão de compressão, regressão de dicionário, algoritmo de paleta, benchmarks de tile_rows, etc.)  
 **Próxima revisão de segurança**: 2027-08-04
