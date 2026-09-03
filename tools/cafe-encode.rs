@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::process::ExitCode;
 
-use cafe::{cHDR, encode, encode_indexed, EncodeOptions, FilterHeuristic};
+use cafe::{cHDR, encode, encode_indexed, EncodeOptions, FilterHeuristic, ToneMapOperator};
 use image::ImageReader;
 
 /// Minimal stderr logger so the `cafe` library's `log::warn!`/`info!`/`debug!`
@@ -87,6 +87,13 @@ fn usage() {
     eprintln!("  --chdr-min-lum <float>   Min luminance (nits)");
     eprintln!("  --chdr-dict-file <path>  ZSTD dictionary file for better compression");
     eprintln!("  --interlace <method>     Interlace method (0=none, 1=Adam7, 2=Even/Odd)");
+    eprintln!();
+    eprintln!("  [v1.8 inverse tone-mapping]");
+    eprintln!("  --inverse-tonemap <op>   Synthesize HDR float data from SDR input (opt-in ITM).");
+    eprintln!("                           Only 'reinhard' is supported (no closed-form inverse");
+    eprintln!("                           for filmic/ACES). Requires --sample-format 1 and");
+    eprintln!("                           --chdr-transfer 0 (linear); --color-type must be RGBA");
+    eprintln!("                           (or left unspecified, which defaults to RGBA).");
 }
 
 fn main() -> ExitCode {
@@ -218,9 +225,6 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
         None
     };
 
-    // Force indexed if the image has few colors (even without --indexed)
-    let use_indexed = user_specified_indexed || is_indexed_candidate;
-
     let json_metadata: HashMap<String, serde_json::Value> =
         if let Some(pos) = args.iter().position(|a| a == "--json-file") {
             let path = require_arg_value(args, pos, "--json-file")?;
@@ -325,6 +329,51 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
         None
     };
 
+    // Inverse tone-mapping (v1.8, opt-in ITM: synthesize HDR float data from
+    // SDR input). Only 'reinhard' has a closed-form inverse; validated more
+    // thoroughly (sample_format/chdr_metadata/color_type combinations) by
+    // `encode()` itself, so this parsing step only needs to parse the
+    // operator name.
+    let inverse_tonemap = if let Some(pos) = args.iter().position(|a| a == "--inverse-tonemap") {
+        let op_str = require_arg_value(args, pos, "--inverse-tonemap")?;
+        use std::str::FromStr;
+        match ToneMapOperator::from_str(op_str) {
+            Ok(ToneMapOperator::Filmic) => {
+                return Err(
+                    "--inverse-tonemap: 'filmic' has no closed-form inverse tone-map operator; \
+                     use 'reinhard'"
+                        .into(),
+                );
+            }
+            Ok(op) => Some(op),
+            Err(e) => return Err(e.into()),
+        }
+    } else {
+        None
+    };
+
+    // `encode_indexed()` has no HDR path at all (see AGENTS.md): it never
+    // reads `sample_format`/`chdr_metadata`/`inverse_tonemap`, always
+    // producing uint8 indexed output. Silently routing to it whenever the
+    // few-colors auto-detection fires would drop `--sample-format`,
+    // `--chdr-*`, and `--inverse-tonemap` on the floor with no warning —
+    // dangerous in particular for `--inverse-tonemap`, whose whole point is
+    // producing HDR float output. `--indexed` explicitly combined with any
+    // of those is a contradiction in terms and rejected outright; the
+    // *auto-detected* few-colors path is instead skipped (falls through to
+    // the normal `encode()` call below) so HDR/float flags stay honored.
+    let hdr_incompatible_with_indexed =
+        sample_format.is_some() || chdr.is_some() || inverse_tonemap.is_some();
+    if user_specified_indexed && hdr_incompatible_with_indexed {
+        return Err(
+            "--indexed is incompatible with --sample-format/--chdr-*/--inverse-tonemap \
+             (encode_indexed() has no HDR/float path — see AGENTS.md)"
+                .into(),
+        );
+    }
+    let use_indexed =
+        user_specified_indexed || (is_indexed_candidate && !hdr_incompatible_with_indexed);
+
     // Interlace method
     let interlace_method = if let Some(pos) = args.iter().position(|a| a == "--interlace") {
         let method_str = require_arg_value(args, pos, "--interlace")?;
@@ -355,6 +404,7 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
         filter_heuristic,
         auto_dictionary,
         palette_algorithm,
+        inverse_tonemap,
         ..EncodeOptions::default()
     };
     opts.target_color_type = target_color_type;
@@ -453,6 +503,14 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
 
     if let Some(ref xmp) = xmp_metadata {
         println!("  XMP metadata: {} bytes", xmp.len());
+    }
+
+    if let Some(op) = inverse_tonemap {
+        let op_name = match op {
+            ToneMapOperator::Reinhard => "reinhard",
+            ToneMapOperator::Filmic => "filmic", // unreachable: rejected during parsing above
+        };
+        println!("  Inverse tone-mapping (ITM): {op_name}");
     }
 
     if interlace_method > 0 {

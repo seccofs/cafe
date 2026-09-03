@@ -68,6 +68,7 @@ fn benchmark_encode_small_image(c: &mut Criterion) {
                     xmp_metadata: None,
                     tonemap_operator: cafe::ToneMapOperator::Filmic,
                     use_filter_per_row: false,
+                    inverse_tonemap: None,
                 };
                 let _ = cafe::encode(
                     black_box(&test_png),

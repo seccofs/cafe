@@ -13,9 +13,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Real ARM hardware validation on physical devices (Raspberry Pi, mobile, Apple Silicon) beyond QEMU emulation
 - Cache-friendly blocking in scalar byte-shuffle fallback
 - Runtime CPU detection for optional SIMD forcing
-- Tone-mapping on encode (SDR → HDR inverse operation), including operator selection via CLI
 - `Decoder<R: Read>::next_tile()` support for 2D tiling (`iDIM`) and interlaced (Adam7/even-odd) files
 - An `EncoderOptions`-equivalent CLI surface for the streaming encoder (`Encoder<W>` remains library-only)
+
+---
+
+## [1.8.0] - 2026-09-03
+
+### Added
+
+- **`EncodeOptions::inverse_tonemap: Option<ToneMapOperator>`** (opt-in inverse tone-mapping / ITM on the encode side, `--inverse-tonemap <reinhard>` in `cafe-encode`): synthesizes plausible HDR linear-float pixel data from ordinary SDR 8-bit input instead of the naive `v/255` conversion used when this field is `None` (the default, unchanged behavior).
+  - **`tonemap::ToneMapOperator::apply_inverse`**: analytic inverse of the existing `apply` (forward) method. Only `Reinhard` (`apply(x) = x/(1+x)` ⇒ `apply_inverse(y) = y/(1-y)`) has a closed-form inverse; `Filmic`/ACES's rational-quadratic curve would require a numerically fragile per-pixel quadratic-formula solve near `y → 1` and returns `CafeError::UnsupportedFeature` instead.
+  - **`tonemap::apply_inverse_tone_mapping_to_image`** (new public function): the encode-side counterpart of the existing `apply_tone_mapping_to_image` (decode). Pipeline: sRGB EOTF (display-referred → compressed linear) → `apply_inverse` (compressed → relative linear `[0,1]`) → color-primaries conversion → scale by `chdr.max_luminance` (relative → absolute nits), mirroring the exact inverse of `tonemap_hdr`'s own forward pipeline. Alpha is passed through unchanged.
+  - **Validation** (`encode()`, checked upfront before any conversion work): requires `sample_format = Some(1)` (float only — matching `convert_raw_to_rgba`'s own restriction of decode-side tone-mapping to `SAMPLE_FORMAT_FLOAT`, never `HALF`, so a file produced this way round-trips through the existing decode path), `target_color_type = COLOR_TYPE_RGBA`, and `chdr_metadata = Some(_)` with `transfer_function == 0` (linear — no OETF implemented for PQ/HLG/sRGB on encode). Violating any of these returns `CafeError::UnsupportedFeature` with a specific message rather than silently falling back to the naive conversion.
+  - **CLI**: `tools/cafe-encode.rs` gained `--inverse-tonemap <reinhard>`, rejecting `filmic` at parse time with a clear message (no closed-form inverse) rather than deferring to `encode()`'s own rejection.
+  - **CLI bug fix (pre-existing)**: `cafe-encode`'s automatic few-colors → indexed-palette detection could silently route past `--sample-format`/`--chdr-*`/`--inverse-tonemap` into `encode_indexed()`, which has no HDR/float path at all (it never reads those `EncodeOptions` fields), discarding them with no warning. Auto-detection is now skipped whenever any HDR-related flag is present (falls through to the normal `encode()` call instead); explicitly combining `--indexed` with any HDR-related flag is now a hard error at parse time, since `encode_indexed()` fundamentally cannot support them.
+
+### Notes
+
+- This is inverse tone-mapping (ITM), an approximation that expands SDR content into a plausible HDR-shaped range — never a lossless recovery of highlight/shadow detail the SDR source never had. Round-tripping through `decode()`'s existing forward tone-mapping is close but not bit-identical to the original SDR input: Reinhard's `apply(x) = x/(1+x)` on `x ∈ [0,1]` only ever produces compressed outputs in `[0, 0.5]` in the linear-transfer-function branch this composes with, which corresponds to sRGB-encoded values up to ~187/255 — brighter SDR input is legitimately outside the domain this specific operator/branch combination can round-trip exactly (documented in `tonemap::ToneMapOperator::apply_inverse`'s doc comment and exercised by `test_forward_inverse_tonemap_roundtrip_reasonable`).
+- Purely additive: `EncodeOptions::inverse_tonemap` defaults to `None`, leaving every existing caller's behavior (including plain `--sample-format float` without the new flag) completely unchanged. No breaking changes to the `.cafe` binary format — an ITM-produced file is an ordinary `SAMPLE_FORMAT_FLOAT` + `cHDR` file, indistinguishable at the format level from one produced by any other means.
+- Validated: `cargo build --lib`/`--bins`/`--release --bins`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (full workspace: 328 lib tests, +11 from v1.7.0's 317 — 10 new `tonemap` unit tests plus `test_apply_inverse_tone_mapping_rejects_truncated_buffer`; all integration suites including 9 tests in `tests/integration_test.rs`, +7 new ITM-specific tests; doc-tests) all pass with zero regressions. Manually verified end-to-end via release binaries: `cafe-encode --sample-format 1 --chdr-transfer 0 --chdr-max-lum 1000 --inverse-tonemap reinhard` followed by `cafe-decode --tonemap-operator reinhard` round-trips a synthetic PNG successfully; also verified the `--indexed`+HDR-flag rejection and confirmed the auto-indexed-detection fallback is unaffected when no HDR flags are given.
 
 ---
 

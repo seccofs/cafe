@@ -507,6 +507,47 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
         _ => opts.target_bit_depth.unwrap_or(8),
     };
 
+    // v1.8: opt-in inverse tone-mapping (ITM) validation. Checked upfront
+    // (before any conversion work happens) so an unsupported combination
+    // fails fast with a clear message rather than silently falling back to
+    // the naive `v/255` conversion or producing a file that only
+    // superficially looks like valid HDR content.
+    if opts.inverse_tonemap.is_some() {
+        if sample_format_final != SAMPLE_FORMAT_FLOAT {
+            return Err(CafeError::UnsupportedFeature(format!(
+                "EncodeOptions::inverse_tonemap requires sample_format = Some(1) (float) — \
+                 matching decode's own restriction of tone-mapping to SAMPLE_FORMAT_FLOAT — \
+                 got sample_format = {:?}",
+                opts.sample_format
+            )));
+        }
+        if opts.target_color_type != COLOR_TYPE_RGBA {
+            return Err(CafeError::UnsupportedFeature(format!(
+                "EncodeOptions::inverse_tonemap requires target_color_type = COLOR_TYPE_RGBA (6) \
+                 — apply_tone_mapping_to_image's decode-side counterpart assumes 4-channel \
+                 (RGBA) float pixel data — got target_color_type = {}",
+                opts.target_color_type
+            )));
+        }
+        match &opts.chdr_metadata {
+            None => {
+                return Err(CafeError::UnsupportedFeature(
+                    "EncodeOptions::inverse_tonemap requires chdr_metadata = Some(_) \
+                     (max_luminance is needed to scale relative linear values to absolute nits)"
+                        .into(),
+                ));
+            }
+            Some(chdr) if chdr.transfer_function != 0 => {
+                return Err(CafeError::UnsupportedFeature(format!(
+                    "EncodeOptions::inverse_tonemap requires chdr_metadata.transfer_function = 0 \
+                     (linear) — no OETF implemented for PQ/HLG/sRGB on encode — got {}",
+                    chdr.transfer_function
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+
     // Converts RGBA to the target color type (section 4.1.3, v1.0)
     // Security validation: width/height were already validated by the image crate
     let (raw, target_color_type, bit_depth) = if opts.target_color_type == COLOR_TYPE_RGBA {
@@ -518,6 +559,26 @@ pub fn encode(input_path: &str, output_path: &str, opts: &EncodeOptions) -> Resu
                 height,
                 COLOR_TYPE_RGBA,
                 target_bit_depth,
+            )?;
+            (converted, COLOR_TYPE_RGBA, target_bit_depth)
+        } else if let Some(operator) = opts.inverse_tonemap {
+            // v1.8: inverse tone-mapping (ITM) — synthesizes plausible HDR
+            // linear-float RGBA data from the SDR input instead of the
+            // naive v/255 conversion. Validated above: sample_format_final
+            // == SAMPLE_FORMAT_FLOAT and chdr_metadata present with
+            // transfer_function == 0 are both guaranteed at this point.
+            let chdr = opts
+                .chdr_metadata
+                .as_ref()
+                .expect("validated above: inverse_tonemap requires chdr_metadata");
+            let source_primaries = 0u8; // image crate always decodes to sRGB/BT.709
+            let converted = tonemap::apply_inverse_tone_mapping_to_image(
+                &rgba_raw,
+                width,
+                height,
+                chdr,
+                source_primaries,
+                operator,
             )?;
             (converted, COLOR_TYPE_RGBA, target_bit_depth)
         } else {

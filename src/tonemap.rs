@@ -216,6 +216,43 @@ impl ToneMapOperator {
         v.clamp(0.0, 1.0)
     }
 
+    /// Analytic inverse of `apply` (v1.8, encode-side "inverse tone-mapping"
+    /// / ITM): expands a compressed value `y` in `[0, 1]` back out to the
+    /// *relative* linear luminance `x` in `[0, 1]` that `apply(x) = y` (the
+    /// same relative-to-`max_lum` domain `tonemap_hdr`'s linear-transfer-
+    /// function branch feeds into `apply` — see `inverse_tonemap_sdr`,
+    /// which multiplies this by `max_lum` to get an absolute nits value for
+    /// storage). Clamped to `[0, 1]` rather than left unbounded: `apply`
+    /// itself is only ever called (in the linear-transfer-function branch
+    /// this inverse targets) with `x` pre-clamped to `[0, 1]` by
+    /// `tonemap_hdr`, so `x > 1` is outside the domain this inverse needs
+    /// to cover, and leaving it unclamped would let `y` values near 1
+    /// diverge toward infinity (Reinhard: `y/(1-y) -> inf` as `y -> 1`).
+    ///
+    /// Only `Reinhard` has a closed-form inverse (`apply(x) = x/(1+x)` =>
+    /// `apply_inverse(y) = y/(1-y)`). `Filmic`'s curve (`f(x) = x(2.51x+0.03)
+    /// / (x(2.43x+0.59)+0.14)`) is a ratio of quadratics in `x` — solving
+    /// `f(x) = y` for `x` requires a full quadratic-formula solve per pixel
+    /// (numerically finicky near `y -> 1`, where multiple roots can be valid
+    /// or none) rather than a single division; that additional complexity
+    /// was deliberately not implemented (see AGENTS.md "v1.8" notes for the
+    /// decision rationale) so this returns
+    /// `CafeError::UnsupportedFeature` for `Filmic` instead of a fragile
+    /// numerical approximation.
+    fn apply_inverse(&self, y: f32) -> Result<f32> {
+        match self {
+            Self::Reinhard => {
+                let y = y.clamp(0.0, 0.999_999);
+                Ok((y / (1.0 - y)).clamp(0.0, 1.0))
+            }
+            Self::Filmic => Err(CafeError::UnsupportedFeature(
+                "Filmic/ACES has no closed-form inverse tone-map operator; \
+                 use ToneMapOperator::Reinhard for EncodeOptions::inverse_tonemap"
+                    .into(),
+            )),
+        }
+    }
+
     /// Parse tone-map operator from string (case-insensitive)
     /// This is the implementation for the FromStr trait below.
     fn parse_from_str(s: &str) -> std::result::Result<Self, String> {
@@ -340,6 +377,141 @@ pub fn tonemap_hdr(
     }
 
     Ok(out)
+}
+
+/// Inverse of `tonemap_hdr`'s color-primaries + tone-map-operator stages
+/// (v1.8, encode-side "inverse tone-mapping" / ITM — see
+/// `apply_inverse_tone_mapping_to_image`'s doc comment for the overall
+/// pipeline and its limitations).
+///
+/// Only `chdr.transfer_function == 0` (linear) is supported here: unlike
+/// the decode direction (`tonemap_hdr`), which has EOTFs for PQ/HLG/sRGB
+/// already implemented, encoding would need the *inverse* transfer
+/// functions (OETFs) for PQ/HLG, which do not exist in this module (see
+/// AGENTS.md "v1.8" notes) — only sRGB's OETF (`srgb_companding`, reused
+/// below as the fixed first step) exists today. Callers that need PQ/HLG
+/// output must set `chdr.transfer_function = 0` and are responsible for
+/// any further encoding of the resulting linear values downstream.
+fn inverse_tonemap_sdr(
+    rgb_srgb_encoded: &[f32; 3], // display-referred sRGB-encoded, [0, 1]
+    color_src: u8,               // primaries of the SDR source (e.g. BT.709)
+    color_target: u8,            // primaries to store the HDR result in (chdr.color_primaries)
+    max_lum: f32,                // nits ceiling for the expanded linear range
+    operator: ToneMapOperator,
+) -> Result<[f32; 3]> {
+    if color_src > 2 || color_target > 2 {
+        return Err(CafeError::UnsupportedFeature(format!(
+            "Invalid color primaries: src={}, target={}",
+            color_src, color_target
+        )));
+    }
+
+    // Step 1 (inverts tonemap_hdr's step 4, srgb_companding): sRGB EOTF,
+    // display-referred encoded -> compressed linear, [0, 1]. This is the
+    // same domain as the tone-map operator's own output in the forward
+    // (decode) direction.
+    let compressed = [
+        srgb_eotf(rgb_srgb_encoded[0].clamp(0.0, 1.0)),
+        srgb_eotf(rgb_srgb_encoded[1].clamp(0.0, 1.0)),
+        srgb_eotf(rgb_srgb_encoded[2].clamp(0.0, 1.0)),
+    ];
+
+    // Step 2 (inverts tonemap_hdr's step 3, operator.apply): expands the
+    // compressed value back to *relative* linear luminance [0, 1] — still
+    // in the SDR source's own color primaries at this point.
+    let mut relative = [0f32; 3];
+    for (i, v) in compressed.iter().enumerate() {
+        let x = if v.is_finite() && *v >= 0.0 { *v } else { 0.0 };
+        relative[i] = operator.apply_inverse(x)?;
+    }
+
+    // Step 3 (inverts tonemap_hdr's step 2, convert_primaries): RGB_linear
+    // (src) -> XYZ -> RGB_linear (target, i.e. chdr.color_primaries).
+    let relative_in_target = convert_primaries(&relative, color_src, color_target);
+
+    // Step 4 (inverts tonemap_hdr's step 1, the /max_lum normalization for
+    // the linear transfer function): scale relative [0, 1] back up to
+    // absolute nits, the value actually stored in the float pixel data.
+    let max_lum_safe = max_lum.max(1.0);
+    Ok([
+        relative_in_target[0] * max_lum_safe,
+        relative_in_target[1] * max_lum_safe,
+        relative_in_target[2] * max_lum_safe,
+    ])
+}
+
+/// Apply inverse tone-mapping to an entire image (SDR 8-bit RGBA -> linear
+/// HDR float, v1.8).
+///
+/// This is the encode-side counterpart of `apply_tone_mapping_to_image`,
+/// used to synthesize plausible HDR content from ordinary SDR input when
+/// `EncodeOptions::inverse_tonemap` is set — never a true recovery of
+/// discarded highlight information (the forward tone-map is a many-to-one
+/// compression; this is inverse tone-mapping / ITM, an approximation, not a
+/// lossless inverse). Alpha is passed through unchanged (scaled to [0,1]).
+///
+/// # Limitations (see `inverse_tonemap_sdr` and `ToneMapOperator::apply_inverse`)
+/// - Only `ToneMapOperator::Reinhard` is supported (`Filmic` has no
+///   closed-form inverse and returns `CafeError::UnsupportedFeature`).
+/// - Only `chdr.transfer_function == 0` (linear) is supported (no PQ/HLG
+///   OETF implemented); other values return `CafeError::UnsupportedFeature`.
+pub fn apply_inverse_tone_mapping_to_image(
+    rgba_u8: &[u8], // RGBA 8-bit, width*height*4 bytes
+    width: u32,
+    height: u32,
+    chdr: &cHDR,
+    source_primaries: u8, // primaries of the input SDR data (typically BT.709/sRGB = 0)
+    operator: ToneMapOperator,
+) -> Result<Vec<u8>> {
+    if chdr.transfer_function != 0 {
+        return Err(CafeError::UnsupportedFeature(format!(
+            "Inverse tone-mapping on encode only supports cHDR.transfer_function = 0 \
+             (linear); no OETF implemented for transfer function {} (see AGENTS.md v1.8 notes)",
+            chdr.transfer_function
+        )));
+    }
+
+    let pixel_count = (width as u64)
+        .checked_mul(height as u64)
+        .ok_or_else(|| CafeError::TruncatedFile("overflow on width × height".into()))?
+        as usize;
+
+    let expected_bytes = pixel_count
+        .checked_mul(4)
+        .ok_or_else(|| CafeError::TruncatedFile("Overflow on pixel count × 4".into()))?;
+
+    if rgba_u8.len() != expected_bytes {
+        return Err(CafeError::TruncatedFile(format!(
+            "Inverse tone-mapping: expected {} RGBA bytes, got {}",
+            expected_bytes,
+            rgba_u8.len()
+        )));
+    }
+
+    let mut result = Vec::with_capacity(pixel_count * 16); // RGBA float32 BE
+
+    for i in 0..pixel_count {
+        let offset = i * 4;
+        let r = rgba_u8[offset] as f32 / 255.0;
+        let g = rgba_u8[offset + 1] as f32 / 255.0;
+        let b = rgba_u8[offset + 2] as f32 / 255.0;
+        let a = rgba_u8[offset + 3] as f32 / 255.0;
+
+        let rgb_hdr = inverse_tonemap_sdr(
+            &[r, g, b],
+            source_primaries,
+            chdr.color_primaries,
+            chdr.max_luminance.max(1.0),
+            operator,
+        )?;
+
+        result.extend_from_slice(&rgb_hdr[0].to_be_bytes());
+        result.extend_from_slice(&rgb_hdr[1].to_be_bytes());
+        result.extend_from_slice(&rgb_hdr[2].to_be_bytes());
+        result.extend_from_slice(&a.to_be_bytes());
+    }
+
+    Ok(result)
 }
 
 /// Apply tone-mapping to an entire image (float → SDR 8-bit)
@@ -660,6 +832,190 @@ mod tests {
         // Invalid operators should error
         assert!(ToneMapOperator::from_str("invalid").is_err());
         assert!(ToneMapOperator::from_str("").is_err());
+    }
+
+    #[test]
+    fn test_reinhard_apply_inverse_roundtrip() {
+        // apply then apply_inverse should return ~ the original input,
+        // within the domain apply_inverse targets: x in [0, 1] (the same
+        // range tonemap_hdr's linear-transfer-function branch pre-clamps
+        // to before calling apply — see apply_inverse's doc comment).
+        for x in [0.0f32, 0.1, 0.5, 0.8, 1.0] {
+            let y = ToneMapOperator::Reinhard.apply(x);
+            let back = ToneMapOperator::Reinhard
+                .apply_inverse(y)
+                .expect("Reinhard inverse should succeed");
+            assert!(
+                (back - x).abs() < 0.01,
+                "roundtrip failed: x={x} -> y={y} -> back={back}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reinhard_apply_inverse_clamps_at_one() {
+        // y approaching 1.0 would blow up to infinity without a [0,1] clamp
+        let result = ToneMapOperator::Reinhard.apply_inverse(0.999999).unwrap();
+        assert!(result <= 1.0);
+        assert!(result > 0.0);
+    }
+
+    #[test]
+    fn test_filmic_apply_inverse_unsupported() {
+        let result = ToneMapOperator::Filmic.apply_inverse(0.5);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_inverse_tonemap_sdr_invalid_primaries() {
+        let result = inverse_tonemap_sdr(&[0.5, 0.5, 0.5], 99, 0, 100.0, ToneMapOperator::Reinhard);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_inverse_tonemap_sdr_produces_finite_output() {
+        let result =
+            inverse_tonemap_sdr(&[0.8, 0.5, 0.2], 0, 1, 1000.0, ToneMapOperator::Reinhard).unwrap();
+        for v in result {
+            assert!(v.is_finite() && v >= 0.0);
+        }
+    }
+
+    #[test]
+    fn test_apply_inverse_tone_mapping_to_image_dimensions() {
+        // 2×2 RGBA 8-bit image
+        let pixels = vec![
+            255, 128, 64, 255, // pixel 0
+            0, 255, 0, 200, // pixel 1
+            10, 20, 30, 100, // pixel 2
+            250, 250, 250, 0, // pixel 3
+        ];
+        let chdr = cHDR {
+            transfer_function: 0,
+            color_primaries: 1,
+            max_luminance: 1000.0,
+            min_luminance: 0.001,
+            max_cll: None,
+            max_fall: None,
+        };
+
+        let result =
+            apply_inverse_tone_mapping_to_image(&pixels, 2, 2, &chdr, 0, ToneMapOperator::Reinhard)
+                .unwrap();
+        // 4 pixels × 4 channels × 4 bytes (float32) = 64 bytes
+        assert_eq!(result.len(), 64);
+    }
+
+    #[test]
+    fn test_apply_inverse_tone_mapping_to_image_alpha_preserved() {
+        let pixels = vec![100, 100, 100, 128]; // 1 pixel, alpha=128
+        let chdr = cHDR {
+            transfer_function: 0,
+            color_primaries: 0,
+            max_luminance: 100.0,
+            min_luminance: 0.001,
+            max_cll: None,
+            max_fall: None,
+        };
+        let result =
+            apply_inverse_tone_mapping_to_image(&pixels, 1, 1, &chdr, 0, ToneMapOperator::Reinhard)
+                .unwrap();
+        let alpha_bits = u32::from_be_bytes([result[12], result[13], result[14], result[15]]);
+        let alpha = f32::from_bits(alpha_bits);
+        assert!((alpha - (128.0 / 255.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_apply_inverse_tone_mapping_rejects_non_linear_transfer_function() {
+        let pixels = vec![100, 100, 100, 255];
+        let chdr = cHDR {
+            transfer_function: 1, // PQ - not supported for inverse tone-mapping
+            color_primaries: 0,
+            max_luminance: 10000.0,
+            min_luminance: 0.001,
+            max_cll: None,
+            max_fall: None,
+        };
+        let result =
+            apply_inverse_tone_mapping_to_image(&pixels, 1, 1, &chdr, 0, ToneMapOperator::Reinhard);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_apply_inverse_tone_mapping_rejects_filmic() {
+        let pixels = vec![100, 100, 100, 255];
+        let chdr = cHDR {
+            transfer_function: 0,
+            color_primaries: 0,
+            max_luminance: 100.0,
+            min_luminance: 0.001,
+            max_cll: None,
+            max_fall: None,
+        };
+        let result =
+            apply_inverse_tone_mapping_to_image(&pixels, 1, 1, &chdr, 0, ToneMapOperator::Filmic);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_apply_inverse_tone_mapping_rejects_truncated_buffer() {
+        let pixels = vec![0u8; 3]; // not a multiple of 4
+        let chdr = cHDR::default();
+        let result =
+            apply_inverse_tone_mapping_to_image(&pixels, 1, 1, &chdr, 0, ToneMapOperator::Reinhard);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_forward_inverse_tonemap_roundtrip_reasonable() {
+        // Encode SDR -> HDR float (inverse), then decode HDR float -> SDR
+        // (forward) with the same operator/chdr; result should be close to
+        // (though not bit-identical to) the original SDR input.
+        //
+        // Note: `tonemap_hdr`'s decode-side linear-transfer-function branch
+        // always pre-clamps its operator input to relative [0, 1] before
+        // calling `operator.apply`, and Reinhard's `apply(x) = x/(1+x)`
+        // therefore only ever reaches compressed outputs in `[0, 0.5]` in
+        // that branch. `apply_inverse` mirrors that same [0, 1] domain
+        // restriction (see its doc comment). SDR input bright enough that
+        // `srgb_eotf(v/255) > 0.5` (v >~ 187/255) is therefore outside the
+        // domain this specific decode/encode pair can round-trip exactly —
+        // an inherent limitation of composing Reinhard with this system's
+        // linear-transfer-function convention, not a bug in the inverse
+        // math itself. This test picks input values comfortably inside the
+        // round-trippable domain; a value like 200 would legitimately clip.
+        let original = vec![150u8, 100, 50, 255];
+        let chdr = cHDR {
+            transfer_function: 0,
+            color_primaries: 0,
+            max_luminance: 1000.0,
+            min_luminance: 0.001,
+            max_cll: None,
+            max_fall: None,
+        };
+
+        let hdr_float = apply_inverse_tone_mapping_to_image(
+            &original,
+            1,
+            1,
+            &chdr,
+            0,
+            ToneMapOperator::Reinhard,
+        )
+        .unwrap();
+        let sdr_back =
+            apply_tone_mapping_to_image(&hdr_float, 1, 1, &chdr, 0, ToneMapOperator::Reinhard)
+                .unwrap();
+
+        for i in 0..3 {
+            let diff = (original[i] as i32 - sdr_back[i] as i32).abs();
+            assert!(
+                diff <= 2,
+                "channel {i}: original={} back={}",
+                original[i],
+                sdr_back[i]
+            );
+        }
     }
 
     #[test]

@@ -770,7 +770,8 @@ This table tracks completeness of CLI flag coverage for `EncodeOptions` fields (
 | `filter_heuristic` | `--filter-heuristic <h>` | ✅ | entropy, msad, test, quick-prune, adaptive |
 | `auto_dictionary` | `--auto-dict` | ✅ | v1.1, auto-train ZSTD dict |
 | `palette_algorithm` | `--palette-algorithm <a>` | ✅ | v1.1, nearest (default); median-cut; weighted (v1.5, redmean, scalar-only); kmeans (v1.7, Lloyd's algorithm) |
-| `tonemap_operator` | — | ❌ **MISSING** | Encode-side field exists (v1.2.1) but only `cafe-decode`'s `--tonemap-operator` is wired up; no encode-side flag |
+| `tonemap_operator` | — | ⚠️ **partial** | Decode-side only (`cafe-decode`'s `--tonemap-operator`); not consulted by `encode()`. See `inverse_tonemap` below for the actual encode-side option. |
+| `inverse_tonemap` | `--inverse-tonemap <reinhard>` | ✅ | v1.8, opt-in SDR→HDR synthesis on encode. Only `reinhard` supported; requires `--sample-format 1` + `--chdr-transfer 0` + RGBA color type. |
 
 `EncoderOptions` (the streaming `Encoder<W>` API, v1.6) is a deliberately smaller struct with no CLI binary of its own — it's a library-only API (`tile_rows`, `level`, `use_filter`/`use_filter_per_row`, `target_color_type`, `target_bit_depth`, `exif`, `json_metadata`, `icc_profile`, `xmp_metadata`, `zstd_dictionary`, `sample_format`, `chdr_metadata`, `filter_heuristic`, `use_byte_shuffle`), so CLI parity doesn't apply to it the same way; see its limitations list in the "Streaming Encoder" section above.
 
@@ -828,7 +829,8 @@ Before submitting a PR:
 | **v1.6.2** | **Real `compression_stats` + `cafe-decode` metadata-export flags**: `DecodeResult::compression_stats` now populated with real per-chunk original/compressed sizes (previously always `None`); new `--show-stats`, `--save-exif`, `--save-icc-profile`, `--save-xmp`, `--save-zstd-dict` flags on `cafe-decode` | ✅ |
 | **v1.6.3** | **CI: nightly fuzz workflow** — new `.github/workflows/fuzz.yml` runs `decode_fuzz`/`chunk_roundtrip_fuzz` for a full hour nightly (plus on-demand via `workflow_dispatch`), separate from `ci.yml`'s existing 60s-per-push smoke test job | ✅ |
 | **v1.7** | **`PaletteAlgorithm::KMeans`**: new indexed-palette quantization algorithm implementing Lloyd's algorithm, deterministically initialized from `MedianCut`'s output (no RNG dependency), typically the lowest mean-squared-error palette of the four algorithms at the highest computational cost — `--palette-algorithm kmeans` | ✅ |
-| Future | Real hardware validation on physical ARM devices, additional compressors, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
+| **v1.8** | **Inverse tone-mapping on encode (SDR→HDR synthesis)**: `ToneMapOperator::apply_inverse` (Reinhard only), `apply_inverse_tone_mapping_to_image`, opt-in `EncodeOptions::inverse_tonemap: Option<ToneMapOperator>` field (default `None`, non-breaking), `--inverse-tonemap reinhard` CLI flag; requires `sample_format=1` + `chdr_transfer=0` (linear) + RGBA color type | ✅ |
+| Future | Real hardware validation on physical ARM devices, additional compressors, tone-mapping operator selection via CLI for PQ/HLG/sRGB transfer functions and Filmic on encode | ⏳ |
 
 ---
 
@@ -927,4 +929,4 @@ cargo doc --open
 
 ---
 
-**Last updated:** September 3, 2026 (v1.7: `PaletteAlgorithm::KMeans` — deterministic k-means palette quantization, `--palette-algorithm kmeans`; v1.6.3: nightly fuzz CI workflow — `.github/workflows/fuzz.yml`; v1.6.2: real `compression_stats` tracking + `cafe-decode` gains `--show-stats`/`--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict` flags; v1.6.1: `cafe-encode` gains `--icc-profile-file`/`--xmp-file` CLI flags; v1.6: streaming encoder — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`) | **Project version:** v1.7.0
+**Last updated:** September 3, 2026 (v1.8: inverse tone-mapping on encode — `EncodeOptions::inverse_tonemap`, `--inverse-tonemap reinhard`, SDR→HDR synthesis; v1.7: `PaletteAlgorithm::KMeans` — deterministic k-means palette quantization, `--palette-algorithm kmeans`; v1.6.3: nightly fuzz CI workflow — `.github/workflows/fuzz.yml`; v1.6.2: real `compression_stats` tracking + `cafe-decode` gains `--show-stats`/`--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict` flags; v1.6.1: `cafe-encode` gains `--icc-profile-file`/`--xmp-file` CLI flags; v1.6: streaming encoder — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`) | **Project version:** v1.8.0

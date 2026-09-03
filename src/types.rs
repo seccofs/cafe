@@ -459,6 +459,23 @@ pub struct EncodeOptions {
     /// Tone-map operator for HDR decode (v1.2.1)
     /// Default: ToneMapOperator::Filmic (recommended for most images)
     pub tonemap_operator: crate::tonemap::ToneMapOperator,
+    /// Opt-in inverse tone-mapping (ITM) for the encode side (v1.8):
+    /// synthesizes plausible HDR linear-float pixel data from ordinary SDR
+    /// 8-bit input instead of the naive `v/255` used when this is `None`.
+    /// Requires `sample_format` to be exactly `Some(1)` (float — matching
+    /// `convert_raw_to_rgba`'s own decode-side restriction of tone-mapping
+    /// to `SAMPLE_FORMAT_FLOAT`, never `HALF`, so an image produced with
+    /// this option round-trips through `decode()`'s existing tone-mapping
+    /// path) and `chdr_metadata` to be `Some(_)` with `transfer_function ==
+    /// 0` (linear) — `encode()` returns `CafeError::UnsupportedFeature`
+    /// otherwise. Only `ToneMapOperator::Reinhard` is supported (`Filmic`
+    /// has no closed-form inverse — see `tonemap::ToneMapOperator::apply_inverse`).
+    ///
+    /// This is inverse tone-mapping (ITM), an approximation that expands
+    /// SDR content into a plausible HDR-shaped range — never a lossless
+    /// recovery of highlight/shadow detail the SDR source never had.
+    /// Default: `None` (existing naive `v/255` behavior, unchanged).
+    pub inverse_tonemap: Option<crate::tonemap::ToneMapOperator>,
 }
 
 /// Palette quantization algorithm selector (v1.1, extended v1.5)
@@ -527,6 +544,7 @@ impl Default for EncodeOptions {
             use_byte_shuffle: false,
             auto_dictionary: false,
             palette_algorithm: PaletteAlgorithm::NearestNeighbor,
+            inverse_tonemap: None,
         }
     }
 }
