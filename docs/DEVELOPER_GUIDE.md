@@ -647,6 +647,192 @@ cargo fmt --check                   # Verify formatting
 cargo deny check                     # Security and license audit (requires: cargo install cargo-deny)
 ```
 
+### Fuzzing with cargo-fuzz
+
+Fuzzing ensures that `decode_bytes()` never panics on arbitrary input — it should only ever return `Err(CafeError::...)`. This is critical for handling malicious or malformed files (see section 12, Security Considerations).
+
+**Available harnesses:**
+
+- **`decode_fuzz`**: fuzzes the core `decode_bytes()` function with arbitrary byte sequences.
+- **`chunk_roundtrip_fuzz`**: fuzzes chunk parsing (read/write) indirectly via `decode_bytes()`.
+
+**Setup (Linux/macOS only)** — fuzzing requires Rust nightly and a Unix-like OS (libFuzzer is not supported on Windows MSVC; run it on a Linux CI machine or in WSL2, and use property tests instead for local Windows development):
+
+```bash
+rustup default nightly
+cargo fuzz init   # already done in this repo; for reference only
+```
+
+**Running fuzzing:**
+
+```bash
+# Local run, ~10 minutes, basic crash search
+cargo fuzz run decode_fuzz -- -max_len=16384 -timeout=10
+
+# Longer run (e.g. overnight/CI), 1+ hours
+cargo fuzz run decode_fuzz -- -max_len=16384 -timeout=10 -max_total_time=3600
+
+# Chunk roundtrip harness
+cargo fuzz run chunk_roundtrip_fuzz -- -max_len=16384 -timeout=10
+```
+
+**Interpreting results:** a clean run for the specified time with no panics means the code is robust. If libFuzzer finds a crash, it saves a minimal reproducer to `fuzz/artifacts/decode_fuzz/` (or `chunk_roundtrip_fuzz/`):
+
+```bash
+xxd fuzz/artifacts/decode_fuzz/<crash_file>                       # inspect the input
+cargo fuzz run decode_fuzz fuzz/artifacts/decode_fuzz/<crash_file> # reproduce
+cargo fuzz cmin decode_fuzz                                        # minimize the corpus
+```
+
+**Local workflow before a long fuzzing run:**
+
+```bash
+cargo test --lib
+cargo clippy -- -D warnings
+cargo fuzz run decode_fuzz -- -max_len=16384 -timeout=10 -runs=1000000
+```
+
+**CI integration (recommended, not yet implemented)** — no `.github/workflows/fuzz.yml` exists today; a nightly scheduled fuzz run would look like:
+
+```yaml
+name: Fuzz
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # Run nightly at 2 AM UTC
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo fuzz run decode_fuzz -- -max_len=16384 -timeout=10 -max_total_time=3600
+      - run: cargo fuzz run chunk_roundtrip_fuzz -- -max_len=16384 -timeout=10 -max_total_time=3600
+      - uses: actions/upload-artifact@v3
+        if: failure()
+        with:
+          name: crash-artifacts
+          path: fuzz/artifacts/
+```
+
+### Property-Based Testing with proptest
+
+Property tests use randomized inputs to find edge cases that hand-written unit tests might miss. CAFE uses `proptest` (`tests/roundtrip_proptest.rs`) to randomize width/height (1..=32), color types and bit depths, sample formats (uint/float/half), interlace methods, and filter heuristics, then verifies pixel round-trip accuracy for each generated configuration.
+
+```bash
+# Default case count (usually 64-256)
+cargo test --test '*' -- --nocapture
+
+# More cases (slower, more thorough)
+PROPTEST_CASES=1000 cargo test --test '*'
+
+# A specific property test, with backtrace on failure
+RUST_BACKTRACE=1 cargo test prop_roundtrip_arbitrary_config -- --nocapture
+```
+
+When proptest finds a failure, it **shrinks** the failing input to a minimal reproducer, **saves** the seed to `proptest-regressions/` for deterministic re-runs, and **shows** the shrunk input in the error output, e.g.:
+
+```
+Error: test failed as expected, and shrinking discovered smaller failing inputs.
+The smallest failing input after 45 iterations was:
+seed: [12345, 67890]
+config: ColorType::GRAY, bit_depth=1, interlace=ADAM7, filter=Entropy
+```
+
+If a property test run is too slow locally, reduce the case count: `PROPTEST_CASES=64 cargo test prop_roundtrip`.
+
+### Benchmarking with criterion
+
+`benches/encode_decode.rs` benchmarks `encode()` (levels 1/9/19/22, filter on/off), `decode()` on various image types, `encode_indexed()` on palette images, and PNG-vs-CAFE encoding time for the same image.
+
+```bash
+cargo bench                    # run all benchmarks
+cargo bench encode_level       # run a specific benchmark
+cargo bench -- --sample-size=100  # reduce sample count if a run times out
+```
+
+Reports are written to `target/criterion/report/index.html`. After running, consider updating `README.md`'s performance numbers if they've drifted meaningfully.
+
+### Quick Reference
+
+| Goal | Command |
+|------|---------|
+| Run all tests | `cargo test --lib` |
+| Quick lint check | `cargo clippy -- -D warnings` |
+| Run fuzzing (local) | `cargo fuzz run decode_fuzz -- -max_len=16384 -runs=100000` |
+| Run property tests | `PROPTEST_CASES=256 cargo test prop_` |
+| Benchmark | `cargo bench` |
+| Build release | `cargo build --release` |
+| Encode an image | `cargo run --release --bin cafe-encode -- input.png output.cafe` |
+| Decode a CAFE | `cargo run --release --bin cafe-decode -- input.cafe output.png` |
+
+### CLI Parity: `EncodeOptions`/`EncoderOptions` ↔ CLI Flags (updated for v1.6)
+
+This table tracks completeness of CLI flag coverage for `EncodeOptions` fields (batch `encode()`/`encode_indexed()`, via `tools/cafe-encode.rs`). **Goal**: all public library features should be accessible via CLI where practical.
+
+| Field | CLI Flag | Status | Notes |
+|-------|----------|--------|-------|
+| `use_filter` | `--no-filter` | ✅ | Inverse logic; default=true (filter on) |
+| `use_filter_per_row` | — | ❌ **MISSING** | v1.5, `FILTER_METHOD_PREDICTIVE_PER_ROW`; library-only today, no `--filter-per-row`-style flag |
+| `use_byte_shuffle` | `--byte-shuffle` | ✅ | v1.1, for HDR/float data |
+| `level` | `--level <1-22>` | ✅ | ZSTD compression (default: 19) |
+| `adaptive_analysis` | `--adaptive` | ✅ | Local complexity per tile |
+| `target_color_type` | `--color-type <0\|2\|4\|6>` | ✅ | 0=GRAY, 2=RGB, 4=GRAY_ALPHA, 6=RGBA |
+| `target_bit_depth` | `--bit-depth <d>` | ✅ | 1,2,4,8,10,12,16,32 (uint only) |
+| `json_metadata` | `--json-file <path>` | ✅ | Reads JSON from file |
+| `exif` | `--exif-file <path>` | ✅ | Raw EXIF binary blob |
+| `icc_profile` | — | ❌ **MISSING** | Could add `--icc-profile <path>` |
+| `xmp_metadata` | — | ❌ **MISSING** | Could add `--xmp-file <path>` |
+| `idim` | — | ❌ **NOT IMPL** | 2D tiling (internal feature, rare) |
+| `interlace_method` | `--interlace <0\|1\|2>` | ✅ | 0=none, 1=Adam7, 2=even/odd |
+| `zstd_dictionary` | `--chdr-dict-file <path>` | ✅ | Pre-trained ZSTD dict |
+| `sample_format` | `--sample-format <0\|1\|2>` | ✅ | 0=uint, 1=float, 2=half-float |
+| `chdr_metadata` | `--chdr-transfer`, `--chdr-primaries`, `--chdr-max-lum`, `--chdr-min-lum` | ✅ | HDR tone-mapping metadata |
+| `filter_heuristic` | `--filter-heuristic <h>` | ✅ | entropy, msad, test, quick-prune, adaptive |
+| `auto_dictionary` | `--auto-dict` | ✅ | v1.1, auto-train ZSTD dict |
+| `palette_algorithm` | `--palette-algorithm <a>` | ✅ | v1.1, nearest (default); median-cut; weighted (v1.5, redmean, scalar-only) |
+| `tonemap_operator` | — | ❌ **MISSING** | Encode-side field exists (v1.2.1) but only `cafe-decode`'s `--tonemap-operator` is wired up; no encode-side flag |
+
+`EncoderOptions` (the streaming `Encoder<W>` API, v1.6) is a deliberately smaller struct with no CLI binary of its own — it's a library-only API (`tile_rows`, `level`, `use_filter`/`use_filter_per_row`, `target_color_type`, `target_bit_depth`, `exif`, `json_metadata`, `icc_profile`, `xmp_metadata`, `zstd_dictionary`, `sample_format`, `chdr_metadata`, `filter_heuristic`, `use_byte_shuffle`), so CLI parity doesn't apply to it the same way; see its limitations list in the "Streaming Encoder" section above.
+
+**`DecodeResult` fields accessibility** (`tools/cafe-decode.rs`):
+
+| Field | CLI Export | Status | Notes |
+|-------|-----------|--------|-------|
+| `width` / `height` | Implicit (output file dimensions) | ✅ | Encoded in the decoded output image |
+| `exif` | `--extract-metadata` (size only) | ⚠️ **PARTIAL** | Prints byte count; raw bytes not saved to a separate file |
+| `json_metadata` | `--extract-metadata` | ✅ | Prints namespace keys always, full contents with `--extract-metadata` |
+| `compression_stats` | — | ❌ **MISSING** | Could add a `--show-stats` flag |
+| `icc_profile` | Printed unconditionally (size only) | ⚠️ **PARTIAL** | Present in library, not saved to a separate file |
+| `xmp_metadata` | Printed unconditionally (size only) | ⚠️ **PARTIAL** | Present in library, not saved to a separate file |
+| `zstd_dictionary` | Printed unconditionally (size only) | ⚠️ **PARTIAL** | Present in library, not saved to a separate file |
+| `chdr_metadata` | Printed unconditionally (full detail) | ✅ | Transfer function, primaries, luminance, MaxCLL/MaxFALL all printed |
+
+**Legend**: ✅ complete (CLI flag exists, correct default behavior) · ⚠️ partial (library has it, CLI only surfaces a summary) · ❌ missing (no CLI flag; 2D tiling is intentionally low-priority for CLI exposure since it's a rarely-used internal feature).
+
+### Common Issues
+
+**Fuzzing fails to link on Windows** — libFuzzer requires Unix-like systems; Windows MSVC linking doesn't support the `#[no_main]` entry point libFuzzer needs. Run fuzzing on Linux CI or WSL2; use property tests for local Windows development instead.
+
+**Property test takes too long** — reduce `PROPTEST_CASES` or target a specific test: `PROPTEST_CASES=64 cargo test prop_roundtrip`.
+
+**Criterion benchmarks time out** — reduce the sample count: `cargo bench -- --sample-size=100`.
+
+### Contribution Checklist
+
+Before submitting a PR:
+
+- [ ] `cargo test --lib` passes
+- [ ] `cargo clippy -- -D warnings` passes (no warnings)
+- [ ] `cargo fmt --check` passes (code is formatted)
+- [ ] New functionality has a test
+- [ ] Fuzzing harnesses still compile (Linux/nightly: `cargo fuzz build`)
+- [ ] No breaking changes to `.cafe` binary format
+- [ ] `README.md` updated if adding public APIs
+- [ ] Performance-sensitive changes run `cargo bench`
+
 ---
 
 ## Version Roadmap
