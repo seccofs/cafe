@@ -692,30 +692,7 @@ cargo clippy -- -D warnings
 cargo fuzz run decode_fuzz -- -max_len=16384 -timeout=10 -runs=1000000
 ```
 
-**CI integration (recommended, not yet implemented)** — no `.github/workflows/fuzz.yml` exists today; a nightly scheduled fuzz run would look like:
-
-```yaml
-name: Fuzz
-
-on:
-  schedule:
-    - cron: '0 2 * * *'  # Run nightly at 2 AM UTC
-  workflow_dispatch:
-
-jobs:
-  fuzz:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo fuzz run decode_fuzz -- -max_len=16384 -timeout=10 -max_total_time=3600
-      - run: cargo fuzz run chunk_roundtrip_fuzz -- -max_len=16384 -timeout=10 -max_total_time=3600
-      - uses: actions/upload-artifact@v3
-        if: failure()
-        with:
-          name: crash-artifacts
-          path: fuzz/artifacts/
-```
+**CI integration (v1.6.3+, implemented)** — `.github/workflows/fuzz.yml` runs a full-hour (configurable via `workflow_dispatch`'s `duration_seconds` input) fuzz run per harness (`decode_fuzz`, `chunk_roundtrip_fuzz`) nightly at 2 AM UTC, plus on-demand. This is separate from `ci.yml`'s own `fuzz` job, which only runs each target for 60s on every push/PR as a fast smoke test — the nightly job trades that speed for depth. On failure, both crash artifacts (`fuzz/artifacts/<target>/`) and the corpus (`fuzz/corpus/<target>/`) are uploaded as workflow artifacts for local reproduction.
 
 ### Property-Based Testing with proptest
 
@@ -849,6 +826,7 @@ Before submitting a PR:
 | **v1.6** | **Streaming Encoder** (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to v1.5's `Decoder<R: Read>`): writes `IHDR` + ancillary chunks + row-strip `IDAT`s incrementally as tiles arrive; `finish()` sets a conservative `compression_method` for `Write`-only destinations, `finish_exact()` patches it to the exact value (byte-for-byte identical to `encode()`) when `W` also supports `Seek` | ✅ |
 | **v1.6.1** | **CLI: `--icc-profile-file`/`--xmp-file` flags for `cafe-encode`** — closes a CLI-parity gap: `EncodeOptions::icc_profile`/`xmp_metadata` already existed in the library but had no CLI flag to populate them | ✅ |
 | **v1.6.2** | **Real `compression_stats` + `cafe-decode` metadata-export flags**: `DecodeResult::compression_stats` now populated with real per-chunk original/compressed sizes (previously always `None`); new `--show-stats`, `--save-exif`, `--save-icc-profile`, `--save-xmp`, `--save-zstd-dict` flags on `cafe-decode` | ✅ |
+| **v1.6.3** | **CI: nightly fuzz workflow** — new `.github/workflows/fuzz.yml` runs `decode_fuzz`/`chunk_roundtrip_fuzz` for a full hour nightly (plus on-demand via `workflow_dispatch`), separate from `ci.yml`'s existing 60s-per-push smoke test job | ✅ |
 | Future | Real hardware validation on physical ARM devices, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
 
 ---
@@ -948,4 +926,4 @@ cargo doc --open
 
 ---
 
-**Last updated:** September 3, 2026 (v1.6.2: real `compression_stats` tracking + `cafe-decode` gains `--show-stats`/`--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict` flags; v1.6.1: `cafe-encode` gains `--icc-profile-file`/`--xmp-file` CLI flags; v1.6: streaming encoder — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`) | **Project version:** v1.6.2
+**Last updated:** September 3, 2026 (v1.6.3: nightly fuzz CI workflow — `.github/workflows/fuzz.yml`; v1.6.2: real `compression_stats` tracking + `cafe-decode` gains `--show-stats`/`--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict` flags; v1.6.1: `cafe-encode` gains `--icc-profile-file`/`--xmp-file` CLI flags; v1.6: streaming encoder — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`) | **Project version:** v1.6.3

@@ -751,30 +751,7 @@ cargo clippy -- -D warnings
 cargo fuzz run decode_fuzz -- -max_len=16384 -timeout=10 -runs=1000000
 ```
 
-**CI integration (recommended, not yet implemented)** — no `.github/workflows/fuzz.yml` exists today; a nightly scheduled fuzz run would look like:
-
-```yaml
-name: Fuzz
-
-on:
-  schedule:
-    - cron: '0 2 * * *'  # Run nightly at 2 AM UTC
-  workflow_dispatch:
-
-jobs:
-  fuzz:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo fuzz run decode_fuzz -- -max_len=16384 -timeout=10 -max_total_time=3600
-      - run: cargo fuzz run chunk_roundtrip_fuzz -- -max_len=16384 -timeout=10 -max_total_time=3600
-      - uses: actions/upload-artifact@v3
-        if: failure()
-        with:
-          name: crash-artifacts
-          path: fuzz/artifacts/
-```
+**CI integration (v1.6.3+, implemented)** — `.github/workflows/fuzz.yml` runs a full-hour (configurable via `workflow_dispatch`'s `duration_seconds` input) fuzz run per harness (`decode_fuzz`, `chunk_roundtrip_fuzz`) nightly at 2 AM UTC, plus on-demand. This is separate from `ci.yml`'s own `fuzz` job, which only runs each target for 60s on every push/PR as a fast smoke test — the nightly job trades that speed for depth. On failure, both crash artifacts (`fuzz/artifacts/<target>/`) and the corpus (`fuzz/corpus/<target>/`) are uploaded as workflow artifacts for local reproduction. See "v1.6.3" notes below.
 
 ### Property-Based Testing with proptest
 
@@ -909,6 +886,7 @@ Before submitting a PR:
 | **v1.6** | **Streaming Encoder** (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to v1.5's `Decoder<R: Read>`): writes `IHDR` + ancillary chunks + row-strip `IDAT`s incrementally as tiles arrive instead of requiring the whole image in memory first; `finish()` leaves `compression_method`'s ZSTD bit conservatively set (safe overestimate) for `Write`-only destinations, `finish_exact()` patches it to the exact value (byte-for-byte identical to `encode()`) when `W` also supports `Seek` — see "v1.6" notes below | ✅ |
 | **v1.6.1** | **CLI: `--icc-profile-file`/`--xmp-file` flags for `cafe-encode`** — closes a CLI-parity gap: `EncodeOptions::icc_profile`/`xmp_metadata` already existed in the library and were written correctly by `encode()`/`encode_indexed()`, but had no CLI flag to populate them — see "v1.6.1" notes below | ✅ |
 | **v1.6.2** | **Real `compression_stats` + `cafe-decode` metadata-export flags**: `DecodeResult::compression_stats` now populated with real per-chunk original/compressed sizes (previously always `None`); new `--show-stats`, `--save-exif`, `--save-icc-profile`, `--save-xmp`, `--save-zstd-dict` flags on `cafe-decode` — see "v1.6.2" notes below | ✅ |
+| **v1.6.3** | **CI: nightly fuzz workflow** — new `.github/workflows/fuzz.yml` runs `decode_fuzz`/`chunk_roundtrip_fuzz` for a full hour nightly (plus on-demand via `workflow_dispatch`), separate from `ci.yml`'s existing 60s-per-push smoke test job — see "v1.6.3" notes below | ✅ |
 | Future | Real hardware validation on physical ARM devices, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
 
 ---
@@ -1022,7 +1000,20 @@ cargo doc --open
 
 ---
 
-**Last updated:** September 3, 2026 | **Project version:** v1.6.2 | **ARM NEON SIMD Phase (Sep 1/2026) + Compression-Focused Audit (Sep 2/2026) + Streaming Encoder (Sep 3/2026) + CLI ICC/XMP flags (Sep 3/2026, v1.6.1) + Real compression_stats + cafe-decode export flags (Sep 3/2026, v1.6.2):**
+**Last updated:** September 3, 2026 | **Project version:** v1.6.3 | **ARM NEON SIMD Phase (Sep 1/2026) + Compression-Focused Audit (Sep 2/2026) + Streaming Encoder (Sep 3/2026) + CLI ICC/XMP flags (Sep 3/2026, v1.6.1) + Real compression_stats + cafe-decode export flags (Sep 3/2026, v1.6.2) + Nightly fuzz CI workflow (Sep 3/2026, v1.6.3):**
+
+### v1.6.3 - CI: nightly fuzz workflow
+
+Closes the last remaining item from the "CI integration (recommended)" note under "Fuzzing with cargo-fuzz" above: `.github/workflows/fuzz.yml` now exists and runs automatically, instead of being a documented-but-unimplemented YAML snippet.
+
+- **New workflow**: `.github/workflows/fuzz.yml`, separate from `ci.yml`'s existing `fuzz` job (which runs each target for only 60s on every push/PR as a fast smoke test — unchanged by this addition). The new job runs the **same two harnesses** (`decode_fuzz`, `chunk_roundtrip_fuzz`) for a full hour each (`-max_total_time=3600`, configurable per-run via `workflow_dispatch`'s `duration_seconds` input), on a `matrix.target` strategy with `fail-fast: false` so one harness crashing doesn't cancel the other's run.
+- **Triggers**: `schedule: cron: '0 2 * * *'` (nightly at 2 AM UTC) plus `workflow_dispatch` for on-demand manual runs (e.g. after a suspicious change to decode-path code, without waiting for the next scheduled run).
+- **Toolchain/setup**: mirrors `ci.yml`'s existing `fuzz` job exactly — `dtolnay/rust-toolchain@nightly` (cargo-fuzz requires nightly), `Swatinem/rust-cache@v2` scoped to `fuzz -> target` (the fuzz harnesses are a separate Cargo workspace member with their own `Cargo.toml`/lockfile-adjacent target dir), `taiki-e/install-action@v2` to install `cargo-fuzz` itself, and `cargo fuzz run --target x86_64-unknown-linux-gnu <target> -- ...` run from the `fuzz` working directory.
+- **Artifact uploads on failure/always**: `actions/upload-artifact@v4` uploads `fuzz/artifacts/<target>/` (crash reproducers, `if: failure()`, `if-no-files-found: ignore` since a clean run produces none) and, unconditionally (`if: always()`), `fuzz/corpus/<target>/` (the accumulated corpus of interesting inputs libFuzzer discovered, useful for seeding future local `cargo fuzz cmin`/reproduction even on a successful run — `if-no-files-found: ignore` since first-ever runs may not have generated a corpus dir yet either).
+- **`timeout-minutes: 90`** (vs. `ci.yml`'s `fuzz` job's default): gives each hour-long fuzz run headroom for toolchain setup/dependency compilation before the job itself would be forcibly killed by GitHub Actions' own default, without being so generous that a genuinely hung run wastes CI minutes indefinitely.
+- **Docs updated**: `AGENTS.md`'s and `docs/DEVELOPER_GUIDE.md`'s "Fuzzing with cargo-fuzz" sections — the `**CI integration (recommended, not yet implemented)**` paragraph with its inline YAML snippet was replaced with a short `**CI integration (v1.6.3+, implemented)**` paragraph pointing at the real file instead of duplicating its contents (avoiding two sources of truth for the same workflow).
+
+**Validation:** workflow YAML syntax checked with `rhysd/actionlint` (via Docker, `docker run --rm -v <repo>:/repo -w /repo rhysd/actionlint`) against both `ci.yml` and the new `fuzz.yml` together — zero errors/warnings for either file. `cargo build --lib`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --lib` (312 tests, unchanged — this item touches no Rust source) all still pass, confirming the version bump and doc-only changes introduced no regressions. The workflow's actual scheduled/triggered execution was not exercised end-to-end (that requires pushing to trigger a real GitHub Actions run, or waiting for the nightly cron) — `actionlint`'s syntax/schema validation plus manual review against `ci.yml`'s already-proven-working `fuzz` job (identical toolchain/action versions, only the trigger and duration differ) is the validation ceiling achievable without pushing.
 
 ### v1.6.2 - Real `compression_stats` + `cafe-decode` metadata-export flags
 

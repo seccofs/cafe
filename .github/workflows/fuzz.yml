@@ -1,0 +1,64 @@
+name: Nightly Fuzz
+
+# Long-running fuzz job, separate from CI's `fuzz` job (ci.yml), which only
+# runs each target for 60s on every push/PR as a fast smoke test. This
+# workflow runs each harness for a full hour on a nightly schedule (plus
+# on-demand via workflow_dispatch), per AGENTS.md's "CI integration
+# (recommended)" section under "Fuzzing with cargo-fuzz".
+on:
+  schedule:
+    - cron: '0 2 * * *' # Nightly at 2 AM UTC
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: 'Fuzz duration per target, in seconds'
+        required: false
+        default: '3600'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [decode_fuzz, chunk_roundtrip_fuzz]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Run ${{ matrix.target }}
+        run: |
+          cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- \
+            -max_len=16384 -timeout=10 \
+            -max_total_time=${{ github.event.inputs.duration_seconds || '3600' }}
+        working-directory: fuzz
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+
+      - name: Upload minimized corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}
+          if-no-files-found: ignore

@@ -17,7 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tone-mapping on encode (SDR → HDR inverse operation), including operator selection via CLI
 - `Decoder<R: Read>::next_tile()` support for 2D tiling (`iDIM`) and interlaced (Adam7/even-odd) files
 - An `EncoderOptions`-equivalent CLI surface for the streaming encoder (`Encoder<W>` remains library-only)
-- `.github/workflows/fuzz.yml` scheduled nightly fuzz CI job (currently only documented as a recommended snippet, not yet wired up)
+
+---
+
+## [1.6.3] - 2026-09-03
+
+### Added
+
+- **`.github/workflows/fuzz.yml`**: new nightly-scheduled CI workflow running `decode_fuzz` and `chunk_roundtrip_fuzz` for a full hour each (`-max_total_time=3600`, configurable via `workflow_dispatch`'s `duration_seconds` input), triggered nightly at 2 AM UTC (`cron: '0 2 * * *'`) plus on-demand via `workflow_dispatch`. Separate from `ci.yml`'s existing `fuzz` job, which continues to run each target for only 60s on every push/PR as a fast smoke test. On failure, crash artifacts (`fuzz/artifacts/<target>/`) are uploaded; the accumulated corpus (`fuzz/corpus/<target>/`) is uploaded unconditionally for reuse in future runs/local reproduction.
+
+### Notes
+
+- Non-breaking, CI/docs-only change: no Rust source was modified.
+- Validated: workflow YAML checked with `rhysd/actionlint` (zero errors/warnings against both `ci.yml` and the new `fuzz.yml`); `cargo build --lib`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --lib` (312 tests, unchanged) all still pass.
 
 ---
 

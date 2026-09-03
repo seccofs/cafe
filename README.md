@@ -7,7 +7,7 @@
 
 A modern chunk-based image format inspired by PNG, with support for ZSTD compression, advanced predictive filters (16 types), indexed palette, structured metadata (EXIF, JSON, ICC, XMP), and progressive interlacing.
 
-**Version**: 1.6.2  
+**Version**: 1.6.3  
 **Status**: ✅ Complete, audited, and SIMD-accelerated  
 **Compatibility**: Rust 2021+
 
@@ -344,6 +344,7 @@ Contributions welcome! High-potential areas:
 | **v1.6** | **Streaming Encoder** (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`): writes `IHDR` + ancillary chunks + row-strip `IDAT`s incrementally as tiles arrive, symmetric counterpart to v1.5's `Decoder<R: Read>`; `finish()` sets a conservative `compression_method` for `Write`-only destinations, `finish_exact()` patches it to the exact value (byte-for-byte identical to `encode()`) when `W` also supports `Seek` | ✅ Complete |
 | **v1.6.1** | **CLI**: `cafe-encode` gains `--icc-profile-file`/`--xmp-file` flags, closing a CLI-parity gap for `EncodeOptions::icc_profile`/`xmp_metadata` | ✅ Complete |
 | **v1.6.2** | **CLI + real `compression_stats`**: `DecodeResult::compression_stats` now populated for real (per-chunk original/compressed sizes) instead of always `None`; `cafe-decode` gains `--show-stats` plus `--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict` to export embedded metadata to separate files | ✅ Complete |
+| **v1.6.3** | **CI: nightly fuzz workflow** — new `.github/workflows/fuzz.yml` runs `decode_fuzz`/`chunk_roundtrip_fuzz` for a full hour nightly (plus on-demand via `workflow_dispatch`), separate from `ci.yml`'s existing 60s-per-push smoke test | ✅ Complete |
 | **Future** | Real hardware validation on physical ARM devices, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR) | 🔮 Planned |
 
 ---
@@ -376,6 +377,6 @@ Architecture, specification, Rust reference implementation (v1.1)
 
 ---
 
-**Last updated**: 2026-09-03 (v1.6.2: real `DecodeResult::compression_stats` tracking + `cafe-decode` gains `--show-stats`/`--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict`; v1.6.1: `cafe-encode` gains `--icc-profile-file`/`--xmp-file` CLI flags; v1.6: streaming encoder — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`)  
+**Last updated**: 2026-09-03 (v1.6.3: nightly fuzz CI workflow — `.github/workflows/fuzz.yml`; v1.6.2: real `DecodeResult::compression_stats` tracking + `cafe-decode` gains `--show-stats`/`--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict`; v1.6.1: `cafe-encode` gains `--icc-profile-file`/`--xmp-file` CLI flags; v1.6: streaming encoder — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`)  
 **Test Coverage**: 312 lib tests + 13 integration test suites (roundtrip, streaming encode, SIMD, compression regression, dictionary regression, palette algorithm, tile_rows benchmarks, etc.)  
 **Next security audit**: 2027-08-04
