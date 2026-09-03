@@ -16,7 +16,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - k-means palette quantization algorithm (clustering-based, as opposed to the greedy/median-cut/redmean-weighted strategies already implemented)
 - Tone-mapping on encode (SDR → HDR inverse operation), including operator selection via CLI
 - `Decoder<R: Read>::next_tile()` support for 2D tiling (`iDIM`) and interlaced (Adam7/even-odd) files
-- CLI flags for `EncodeOptions::icc_profile`/`xmp_metadata`, and an `EncoderOptions`-equivalent CLI surface for the streaming encoder
+- An `EncoderOptions`-equivalent CLI surface for the streaming encoder (`Encoder<W>` remains library-only)
+- `.github/workflows/fuzz.yml` scheduled nightly fuzz CI job (currently only documented as a recommended snippet, not yet wired up)
+- `cafe-decode` CLI: `--show-stats` flag for `compression_stats`, and saving `exif`/`icc_profile`/`xmp_metadata`/`zstd_dictionary` to separate output files instead of only printing byte counts
+
+---
+
+## [1.6.1] - 2026-09-03
+
+### Added
+
+- **`cafe-encode` CLI**: `--icc-profile-file <path>` and `--xmp-file <path>` flags, wiring up `EncodeOptions::icc_profile` (raw ICC binary blob) and `EncodeOptions::xmp_metadata` (UTF-8 XML/text) — both fields already existed in the library and were written correctly by `encode()`/`encode_indexed()`, but had no CLI flag to populate them. Verified round-trip via `cafe-decode --extract-metadata`.
+
+### Notes
+
+- Non-breaking, additive-only change: no existing CLI flag or library API changed behavior.
+- Validated: `cargo build --lib`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (full suite) all pass with zero regressions. Manually verified end-to-end: encoded a test image with both new flags, decoded it back with `--extract-metadata`, confirmed byte counts matched the input files exactly.
 
 ---
 

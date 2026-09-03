@@ -73,6 +73,8 @@ fn usage() {
     eprintln!("  --indexed                Encode with indexed palette (few colors: -70-90%)");
     eprintln!("  --json-file <file>       JSON file with metadata");
     eprintln!("  --exif-file <file>       Raw EXIF binary blob");
+    eprintln!("  --icc-profile-file <f>   ICC color profile binary blob");
+    eprintln!("  --xmp-file <file>        XMP metadata (UTF-8 text/XML)");
     eprintln!();
     eprintln!("  [v1.0 HDR and interlace]");
     eprintln!("  --sample-format <fmt>    Sample format (0=uint, 1=float, 2=half-float)");
@@ -232,6 +234,23 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
         None
     };
 
+    let icc_profile = if let Some(pos) = args.iter().position(|a| a == "--icc-profile-file") {
+        let path = require_arg_value(args, pos, "--icc-profile-file")?;
+        Some(std::fs::read(path).map_err(|e| format!("Error reading ICC profile file: {e}"))?)
+    } else {
+        None
+    };
+
+    let xmp_metadata = if let Some(pos) = args.iter().position(|a| a == "--xmp-file") {
+        let path = require_arg_value(args, pos, "--xmp-file")?;
+        Some(
+            std::fs::read_to_string(path)
+                .map_err(|e| format!("Error reading XMP file as UTF-8 text: {e}"))?,
+        )
+    } else {
+        None
+    };
+
     // --- Parse v1.0 features ---
 
     // Sample format (uint/float/half)
@@ -324,6 +343,8 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
         adaptive_analysis,
         json_metadata,
         exif,
+        icc_profile: icc_profile.clone(),
+        xmp_metadata: xmp_metadata.clone(),
         sample_format,
         chdr_metadata: chdr.clone(),
         zstd_dictionary: zstd_dictionary.clone(),
@@ -421,6 +442,14 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
 
     if zstd_dictionary.is_some() {
         println!("  ZSTD dictionary: included");
+    }
+
+    if let Some(ref icc) = icc_profile {
+        println!("  ICC profile: {} bytes", icc.len());
+    }
+
+    if let Some(ref xmp) = xmp_metadata {
+        println!("  XMP metadata: {} bytes", xmp.len());
     }
 
     if interlace_method > 0 {

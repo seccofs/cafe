@@ -7,7 +7,7 @@
 
 Um formato de imagem moderno baseado em chunks, inspirado em PNG, com suporte a compressão ZSTD, filtros preditivos avançados (16 tipos), paleta indexada, metadados estruturados (EXIF, JSON, ICC, XMP) e entrelaçamento progressivo.
 
-**Versão**: 1.6.0  
+**Versão**: 1.6.1  
 **Status**: ✅ Completo, auditado, e com aceleração SIMD  
 **Compatibilidade**: Rust 2021+
 
@@ -379,6 +379,6 @@ Arquitetura, especificação, implementação de referência em Rust (v1.1)
 
 ---
 
-**Última atualização**: 2026-09-03 (v1.6: encoder em streaming — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, contraparte simétrica do `Decoder<R: Read>` da v1.5)  
+**Última atualização**: 2026-09-03 (v1.6.1: `cafe-encode` ganha as flags `--icc-profile-file`/`--xmp-file`; v1.6: encoder em streaming — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, contraparte simétrica do `Decoder<R: Read>` da v1.5)  
 **Cobertura de testes**: 311 testes de lib + 13 suítes de teste de integração (roundtrip, encoder em streaming, SIMD, regressão de compressão, regressão de dicionário, algoritmo de paleta, benchmarks de tile_rows, etc.)  
 **Próxima revisão de segurança**: 2027-08-04

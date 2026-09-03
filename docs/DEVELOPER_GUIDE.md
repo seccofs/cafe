@@ -783,8 +783,8 @@ This table tracks completeness of CLI flag coverage for `EncodeOptions` fields (
 | `target_bit_depth` | `--bit-depth <d>` | ✅ | 1,2,4,8,10,12,16,32 (uint only) |
 | `json_metadata` | `--json-file <path>` | ✅ | Reads JSON from file |
 | `exif` | `--exif-file <path>` | ✅ | Raw EXIF binary blob |
-| `icc_profile` | — | ❌ **MISSING** | Could add `--icc-profile <path>` |
-| `xmp_metadata` | — | ❌ **MISSING** | Could add `--xmp-file <path>` |
+| `icc_profile` | `--icc-profile-file <path>` | ✅ | v1.6.1, ICC binary blob |
+| `xmp_metadata` | `--xmp-file <path>` | ✅ | v1.6.1, UTF-8 XML/text |
 | `idim` | — | ❌ **NOT IMPL** | 2D tiling (internal feature, rare) |
 | `interlace_method` | `--interlace <0\|1\|2>` | ✅ | 0=none, 1=Adam7, 2=even/odd |
 | `zstd_dictionary` | `--chdr-dict-file <path>` | ✅ | Pre-trained ZSTD dict |
@@ -847,6 +847,7 @@ Before submitting a PR:
 | **v1.4.2** | **CI: ARM64 Cross-Compile Check job** — new `aarch64-cross-compile` job in `.github/workflows/ci.yml` runs `cargo check`/`cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` on every push/PR (Ubuntu runner + `gcc-aarch64-linux-gnu`), preventing future aarch64 regressions from merging unnoticed | ✅ |
 | **v1.5** | **Compression-focused audit (5 items)**: per-row predictive filter (`Filter method=3`), real compression benchmarks + CI regression gate (`tests/compression_regression.rs`, `benches/encode_decode.rs`), `auto_dictionary` non-regression guarantee, perceptually-weighted palette quantization (`PaletteAlgorithm::NearestNeighborWeighted`, redmean distance), `DEFAULT_TILE_ROWS` retuning investigation (benchmarked, kept at 64) | ✅ |
 | **v1.6** | **Streaming Encoder** (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to v1.5's `Decoder<R: Read>`): writes `IHDR` + ancillary chunks + row-strip `IDAT`s incrementally as tiles arrive; `finish()` sets a conservative `compression_method` for `Write`-only destinations, `finish_exact()` patches it to the exact value (byte-for-byte identical to `encode()`) when `W` also supports `Seek` | ✅ |
+| **v1.6.1** | **CLI: `--icc-profile-file`/`--xmp-file` flags for `cafe-encode`** — closes a CLI-parity gap: `EncodeOptions::icc_profile`/`xmp_metadata` already existed in the library but had no CLI flag to populate them | ✅ |
 | Future | Real hardware validation on physical ARM devices, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
 
 ---
@@ -946,4 +947,4 @@ cargo doc --open
 
 ---
 
-**Last updated:** September 3, 2026 (v1.6: streaming encoder — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`) | **Project version:** v1.6.0
+**Last updated:** September 3, 2026 (v1.6.1: `cafe-encode` gains `--icc-profile-file`/`--xmp-file` CLI flags; v1.6: streaming encoder — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`) | **Project version:** v1.6.1

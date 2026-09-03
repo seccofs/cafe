@@ -842,8 +842,8 @@ This table tracks completeness of CLI flag coverage for `EncodeOptions` fields (
 | `target_bit_depth` | `--bit-depth <d>` | ✅ | 1,2,4,8,10,12,16,32 (uint only) |
 | `json_metadata` | `--json-file <path>` | ✅ | Reads JSON from file |
 | `exif` | `--exif-file <path>` | ✅ | Raw EXIF binary blob |
-| `icc_profile` | — | ❌ **MISSING** | Could add `--icc-profile <path>` |
-| `xmp_metadata` | — | ❌ **MISSING** | Could add `--xmp-file <path>` |
+| `icc_profile` | `--icc-profile-file <path>` | ✅ | v1.6.1, ICC binary blob |
+| `xmp_metadata` | `--xmp-file <path>` | ✅ | v1.6.1, UTF-8 XML/text |
 | `idim` | — | ❌ **NOT IMPL** | 2D tiling (internal feature, rare) |
 | `interlace_method` | `--interlace <0\|1\|2>` | ✅ | 0=none, 1=Adam7, 2=even/odd |
 | `zstd_dictionary` | `--chdr-dict-file <path>` | ✅ | Pre-trained ZSTD dict |
@@ -907,6 +907,7 @@ Before submitting a PR:
 | **v1.4.2** | **CI: ARM64 Cross-Compile Check job** — new `aarch64-cross-compile` job in `.github/workflows/ci.yml` runs `cargo check`/`cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings` on every push/PR (Ubuntu runner + `gcc-aarch64-linux-gnu` cross-compiler, no `zig cc` needed since `apt` provides a native GNU cross-toolchain in CI), preventing future aarch64 regressions from merging unnoticed | ✅ |
 | **v1.5** | **Compression-focused audit (5 items)**: per-row predictive filter (`Filter method=3`, finer-grained adaptation than per-tile), real compression benchmarks + CI regression gate (`tests/compression_regression.rs`, `benches/encode_decode.rs`), `auto_dictionary` non-regression guarantee (never emits a `zDIC`-using encode larger than the no-dictionary equivalent), perceptually-weighted palette quantization (`PaletteAlgorithm::NearestNeighborWeighted`, redmean distance), `DEFAULT_TILE_ROWS` retuning investigation (benchmarked, kept at 64 — see "v1.5" notes below) | ✅ |
 | **v1.6** | **Streaming Encoder** (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to v1.5's `Decoder<R: Read>`): writes `IHDR` + ancillary chunks + row-strip `IDAT`s incrementally as tiles arrive instead of requiring the whole image in memory first; `finish()` leaves `compression_method`'s ZSTD bit conservatively set (safe overestimate) for `Write`-only destinations, `finish_exact()` patches it to the exact value (byte-for-byte identical to `encode()`) when `W` also supports `Seek` — see "v1.6" notes below | ✅ |
+| **v1.6.1** | **CLI: `--icc-profile-file`/`--xmp-file` flags for `cafe-encode`** — closes a CLI-parity gap: `EncodeOptions::icc_profile`/`xmp_metadata` already existed in the library and were written correctly by `encode()`/`encode_indexed()`, but had no CLI flag to populate them — see "v1.6.1" notes below | ✅ |
 | Future | Real hardware validation on physical ARM devices, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
 
 ---
@@ -1020,7 +1021,18 @@ cargo doc --open
 
 ---
 
-**Last updated:** September 3, 2026 | **Project version:** v1.6 | **ARM NEON SIMD Phase (Sep 1/2026) + Compression-Focused Audit (Sep 2/2026) + Streaming Encoder (Sep 3/2026):**
+**Last updated:** September 3, 2026 | **Project version:** v1.6.1 | **ARM NEON SIMD Phase (Sep 1/2026) + Compression-Focused Audit (Sep 2/2026) + Streaming Encoder (Sep 3/2026) + CLI ICC/XMP flags (Sep 3/2026, v1.6.1):**
+
+### v1.6.1 - CLI: `--icc-profile-file`/`--xmp-file` flags for `cafe-encode`
+
+Closes a CLI-parity gap flagged in the "CLI Parity" table below: `EncodeOptions::icc_profile` (`Option<Vec<u8>>`, raw ICC binary blob) and `EncodeOptions::xmp_metadata` (`Option<String>`, UTF-8 XML/text) already existed in the library and were written correctly to the `iCCP`/`xMPd` chunks by `encode()`/`encode_indexed()`, but `tools/cafe-encode.rs` had no flag to populate them from the CLI — the only way to set them was via the library API directly.
+
+- **`--icc-profile-file <path>`**: reads the file as raw bytes (`std::fs::read`), identical pattern to the existing `--exif-file`/`--chdr-dict-file` flags.
+- **`--xmp-file <path>`**: reads the file as UTF-8 text (`std::fs::read_to_string`), since `xmp_metadata` is `Option<String>` (XMP is XML/text, unlike the binary EXIF/ICC/dictionary blobs).
+- Both print a byte-count confirmation line (`ICC profile: N bytes` / `XMP metadata: N bytes`) in `cafe-encode`'s summary output, matching the existing pattern for `--exif-file`/`--chdr-dict-file`.
+- No library changes — purely a CLI wiring gap closed in `tools/cafe-encode.rs`. `cafe-decode`'s existing `--extract-metadata` flag already printed ICC/XMP byte counts on the read side; this only closes the write side.
+
+**Validation:** `cargo build --lib`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (full suite) all pass with zero regressions. Manually verified end-to-end: encoded a generated 16×16 test PNG with both new flags pointing at a 20-byte dummy ICC blob and a 15-byte XMP string, decoded the result with `cafe-decode --extract-metadata`, and confirmed both byte counts matched the input files exactly.
 
 ### v1.6 - Streaming Encoder (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`)
 
