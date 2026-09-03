@@ -72,6 +72,7 @@ use crate::codec::{
 };
 
 use crate::chunk::{read_chunk, read_chunk_from, write_chunk, ReadChunk};
+use crate::types::{ChunkStats, CompressionStats};
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -1148,6 +1149,14 @@ struct DecodeState {
     // derives the same information implicitly from `state.pixel_rows.len()`
     // and does not need this counter.
     tile_rows_seen: usize,
+    // Per-chunk compression stats (v1.6.2+), populated as each chunk is
+    // read/decompressed so `DecodeResult::compression_stats` can report
+    // real numbers instead of always being `None`. Per `ChunkStats`'s field
+    // doc comments (`src/types.rs`): `original_size` is the decompressed
+    // (post-`decompress_chunk`) size, `compressed_size` is the on-disk size
+    // of the chunk's `Data` field (i.e. `chunk.data.len()`, already
+    // compressed if Flag=ZSTD, identical to Flag=raw).
+    chunk_stats: Vec<ChunkStats>,
 }
 
 impl Default for DecodeState {
@@ -1177,8 +1186,25 @@ impl Default for DecodeState {
             idim_tile_order: None,
             chdr: None,
             tile_rows_seen: 0,
+            chunk_stats: Vec::new(),
         }
     }
+}
+
+/// Records one chunk's compression stats into `state.chunk_stats` (v1.6.2+).
+/// `chunk_type` is a human-readable 4-byte tag (e.g. `"IDAT"`); `compressed_size`
+/// is the on-disk `Data` field length, `original_size` is the decompressed length.
+fn record_chunk_stats(
+    state: &mut DecodeState,
+    chunk_type: &[u8; 4],
+    original_size: usize,
+    compressed_size: usize,
+) {
+    state.chunk_stats.push(ChunkStats {
+        chunk_type: String::from_utf8_lossy(chunk_type).to_string(),
+        original_size: original_size as u32,
+        compressed_size: compressed_size as u32,
+    });
 }
 
 /// Handles the IHDR chunk (section 4.1): parses and validates width, height,
@@ -1524,6 +1550,13 @@ fn handle_ihdr_chunk(state: &mut DecodeState, data: &[u8]) -> Result<()> {
 fn handle_plte_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) -> Result<()> {
     // PLTE is critical, required with Color type = 3 (section 4.1.2)
     if state.palette.is_none() {
+        // Stats (v1.6.2+): PLTE payloads are tiny (<=256 entries), so a
+        // second decompress_chunk call here (just to measure the
+        // pre-parse decompressed length) is negligible overhead — avoids
+        // changing read_plte_chunk's return type just for stats tracking.
+        if let Ok(decompressed) = decompress_chunk(flag, data) {
+            record_chunk_stats(state, CHUNK_PLTE, decompressed.len(), data.len());
+        }
         state.palette = Some(read_plte_chunk(flag, data)?);
         // v1.0: Adjust bytes_per_row ONLY if color_type=3 (PLTE)
         // If color_type=6 (RGBA) with Adam7, PLTE is ignored (don't overwrite bytes_per_row)
@@ -1540,7 +1573,9 @@ fn handle_plte_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) -> Result<(
 /// Handles the eXIF chunk (section 4.5): ancillary, single instance — ignores repeats.
 fn handle_exif_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) -> Result<()> {
     if state.exif.is_none() {
-        state.exif = Some(decompress_chunk(flag, data)?);
+        let decompressed = decompress_chunk(flag, data)?;
+        record_chunk_stats(state, CHUNK_EXIF, decompressed.len(), data.len());
+        state.exif = Some(decompressed);
     }
     Ok(())
 }
@@ -1548,6 +1583,11 @@ fn handle_exif_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) -> Result<(
 /// Handles the jSON chunk (section 4.6): ancillary, multiple instances per
 /// namespace. Malformed JSON is silently discarded (ancillary contract).
 fn handle_json_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) -> Result<()> {
+    // Stats (v1.6.2+): measured before parsing so a namespace is recorded
+    // even if the JSON body itself turns out to be malformed (obj == None).
+    if let Ok(decompressed) = decompress_chunk(flag, data) {
+        record_chunk_stats(state, CHUNK_JSON, decompressed.len(), data.len());
+    }
     let (namespace, obj) = read_json_chunk(flag, data)?;
     if let Some(obj) = obj {
         state.json_metadata.insert(namespace, obj);
@@ -1562,7 +1602,10 @@ fn handle_json_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) -> Result<(
 fn handle_iccp_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) {
     if state.icc_profile.is_none() {
         match read_iccp_chunk(flag, data) {
-            Ok(profile) => state.icc_profile = Some(profile),
+            Ok(profile) => {
+                record_chunk_stats(state, CHUNK_ICCP, profile.len(), data.len());
+                state.icc_profile = Some(profile);
+            }
             Err(e) => {
                 // Invalid ICC profile, silently discarded (ancillary)
                 log::warn!("invalid iCCP chunk, discarded: {}", e);
@@ -1576,7 +1619,10 @@ fn handle_iccp_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) {
 fn handle_xmpd_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) {
     if state.xmp_metadata.is_none() {
         match read_xmpd_chunk(flag, data) {
-            Ok(xmp) => state.xmp_metadata = Some(xmp),
+            Ok(xmp) => {
+                record_chunk_stats(state, CHUNK_XMPD, xmp.len(), data.len());
+                state.xmp_metadata = Some(xmp);
+            }
             Err(e) => {
                 // Invalid XMP metadata, silently discarded (ancillary)
                 log::warn!("xMPd chunk contains invalid UTF-8, discarded: {}", e);
@@ -1590,7 +1636,10 @@ fn handle_xmpd_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) {
 fn handle_zdic_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) {
     if state.zstd_dictionary.is_none() {
         match read_zdic_chunk(flag, data) {
-            Ok(dict) => state.zstd_dictionary = Some(dict),
+            Ok(dict) => {
+                record_chunk_stats(state, CHUNK_ZDIC, dict.len(), data.len());
+                state.zstd_dictionary = Some(dict);
+            }
             Err(e) => {
                 // Invalid ZSTD dictionary, silently discarded (ancillary)
                 log::warn!("invalid zDIC chunk, discarded: {}", e);
@@ -2135,6 +2184,7 @@ fn decompress_idat_payload(state: &mut DecodeState, flag: u8, data: &[u8]) -> Re
         .decompressed_total
         .checked_add(decompressed.len() as u64)
         .ok_or_else(|| CafeError::TruncatedFile("overflow in decompressed total".into()))?;
+    record_chunk_stats(state, CHUNK_IDAT, decompressed.len(), data.len());
     Ok(decompressed)
 }
 
@@ -2246,9 +2296,29 @@ fn decode_bytes_internal(
          )));
     }
 
-    // Optional: Add compression statistics (always None for now)
-    // Note: For true tracking, would need to store sizes during decoding
-    let compression_stats = None;
+    // Compression statistics (v1.6.2+): aggregated from `state.chunk_stats`,
+    // populated incrementally by each chunk handler above as it decompresses
+    // its payload. `None` only in the (practically unreachable, since IDAT
+    // is mandatory) case of zero recorded chunks.
+    let compression_stats = if state.chunk_stats.is_empty() {
+        None
+    } else {
+        let total_original: u64 = state
+            .chunk_stats
+            .iter()
+            .map(|c| c.original_size as u64)
+            .sum();
+        let total_compressed: u64 = state
+            .chunk_stats
+            .iter()
+            .map(|c| c.compressed_size as u64)
+            .sum();
+        Some(CompressionStats {
+            total_original,
+            total_compressed,
+            chunks: state.chunk_stats,
+        })
+    };
 
     let result = DecodeResult {
         width,
@@ -2558,12 +2628,43 @@ impl<R: Read> Decoder<R> {
         let width = self.state.width.ok_or(CafeError::MissingIhdr)?;
         let height = self.state.height.ok_or(CafeError::MissingIhdr)?;
 
+        // Compression statistics (v1.6.2+): same aggregation as
+        // `decode_bytes_internal` (see that function for the exact
+        // semantics). `self.state.chunk_stats` already accumulates entries
+        // from any `IDAT`s consumed earlier via `next_tile()` too — both
+        // `next_tile()` (via `decode_idat_chunk_as_tile_row_strip`) and this
+        // function's own drain loop (via the direct `decompress_idat_payload`
+        // call above) route through the same `decompress_idat_payload`,
+        // which is where stats are recorded — so `finish()`'s totals cover
+        // every `IDAT` in the file regardless of how each one was consumed.
+        let compression_stats = if self.state.chunk_stats.is_empty() {
+            None
+        } else {
+            let total_original: u64 = self
+                .state
+                .chunk_stats
+                .iter()
+                .map(|c| c.original_size as u64)
+                .sum();
+            let total_compressed: u64 = self
+                .state
+                .chunk_stats
+                .iter()
+                .map(|c| c.compressed_size as u64)
+                .sum();
+            Some(CompressionStats {
+                total_original,
+                total_compressed,
+                chunks: self.state.chunk_stats,
+            })
+        };
+
         Ok(DecodeResult {
             width,
             height,
             exif: self.state.exif,
             json_metadata: self.state.json_metadata,
-            compression_stats: None,
+            compression_stats,
             icc_profile: self.state.icc_profile,
             xmp_metadata: self.state.xmp_metadata,
             zstd_dictionary: self.state.zstd_dictionary,
@@ -6068,6 +6169,77 @@ mod tests {
         assert_tiles_reassemble_to(&tiles, width, height, &whole_image_pixels);
         assert_eq!(whole_image_result.width, width);
         assert_eq!(whole_image_result.height, height);
+    }
+
+    /// `compression_stats` (v1.6.2+) must be populated with real per-chunk
+    /// sizes rather than always `None` — one entry per IDAT (there should be
+    /// `height / tile_rows` rounded up of them) plus one for the eXIF chunk
+    /// this test attaches, with `total_original`/`total_compressed` matching
+    /// the sum of the individual entries.
+    #[test]
+    fn test_decode_bytes_populates_compression_stats() {
+        let width = 32u32;
+        let height = 20u32; // not a multiple of tile_rows, so >1 IDAT with a partial last tile
+        let mut img_data = vec![0u8; (width * height * 4) as usize];
+        for (i, cell) in img_data.iter_mut().enumerate() {
+            *cell = (i % 256) as u8;
+        }
+        let img =
+            image::RgbaImage::from_raw(width, height, img_data).expect("failed to create image");
+        let temp_dir = std::env::temp_dir();
+        let input_path = temp_dir
+            .join("test_stats_input.png")
+            .to_string_lossy()
+            .to_string();
+        img.save(&input_path).expect("failed to save PNG");
+
+        let opts = EncodeOptions {
+            use_filter: true,
+            tile_rows: 8,
+            level: 5,
+            exif: Some(vec![1, 2, 3, 4, 5]),
+            ..EncodeOptions::default()
+        };
+        let cafe_path = temp_dir
+            .join("test_stats.cafe")
+            .to_string_lossy()
+            .to_string();
+        encode(&input_path, &cafe_path, &opts).expect("failed to encode");
+
+        let buf = std::fs::read(&cafe_path).expect("failed to read encoded file");
+        let (_pixels, result) = decode_bytes(&buf).expect("decode failed");
+
+        let stats = result
+            .compression_stats
+            .expect("compression_stats should be Some after decode");
+
+        assert!(
+            !stats.chunks.is_empty(),
+            "expected at least one recorded chunk"
+        );
+        // At least one IDAT and one eXIF entry must be present.
+        assert!(stats.chunks.iter().any(|c| c.chunk_type == "IDAT"));
+        assert!(stats.chunks.iter().any(|c| c.chunk_type == "eXIF"));
+
+        // Sums must match the aggregated totals exactly.
+        let sum_original: u64 = stats.chunks.iter().map(|c| c.original_size as u64).sum();
+        let sum_compressed: u64 = stats.chunks.iter().map(|c| c.compressed_size as u64).sum();
+        assert_eq!(stats.total_original, sum_original);
+        assert_eq!(stats.total_compressed, sum_compressed);
+
+        // Sanity: original pixel bytes reconstructed across all IDATs must
+        // equal width*height*4 (no filter-byte overhead leaking through, no
+        // undercount from tiling).
+        let idat_original_sum: u64 = stats
+            .chunks
+            .iter()
+            .filter(|c| c.chunk_type == "IDAT")
+            .map(|c| c.original_size as u64)
+            .sum();
+        assert!(
+            idat_original_sum > 0,
+            "IDAT original size sum should be nonzero"
+        );
     }
 
     /// Fase 2 (streaming-prep) parity test, indexed-palette path

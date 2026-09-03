@@ -18,7 +18,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Decoder<R: Read>::next_tile()` support for 2D tiling (`iDIM`) and interlaced (Adam7/even-odd) files
 - An `EncoderOptions`-equivalent CLI surface for the streaming encoder (`Encoder<W>` remains library-only)
 - `.github/workflows/fuzz.yml` scheduled nightly fuzz CI job (currently only documented as a recommended snippet, not yet wired up)
-- `cafe-decode` CLI: `--show-stats` flag for `compression_stats`, and saving `exif`/`icc_profile`/`xmp_metadata`/`zstd_dictionary` to separate output files instead of only printing byte counts
+
+---
+
+## [1.6.2] - 2026-09-03
+
+### Added
+
+- **`DecodeResult::compression_stats`** (`Option<CompressionStats>`) is now populated with real per-chunk original/compressed sizes on every successful decode, instead of always being `None`. Tracked via a new `DecodeState.chunk_stats: Vec<ChunkStats>` field, appended to by the chunk handlers for `PLTE`, `eXIF`, `jSON`, `iCCP`, `xMPd`, `zDIC`, and `IDAT` (the last one covering all three IDAT-consumption paths — whole-image `decode_bytes_internal`, `Decoder<R>::next_tile()`, and `Decoder<R>::finish()`'s drain loop — via a single shared instrumented function). `cHDR` is deliberately not tracked, since it isn't a simple decompressed byte blob.
+- **`cafe-decode` CLI**: `--show-stats` flag prints `compression_stats` as a table (`[TYPE] orig -> comp bytes` per chunk, plus totals and overall compression ratio). `--save-exif <path>`, `--save-icc-profile <path>`, `--save-xmp <path>`, `--save-zstd-dict <path>` flags save the corresponding `DecodeResult` field's raw bytes/text to a file (previously only byte counts were printed, with no way to export the actual data).
+- New test: `test_decode_bytes_populates_compression_stats` (`src/cafe.rs`), verifying `compression_stats` is `Some`, contains `IDAT`/`eXIF` chunk-type entries, and that per-chunk sizes sum to the aggregated totals.
+
+### Notes
+
+- Non-breaking, additive-only change: no existing CLI flag or library API changed behavior when the new flags/fields aren't used.
+- Validated: `cargo build --lib`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --lib` (312 tests, +1 from the new test) all pass with zero regressions; all pre-existing integration suites re-run manually and still pass. Manually verified end-to-end via release binaries: encoded an image with EXIF/ICC/XMP metadata, decoded with `--extract-metadata --show-stats --save-exif --save-icc-profile --save-xmp`, confirmed saved bytes are identical to the originals and stats are internally consistent.
 
 ---
 

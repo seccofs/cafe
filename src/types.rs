@@ -622,7 +622,11 @@ impl Default for EncoderOptions {
     }
 }
 
-/// Chunk statistics
+/// Per-chunk compression statistics for a single chunk read during decode
+/// (v1.6.2+, `src/cafe.rs`'s `record_chunk_stats`). `chunk_type` is the
+/// human-readable 4-byte tag (e.g. `"IDAT"`, `"eXIF"`); `original_size` is
+/// the decompressed payload length, `compressed_size` is the on-disk `Data`
+/// field length (identical to `original_size` when Flag=raw).
 #[derive(Clone, Debug)]
 pub struct ChunkStats {
     pub chunk_type: String,
@@ -630,7 +634,10 @@ pub struct ChunkStats {
     pub compressed_size: u32,
 }
 
-/// Compression statistics
+/// Aggregated compression statistics across every chunk read during decode
+/// (v1.6.2+). `total_original`/`total_compressed` are simply the sum of
+/// `chunks`' respective fields — provided pre-summed for convenience since
+/// that's almost always what a caller wants first.
 #[derive(Clone, Debug)]
 pub struct CompressionStats {
     pub total_original: u64,
@@ -644,6 +651,11 @@ pub struct DecodeResult {
     pub height: u32,
     pub exif: Option<Vec<u8>>,
     pub json_metadata: std::collections::HashMap<String, serde_json::Value>,
+    /// Real per-chunk compression statistics (v1.6.2+, populated by both
+    /// `decode_bytes`/`decode` and `Decoder<R>::finish()`). `None` only in
+    /// the practically unreachable case of zero chunks having been recorded
+    /// (every valid CAFE file has at least one `IDAT`, which is always
+    /// recorded — see `record_chunk_stats` call sites in `src/cafe.rs`).
     pub compression_stats: Option<CompressionStats>,
     pub icc_profile: Option<Vec<u8>>,
     pub xmp_metadata: Option<String>,

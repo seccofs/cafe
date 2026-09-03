@@ -861,12 +861,12 @@ This table tracks completeness of CLI flag coverage for `EncodeOptions` fields (
 | Field | CLI Export | Status | Notes |
 |-------|-----------|--------|-------|
 | `width` / `height` | Implicit (output file dimensions) | ✅ | Encoded in the decoded output image |
-| `exif` | `--extract-metadata` (size only) | ⚠️ **PARTIAL** | Prints byte count; raw bytes not saved to a separate file |
+| `exif` | `--save-exif <path>` (v1.6.2) | ✅ | Byte count always printed; raw bytes saved to a file when the flag is given |
 | `json_metadata` | `--extract-metadata` | ✅ | Prints namespace keys always, full contents with `--extract-metadata` |
-| `compression_stats` | — | ❌ **MISSING** | Could add a `--show-stats` flag |
-| `icc_profile` | Printed unconditionally (size only) | ⚠️ **PARTIAL** | Present in library, not saved to a separate file |
-| `xmp_metadata` | Printed unconditionally (size only) | ⚠️ **PARTIAL** | Present in library, not saved to a separate file |
-| `zstd_dictionary` | Printed unconditionally (size only) | ⚠️ **PARTIAL** | Present in library, not saved to a separate file |
+| `compression_stats` | `--show-stats` (v1.6.2) | ✅ | Real per-chunk original/compressed sizes (see "v1.6.2" notes below), printed as a table with totals + ratio |
+| `icc_profile` | `--save-icc-profile <path>` (v1.6.2) | ✅ | Byte count always printed; raw bytes saved to a file when the flag is given |
+| `xmp_metadata` | `--save-xmp <path>` (v1.6.2) | ✅ | Byte count always printed; text saved to a file when the flag is given |
+| `zstd_dictionary` | `--save-zstd-dict <path>` (v1.6.2) | ✅ | Byte count always printed; raw bytes saved to a file when the flag is given |
 | `chdr_metadata` | Printed unconditionally (full detail) | ✅ | Transfer function, primaries, luminance, MaxCLL/MaxFALL all printed |
 
 **Legend**: ✅ complete (CLI flag exists, correct default behavior) · ⚠️ partial (library has it, CLI only surfaces a summary) · ❌ missing (no CLI flag; 2D tiling is intentionally low-priority for CLI exposure since it's a rarely-used internal feature).
@@ -908,6 +908,7 @@ Before submitting a PR:
 | **v1.5** | **Compression-focused audit (5 items)**: per-row predictive filter (`Filter method=3`, finer-grained adaptation than per-tile), real compression benchmarks + CI regression gate (`tests/compression_regression.rs`, `benches/encode_decode.rs`), `auto_dictionary` non-regression guarantee (never emits a `zDIC`-using encode larger than the no-dictionary equivalent), perceptually-weighted palette quantization (`PaletteAlgorithm::NearestNeighborWeighted`, redmean distance), `DEFAULT_TILE_ROWS` retuning investigation (benchmarked, kept at 64 — see "v1.5" notes below) | ✅ |
 | **v1.6** | **Streaming Encoder** (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to v1.5's `Decoder<R: Read>`): writes `IHDR` + ancillary chunks + row-strip `IDAT`s incrementally as tiles arrive instead of requiring the whole image in memory first; `finish()` leaves `compression_method`'s ZSTD bit conservatively set (safe overestimate) for `Write`-only destinations, `finish_exact()` patches it to the exact value (byte-for-byte identical to `encode()`) when `W` also supports `Seek` — see "v1.6" notes below | ✅ |
 | **v1.6.1** | **CLI: `--icc-profile-file`/`--xmp-file` flags for `cafe-encode`** — closes a CLI-parity gap: `EncodeOptions::icc_profile`/`xmp_metadata` already existed in the library and were written correctly by `encode()`/`encode_indexed()`, but had no CLI flag to populate them — see "v1.6.1" notes below | ✅ |
+| **v1.6.2** | **Real `compression_stats` + `cafe-decode` metadata-export flags**: `DecodeResult::compression_stats` now populated with real per-chunk original/compressed sizes (previously always `None`); new `--show-stats`, `--save-exif`, `--save-icc-profile`, `--save-xmp`, `--save-zstd-dict` flags on `cafe-decode` — see "v1.6.2" notes below | ✅ |
 | Future | Real hardware validation on physical ARM devices, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
 
 ---
@@ -1021,7 +1022,20 @@ cargo doc --open
 
 ---
 
-**Last updated:** September 3, 2026 | **Project version:** v1.6.1 | **ARM NEON SIMD Phase (Sep 1/2026) + Compression-Focused Audit (Sep 2/2026) + Streaming Encoder (Sep 3/2026) + CLI ICC/XMP flags (Sep 3/2026, v1.6.1):**
+**Last updated:** September 3, 2026 | **Project version:** v1.6.2 | **ARM NEON SIMD Phase (Sep 1/2026) + Compression-Focused Audit (Sep 2/2026) + Streaming Encoder (Sep 3/2026) + CLI ICC/XMP flags (Sep 3/2026, v1.6.1) + Real compression_stats + cafe-decode export flags (Sep 3/2026, v1.6.2):**
+
+### v1.6.2 - Real `compression_stats` + `cafe-decode` metadata-export flags
+
+Closes two related gaps: `DecodeResult::compression_stats` (`Option<CompressionStats>`) existed in the library since v1.0 but was **always `None`** — nothing ever populated it — and `cafe-decode` had no way to write extracted `exif`/`icc_profile`/`xmp_metadata`/`zstd_dictionary` blobs to separate files (only byte counts were printed).
+
+- **`DecodeState` (`src/cafe.rs`) gained a `chunk_stats: Vec<ChunkStats>` field** (empty by default), and a new `record_chunk_stats(state, chunk_type: &[u8; 4], original_size, compressed_size)` helper appends one entry per chunk actually decoded.
+- **Instrumented handlers**: `handle_plte_chunk` (an extra `decompress_chunk` call purely to measure the decompressed size — payloads are small, overhead is negligible; avoids changing `read_plte_chunk`'s return signature), `handle_exif_chunk`, `handle_json_chunk`, `handle_iccp_chunk`, `handle_xmpd_chunk`, `handle_zdic_chunk`, and `decompress_idat_payload` (the single shared function behind **every** `IDAT` consumption path — whole-image `decode_bytes_internal`, `Decoder<R>::next_tile()` via `decode_idat_chunk_as_tile_row_strip`, and `Decoder<R>::finish()`'s drain loop — so instrumenting it once covers all three call sites without duplication). `handle_chdr_chunk` is deliberately **not** instrumented: `cHDR` isn't a simple decompressed byte blob like the others, so "original/compressed size" doesn't map cleanly onto it.
+- **`decode_bytes_internal`**: replaced the permanent `let compression_stats = None;` with real aggregation — sums `chunk_stats` into `CompressionStats { total_original, total_compressed, chunks }`, still `None` only in the (currently unreachable in practice) case of an empty `chunk_stats` vec, since every valid CAFE file has at least one `IDAT`, which is always recorded.
+- **`Decoder<R>::finish()`**: the same aggregation logic applied to `self.state.chunk_stats`, correctly covering `IDAT`s regardless of whether they were consumed via `next_tile()` calls before `finish()` or drained by `finish()` itself — both paths go through the same instrumented `decompress_idat_payload`.
+- **`tools/cafe-decode.rs`** gained five new flags: `--show-stats` (prints `compression_stats` as a table — one line per chunk `[TYPE] orig -> comp bytes`, plus totals and overall ratio; prints a "no chunk statistics were recorded" message if somehow absent) and `--save-exif <path>` / `--save-icc-profile <path>` / `--save-xmp <path>` / `--save-zstd-dict <path>` (each writes the corresponding `DecodeResult` field's raw bytes to a file when present, using a shared `require_arg_value` argument-parsing helper mirroring `cafe-encode.rs`'s pattern; a "not found" message is printed if the field is absent instead of silently no-op'ing). Default behavior (no new flags passed) is byte-for-byte unchanged from v1.6.1.
+- **New test**: `test_decode_bytes_populates_compression_stats` (`src/cafe.rs`) encodes a 32×20 PNG with `tile_rows: 8` plus an EXIF blob, decodes it, and asserts `compression_stats` is `Some`, contains `"IDAT"` and `"eXIF"` chunk-type entries, and that the summed per-chunk sizes match the aggregated totals exactly.
+
+**Validation:** `cargo build --lib`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --lib` (312 tests, +1 from the new test) all pass with zero regressions; all pre-existing integration suites re-run manually and still pass (`integration_roundtrip`, `integration_test`, `decode_robustness`, `streaming_encode`, `dictionary_regression`, `auto_dictionary_test`, `palette_algorithm_test`, `roundtrip_formats`, `simd_integration`, `compression_regression`). Manually verified end-to-end via release binaries: encoded a 24×24 PNG with `--exif-file`/`--icc-profile-file`/`--xmp-file`, decoded with `--extract-metadata --show-stats --save-exif --save-icc-profile --save-xmp`, confirmed saved bytes are identical to the originals and printed stats are internally consistent (e.g. `[PLTE] 1025 -> 524 bytes`, `[IDAT] 577 -> 55 bytes`); also verified the no-metadata case (correct "not found" messages) and the no-new-flags case (output identical to pre-v1.6.2 behavior).
 
 ### v1.6.1 - CLI: `--icc-profile-file`/`--xmp-file` flags for `cafe-encode`
 

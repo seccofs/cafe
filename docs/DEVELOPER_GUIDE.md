@@ -802,12 +802,12 @@ This table tracks completeness of CLI flag coverage for `EncodeOptions` fields (
 | Field | CLI Export | Status | Notes |
 |-------|-----------|--------|-------|
 | `width` / `height` | Implicit (output file dimensions) | ✅ | Encoded in the decoded output image |
-| `exif` | `--extract-metadata` (size only) | ⚠️ **PARTIAL** | Prints byte count; raw bytes not saved to a separate file |
+| `exif` | `--save-exif <path>` (v1.6.2) | ✅ | Byte count always printed; raw bytes saved to a file when the flag is given |
 | `json_metadata` | `--extract-metadata` | ✅ | Prints namespace keys always, full contents with `--extract-metadata` |
-| `compression_stats` | — | ❌ **MISSING** | Could add a `--show-stats` flag |
-| `icc_profile` | Printed unconditionally (size only) | ⚠️ **PARTIAL** | Present in library, not saved to a separate file |
-| `xmp_metadata` | Printed unconditionally (size only) | ⚠️ **PARTIAL** | Present in library, not saved to a separate file |
-| `zstd_dictionary` | Printed unconditionally (size only) | ⚠️ **PARTIAL** | Present in library, not saved to a separate file |
+| `compression_stats` | `--show-stats` (v1.6.2) | ✅ | Real per-chunk original/compressed sizes, printed as a table with totals + ratio |
+| `icc_profile` | `--save-icc-profile <path>` (v1.6.2) | ✅ | Byte count always printed; raw bytes saved to a file when the flag is given |
+| `xmp_metadata` | `--save-xmp <path>` (v1.6.2) | ✅ | Byte count always printed; text saved to a file when the flag is given |
+| `zstd_dictionary` | `--save-zstd-dict <path>` (v1.6.2) | ✅ | Byte count always printed; raw bytes saved to a file when the flag is given |
 | `chdr_metadata` | Printed unconditionally (full detail) | ✅ | Transfer function, primaries, luminance, MaxCLL/MaxFALL all printed |
 
 **Legend**: ✅ complete (CLI flag exists, correct default behavior) · ⚠️ partial (library has it, CLI only surfaces a summary) · ❌ missing (no CLI flag; 2D tiling is intentionally low-priority for CLI exposure since it's a rarely-used internal feature).
@@ -848,6 +848,7 @@ Before submitting a PR:
 | **v1.5** | **Compression-focused audit (5 items)**: per-row predictive filter (`Filter method=3`), real compression benchmarks + CI regression gate (`tests/compression_regression.rs`, `benches/encode_decode.rs`), `auto_dictionary` non-regression guarantee, perceptually-weighted palette quantization (`PaletteAlgorithm::NearestNeighborWeighted`, redmean distance), `DEFAULT_TILE_ROWS` retuning investigation (benchmarked, kept at 64) | ✅ |
 | **v1.6** | **Streaming Encoder** (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to v1.5's `Decoder<R: Read>`): writes `IHDR` + ancillary chunks + row-strip `IDAT`s incrementally as tiles arrive; `finish()` sets a conservative `compression_method` for `Write`-only destinations, `finish_exact()` patches it to the exact value (byte-for-byte identical to `encode()`) when `W` also supports `Seek` | ✅ |
 | **v1.6.1** | **CLI: `--icc-profile-file`/`--xmp-file` flags for `cafe-encode`** — closes a CLI-parity gap: `EncodeOptions::icc_profile`/`xmp_metadata` already existed in the library but had no CLI flag to populate them | ✅ |
+| **v1.6.2** | **Real `compression_stats` + `cafe-decode` metadata-export flags**: `DecodeResult::compression_stats` now populated with real per-chunk original/compressed sizes (previously always `None`); new `--show-stats`, `--save-exif`, `--save-icc-profile`, `--save-xmp`, `--save-zstd-dict` flags on `cafe-decode` | ✅ |
 | Future | Real hardware validation on physical ARM devices, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
 
 ---
@@ -947,4 +948,4 @@ cargo doc --open
 
 ---
 
-**Last updated:** September 3, 2026 (v1.6.1: `cafe-encode` gains `--icc-profile-file`/`--xmp-file` CLI flags; v1.6: streaming encoder — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`) | **Project version:** v1.6.1
+**Last updated:** September 3, 2026 (v1.6.2: real `compression_stats` tracking + `cafe-decode` gains `--show-stats`/`--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict` flags; v1.6.1: `cafe-encode` gains `--icc-profile-file`/`--xmp-file` CLI flags; v1.6: streaming encoder — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`) | **Project version:** v1.6.2
