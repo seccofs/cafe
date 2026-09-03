@@ -477,6 +477,14 @@ pub enum PaletteAlgorithm {
     /// the cost of always running the scalar (non-SIMD) matching path —
     /// see `quantize_nearest_neighbor_weighted` in `cafe.rs`.
     NearestNeighborWeighted,
+    /// K-means (Lloyd's algorithm) clustering, initialized deterministically
+    /// from `MedianCut`'s bucket-averaged output (v1.7, `quantize_kmeans` in
+    /// `quantize.rs`). Directly minimizes total squared distance from each
+    /// pixel to its assigned palette entry via iterative centroid
+    /// refinement, typically producing the lowest mean-squared-error
+    /// palette of the four algorithms (at the highest computational cost --
+    /// several full passes over the color histogram instead of one).
+    KMeans,
 }
 
 impl std::str::FromStr for PaletteAlgorithm {
@@ -486,8 +494,9 @@ impl std::str::FromStr for PaletteAlgorithm {
             "nearest" | "nearest-neighbor" | "nn" => Ok(PaletteAlgorithm::NearestNeighbor),
             "median-cut" | "mediancut" | "median" => Ok(PaletteAlgorithm::MedianCut),
             "weighted" | "perceptual" | "redmean" => Ok(PaletteAlgorithm::NearestNeighborWeighted),
+            "kmeans" | "k-means" => Ok(PaletteAlgorithm::KMeans),
             other => Err(format!(
-                "unknown palette algorithm '{}': use 'nearest', 'median-cut', or 'weighted'",
+                "unknown palette algorithm '{}': use 'nearest', 'median-cut', 'weighted', or 'kmeans'",
                 other
             )),
         }

@@ -7,7 +7,7 @@
 
 A modern chunk-based image format inspired by PNG, with support for ZSTD compression, advanced predictive filters (16 types), indexed palette, structured metadata (EXIF, JSON, ICC, XMP), and progressive interlacing.
 
-**Version**: 1.6.3  
+**Version**: 1.7.0  
 **Status**: ✅ Complete, audited, and SIMD-accelerated  
 **Compatibility**: Rust 2021+
 
@@ -51,6 +51,7 @@ A modern chunk-based image format inspired by PNG, with support for ZSTD compres
 - **`auto_dictionary` non-regression guarantee**: an auto-trained ZSTD dictionary is only used when it strictly shrinks the file, checked per-`IDAT` and whole-file
 - **Perceptually-weighted palette quantization**: `PaletteAlgorithm::NearestNeighborWeighted` using the redmean distance formula
 - **Real compression benchmarks + CI regression gate**: `tests/compression_regression.rs` and `benches/encode_decode.rs`
+- **k-means palette quantization** (v1.7): `PaletteAlgorithm::KMeans` iteratively refines centroids (Lloyd's algorithm, deterministic median-cut initialization) for the lowest mean-squared-error palette of the four algorithms
 
 ### Security
 - ✅ Decompression bomb protection (CWE-409)
@@ -325,6 +326,7 @@ Contributions welcome! High-potential areas:
 - [x] **Perceptually-weighted palette quantization** — *complete in v1.5* (`PaletteAlgorithm::NearestNeighborWeighted`, redmean distance)
 - [x] **Real compression benchmarks + CI regression gate** — *complete in v1.5* (`tests/compression_regression.rs`, `benches/encode_decode.rs`)
 - [x] **Streaming encoder** — *complete in v1.6* (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`)
+- [x] **k-means palette quantization** — *complete in v1.7* (`PaletteAlgorithm::KMeans`, deterministic Lloyd's algorithm)
 
 ---
 
@@ -345,7 +347,8 @@ Contributions welcome! High-potential areas:
 | **v1.6.1** | **CLI**: `cafe-encode` gains `--icc-profile-file`/`--xmp-file` flags, closing a CLI-parity gap for `EncodeOptions::icc_profile`/`xmp_metadata` | ✅ Complete |
 | **v1.6.2** | **CLI + real `compression_stats`**: `DecodeResult::compression_stats` now populated for real (per-chunk original/compressed sizes) instead of always `None`; `cafe-decode` gains `--show-stats` plus `--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict` to export embedded metadata to separate files | ✅ Complete |
 | **v1.6.3** | **CI: nightly fuzz workflow** — new `.github/workflows/fuzz.yml` runs `decode_fuzz`/`chunk_roundtrip_fuzz` for a full hour nightly (plus on-demand via `workflow_dispatch`), separate from `ci.yml`'s existing 60s-per-push smoke test | ✅ Complete |
-| **Future** | Real hardware validation on physical ARM devices, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR) | 🔮 Planned |
+| **v1.7** | **`PaletteAlgorithm::KMeans`**: new indexed-palette algorithm implementing Lloyd's algorithm (deterministic median-cut initialization, no RNG dependency), typically the lowest mean-squared-error palette of the four algorithms at the highest computational cost — `--palette-algorithm kmeans` | ✅ Complete |
+| **Future** | Real hardware validation on physical ARM devices, additional compressors, tone-mapping on encode (SDR→HDR) | 🔮 Planned |
 
 ---
 
@@ -377,6 +380,6 @@ Architecture, specification, Rust reference implementation (v1.1)
 
 ---
 
-**Last updated**: 2026-09-03 (v1.6.3: nightly fuzz CI workflow — `.github/workflows/fuzz.yml`; v1.6.2: real `DecodeResult::compression_stats` tracking + `cafe-decode` gains `--show-stats`/`--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict`; v1.6.1: `cafe-encode` gains `--icc-profile-file`/`--xmp-file` CLI flags; v1.6: streaming encoder — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`)  
-**Test Coverage**: 312 lib tests + 13 integration test suites (roundtrip, streaming encode, SIMD, compression regression, dictionary regression, palette algorithm, tile_rows benchmarks, etc.)  
+**Last updated**: 2026-09-03 (v1.7: `PaletteAlgorithm::KMeans` — deterministic k-means palette quantization, `--palette-algorithm kmeans`; v1.6.3: nightly fuzz CI workflow — `.github/workflows/fuzz.yml`; v1.6.2: real `DecodeResult::compression_stats` tracking + `cafe-decode` gains `--show-stats`/`--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict`; v1.6.1: `cafe-encode` gains `--icc-profile-file`/`--xmp-file` CLI flags; v1.6: streaming encoder — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`)  
+**Test Coverage**: 317 lib tests + 13 integration test suites (roundtrip, streaming encode, SIMD, compression regression, dictionary regression, palette algorithm, tile_rows benchmarks, etc.)  
 **Next security audit**: 2027-08-04

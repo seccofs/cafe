@@ -60,7 +60,10 @@ fn usage() {
     eprintln!("  --palette-algorithm <a>  Palette quantization algorithm (v1.1, indexed only):");
     eprintln!("                           nearest (default, fast), median-cut (better quality),");
     eprintln!(
-        "                           weighted (v1.5, perceptual/redmean distance, scalar-only)"
+        "                           weighted (v1.5, perceptual/redmean distance, scalar-only),"
+    );
+    eprintln!(
+        "                           kmeans (v1.7, iterative refinement, best quality/slowest)"
     );
     eprintln!("  --color-type <type>      Color type (default: auto-detect):");
     eprintln!("                           0=GRAY (1 byte/px, -75%), 2=RGB (3 bytes/px, -25%)");
@@ -130,7 +133,7 @@ fn run_encode(args: &[String], src: &str, dst: &str) -> Result<(), Box<dyn std::
     let user_specified_indexed = args.iter().any(|a| a == "--indexed");
     let auto_dictionary = args.iter().any(|a| a == "--auto-dict");
 
-    // Parse --palette-algorithm <nearest|median-cut|weighted>
+    // Parse --palette-algorithm <nearest|median-cut|weighted|kmeans>
     let palette_algorithm = if let Some(pos) = args.iter().position(|a| a == "--palette-algorithm")
     {
         let algo = require_arg_value(args, pos, "--palette-algorithm")?;

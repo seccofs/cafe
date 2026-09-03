@@ -13,10 +13,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Real ARM hardware validation on physical devices (Raspberry Pi, mobile, Apple Silicon) beyond QEMU emulation
 - Cache-friendly blocking in scalar byte-shuffle fallback
 - Runtime CPU detection for optional SIMD forcing
-- k-means palette quantization algorithm (clustering-based, as opposed to the greedy/median-cut/redmean-weighted strategies already implemented)
 - Tone-mapping on encode (SDR → HDR inverse operation), including operator selection via CLI
 - `Decoder<R: Read>::next_tile()` support for 2D tiling (`iDIM`) and interlaced (Adam7/even-odd) files
 - An `EncoderOptions`-equivalent CLI surface for the streaming encoder (`Encoder<W>` remains library-only)
+
+---
+
+## [1.7.0] - 2026-09-03
+
+### Added
+
+- **`PaletteAlgorithm::KMeans`** (`--palette-algorithm kmeans`/`k-means`): new indexed-palette quantization algorithm implementing Lloyd's algorithm (`quantize_kmeans` in `src/quantize.rs`), joining the existing `NearestNeighbor`/`MedianCut`/`NearestNeighborWeighted` variants. Directly minimizes total squared RGB distance from each pixel to its assigned palette entry via iterative centroid refinement, typically producing the lowest mean-squared-error palette of the four algorithms at the highest computational cost.
+  - **Deterministic by design**: centroids are initialized from `quantize_median_cut`'s own bucket-averaged output rather than random/k-means++ seeding, so encoding the same input with the same options always produces a byte-identical palette — CAFE has no RNG dependency anywhere else in the codebase, and this avoids introducing one.
+  - Converges via up to 20 assign/update iterations (`MAX_KMEANS_ITERATIONS`), stopping early once cluster assignments stabilize; empty clusters (possible on adversarial/synthetic inputs) are dropped rather than re-seeded, consistent with every other `PaletteAlgorithm` variant's existing behavior of not guaranteeing an exact `max_colors` entry count.
+  - RGB-only clustering (alpha forced to 255 in the output palette), matching `quantize_median_cut`'s existing convention — unlike `NearestNeighborWeighted`, which quantizes the full RGBA buffer and preserves alpha exactly.
+  - Shares its `<= max_colors` unique-color lossless short-circuit and pixel-to-palette mapping step (SIMD-accelerated via `PaletteSoa` when the `simd` feature is enabled) with `MedianCut`, via two small refactors: `collect_opaque_color_counts`/`palette_from_unique_colors` (extracted from `quantize_median_cut` into shared helpers in `quantize.rs`) and `map_pixels_to_fixed_palette` (extracted from `quantize_median_cut_wrapper` into a shared helper in `cafe.rs`).
+
+### Notes
+
+- Purely additive: no breaking changes to existing `PaletteAlgorithm` variants, `EncodeOptions`, or the `.cafe` binary format (k-means-quantized files decode identically to any other `COLOR_TYPE_INDEXED` file — the palette entries and indices are ordinary `PLTE`/`IDAT` data, with no format-level awareness of which algorithm produced them).
+- Validated: `cargo build --lib`/`--bins`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --lib` (317 tests, +5 new: `test_kmeans_already_under_max_colors`, `test_kmeans_reduction`, `test_kmeans_deterministic_across_runs`, `test_kmeans_rejects_invalid_max_colors`, `test_kmeans_rejects_non_rgba_length`), `cargo test --test palette_algorithm_test` (7 tests, +3 new: `palette_algorithm_from_str_kmeans_accepted_end_to_end`, `kmeans_algorithm_maps_exact_palette_colors_losslessly`, `kmeans_reduces_many_colors_to_requested_palette_size`, plus the existing 3-algorithm round-trip test extended to cover all four) all pass. Manually verified end-to-end via release binaries: `cafe-encode --indexed --palette-algorithm kmeans` followed by `cafe-decode` round-trips a 64×64 gradient PNG successfully.
 
 ---
 

@@ -3622,6 +3622,7 @@ fn quantize_to_palette(
         PaletteAlgorithm::NearestNeighborWeighted => {
             quantize_nearest_neighbor_weighted(rgba, max_colors)
         }
+        PaletteAlgorithm::KMeans => quantize_kmeans_wrapper(rgba, max_colors),
     }
 }
 
@@ -3742,55 +3743,75 @@ fn quantize_median_cut_wrapper(rgba: &[u8], max_colors: u32) -> (Vec<u8>, Palett
         .collect();
 
     match quantize::quantize_median_cut(&rgb_only, max_colors as usize) {
-        Ok(palette) => {
-            // Now map original RGBA pixels to palette indices using
-            // nearest-neighbor (RGB-only). The palette is fixed here (unlike
-            // quantize_nearest_neighbor's incremental growth), so a single
-            // SoA transposition can be reused across all pixels.
-            let mut indices = Vec::with_capacity(rgba.len() / 4);
-
-            #[cfg(feature = "simd")]
-            {
-                let palette_soa = crate::simd_quantize::PaletteSoa::from_entries(&palette.entries);
-                for chunk in rgba.as_chunks::<4>().0 {
-                    let (best_idx, _) = palette_soa.find_closest_rgb(chunk[0], chunk[1], chunk[2]);
-                    indices.push(best_idx);
-                }
-            }
-
-            #[cfg(not(feature = "simd"))]
-            {
-                for chunk in rgba.as_chunks::<4>().0 {
-                    let r = chunk[0];
-                    let g = chunk[1];
-                    let b = chunk[2];
-
-                    let mut best_idx = 0;
-                    let mut best_dist = u32::MAX;
-
-                    for (i, entry) in palette.entries.iter().enumerate() {
-                        // Only consider RGB distance (ignore alpha in palette matching)
-                        let dist = ((r as i32 - entry.r as i32).pow(2)
-                            + (g as i32 - entry.g as i32).pow(2)
-                            + (b as i32 - entry.b as i32).pow(2))
-                            as u32;
-                        if dist < best_dist {
-                            best_dist = dist;
-                            best_idx = i;
-                        }
-                    }
-
-                    indices.push(best_idx as u8);
-                }
-            }
-
-            (indices, palette)
-        }
+        Ok(palette) => (map_pixels_to_fixed_palette(rgba, &palette), palette),
         Err(_) => {
             // Fall back to nearest-neighbor on error
             quantize_nearest_neighbor(rgba, max_colors)
         }
     }
+}
+
+/// K-means quantization (v1.7, `PaletteAlgorithm::KMeans`): builds a fixed
+/// palette via `quantize::quantize_kmeans` (RGB-only, same convention as
+/// `quantize_median_cut_wrapper`), then maps every pixel to its nearest
+/// entry. Falls back to `quantize_nearest_neighbor` if clustering itself
+/// errors (mirrors `quantize_median_cut_wrapper`'s own fallback policy).
+fn quantize_kmeans_wrapper(rgba: &[u8], max_colors: u32) -> (Vec<u8>, Palette) {
+    let rgb_only: Vec<u8> = rgba
+        .chunks(4)
+        .flat_map(|chunk| vec![chunk[0], chunk[1], chunk[2], 255])
+        .collect();
+
+    match quantize::quantize_kmeans(&rgb_only, max_colors as usize) {
+        Ok(palette) => (map_pixels_to_fixed_palette(rgba, &palette), palette),
+        Err(_) => quantize_nearest_neighbor(rgba, max_colors),
+    }
+}
+
+/// Maps every RGBA pixel to its nearest-by-RGB-distance entry in an
+/// already-computed, fixed palette (alpha ignored in matching, matching
+/// both `quantize_median_cut`'s and `quantize_kmeans`'s RGB-only
+/// clustering). Shared by both wrappers above, since building a palette up
+/// front (as opposed to `quantize_nearest_neighbor`'s incremental growth)
+/// means a single SoA transposition can be reused across all pixels.
+fn map_pixels_to_fixed_palette(rgba: &[u8], palette: &Palette) -> Vec<u8> {
+    let mut indices = Vec::with_capacity(rgba.len() / 4);
+
+    #[cfg(feature = "simd")]
+    {
+        let palette_soa = crate::simd_quantize::PaletteSoa::from_entries(&palette.entries);
+        for chunk in rgba.as_chunks::<4>().0 {
+            let (best_idx, _) = palette_soa.find_closest_rgb(chunk[0], chunk[1], chunk[2]);
+            indices.push(best_idx);
+        }
+    }
+
+    #[cfg(not(feature = "simd"))]
+    {
+        for chunk in rgba.as_chunks::<4>().0 {
+            let r = chunk[0];
+            let g = chunk[1];
+            let b = chunk[2];
+
+            let mut best_idx = 0;
+            let mut best_dist = u32::MAX;
+
+            for (i, entry) in palette.entries.iter().enumerate() {
+                // Only consider RGB distance (ignore alpha in palette matching)
+                let dist = ((r as i32 - entry.r as i32).pow(2)
+                    + (g as i32 - entry.g as i32).pow(2)
+                    + (b as i32 - entry.b as i32).pow(2)) as u32;
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_idx = i;
+                }
+            }
+
+            indices.push(best_idx as u8);
+        }
+    }
+
+    indices
 }
 
 // Dequantize palette (convert indices to RGBA)

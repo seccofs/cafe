@@ -769,7 +769,7 @@ This table tracks completeness of CLI flag coverage for `EncodeOptions` fields (
 | `chdr_metadata` | `--chdr-transfer`, `--chdr-primaries`, `--chdr-max-lum`, `--chdr-min-lum` | ✅ | HDR tone-mapping metadata |
 | `filter_heuristic` | `--filter-heuristic <h>` | ✅ | entropy, msad, test, quick-prune, adaptive |
 | `auto_dictionary` | `--auto-dict` | ✅ | v1.1, auto-train ZSTD dict |
-| `palette_algorithm` | `--palette-algorithm <a>` | ✅ | v1.1, nearest (default); median-cut; weighted (v1.5, redmean, scalar-only) |
+| `palette_algorithm` | `--palette-algorithm <a>` | ✅ | v1.1, nearest (default); median-cut; weighted (v1.5, redmean, scalar-only); kmeans (v1.7, Lloyd's algorithm) |
 | `tonemap_operator` | — | ❌ **MISSING** | Encode-side field exists (v1.2.1) but only `cafe-decode`'s `--tonemap-operator` is wired up; no encode-side flag |
 
 `EncoderOptions` (the streaming `Encoder<W>` API, v1.6) is a deliberately smaller struct with no CLI binary of its own — it's a library-only API (`tile_rows`, `level`, `use_filter`/`use_filter_per_row`, `target_color_type`, `target_bit_depth`, `exif`, `json_metadata`, `icc_profile`, `xmp_metadata`, `zstd_dictionary`, `sample_format`, `chdr_metadata`, `filter_heuristic`, `use_byte_shuffle`), so CLI parity doesn't apply to it the same way; see its limitations list in the "Streaming Encoder" section above.
@@ -827,7 +827,8 @@ Before submitting a PR:
 | **v1.6.1** | **CLI: `--icc-profile-file`/`--xmp-file` flags for `cafe-encode`** — closes a CLI-parity gap: `EncodeOptions::icc_profile`/`xmp_metadata` already existed in the library but had no CLI flag to populate them | ✅ |
 | **v1.6.2** | **Real `compression_stats` + `cafe-decode` metadata-export flags**: `DecodeResult::compression_stats` now populated with real per-chunk original/compressed sizes (previously always `None`); new `--show-stats`, `--save-exif`, `--save-icc-profile`, `--save-xmp`, `--save-zstd-dict` flags on `cafe-decode` | ✅ |
 | **v1.6.3** | **CI: nightly fuzz workflow** — new `.github/workflows/fuzz.yml` runs `decode_fuzz`/`chunk_roundtrip_fuzz` for a full hour nightly (plus on-demand via `workflow_dispatch`), separate from `ci.yml`'s existing 60s-per-push smoke test job | ✅ |
-| Future | Real hardware validation on physical ARM devices, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
+| **v1.7** | **`PaletteAlgorithm::KMeans`**: new indexed-palette quantization algorithm implementing Lloyd's algorithm, deterministically initialized from `MedianCut`'s output (no RNG dependency), typically the lowest mean-squared-error palette of the four algorithms at the highest computational cost — `--palette-algorithm kmeans` | ✅ |
+| Future | Real hardware validation on physical ARM devices, additional compressors, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
 
 ---
 
@@ -884,7 +885,7 @@ cargo build --release --no-default-features
 2. **Real ARM hardware validation on physical devices** — QEMU emulation (v1.4.1) already caught and fixed one real NEON bug; running the suite on actual ARM64 hardware (Raspberry Pi, mobile, Apple Silicon) would add confidence beyond emulation (e.g. timing-sensitive or alignment-sensitive behavior QEMU might not reproduce exactly)
 3. **Advanced 2D tiling** — iDIM with per-tile IDAT already implemented; evolve with preview/progressive streaming
 4. **Optimized interlace** — Adam7 and even/odd already supported; optimize progressiveness and SIMD of passes
-5. **Optimized indexed palette** — `NearestNeighbor`, `MedianCut`, and a perceptually-weighted `NearestNeighborWeighted` (redmean distance, v1.5) already exist; could still use k-means clustering for the palette-building step itself
+5. ~~**Optimized indexed palette**~~ — `NearestNeighbor`, `MedianCut`, `NearestNeighborWeighted` (redmean distance, v1.5), and `KMeans` (Lloyd's algorithm, v1.7) now cover greedy incremental, median-cut bucket-splitting, and iterative-clustering strategies — closed as of v1.7
 6. **Automatic ZSTD dictionary** — Train dictionary for small images (non-regression guarantee already added in v1.5)
 7. **Tone-mapping on encode (SDR→HDR)** — Inverse of decode; operator selection via CLI
 8. **More robust tests** — Adversarial files, fuzzing
@@ -926,4 +927,4 @@ cargo doc --open
 
 ---
 
-**Last updated:** September 3, 2026 (v1.6.3: nightly fuzz CI workflow — `.github/workflows/fuzz.yml`; v1.6.2: real `compression_stats` tracking + `cafe-decode` gains `--show-stats`/`--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict` flags; v1.6.1: `cafe-encode` gains `--icc-profile-file`/`--xmp-file` CLI flags; v1.6: streaming encoder — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`) | **Project version:** v1.6.3
+**Last updated:** September 3, 2026 (v1.7: `PaletteAlgorithm::KMeans` — deterministic k-means palette quantization, `--palette-algorithm kmeans`; v1.6.3: nightly fuzz CI workflow — `.github/workflows/fuzz.yml`; v1.6.2: real `compression_stats` tracking + `cafe-decode` gains `--show-stats`/`--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict` flags; v1.6.1: `cafe-encode` gains `--icc-profile-file`/`--xmp-file` CLI flags; v1.6: streaming encoder — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`) | **Project version:** v1.7.0

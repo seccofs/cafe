@@ -828,7 +828,7 @@ This table tracks completeness of CLI flag coverage for `EncodeOptions` fields (
 | `chdr_metadata` | `--chdr-transfer`, `--chdr-primaries`, `--chdr-max-lum`, `--chdr-min-lum` | ✅ | HDR tone-mapping metadata |
 | `filter_heuristic` | `--filter-heuristic <h>` | ✅ | entropy, msad, test, quick-prune, adaptive |
 | `auto_dictionary` | `--auto-dict` | ✅ | v1.1, auto-train ZSTD dict |
-| `palette_algorithm` | `--palette-algorithm <a>` | ✅ | v1.1, nearest (default); median-cut; weighted (v1.5, redmean, scalar-only) |
+| `palette_algorithm` | `--palette-algorithm <a>` | ✅ | v1.1, nearest (default); median-cut; weighted (v1.5, redmean, scalar-only); kmeans (v1.7, Lloyd's algorithm) |
 | `tonemap_operator` | — | ❌ **MISSING** | Encode-side field exists (v1.2.1) but only `cafe-decode`'s `--tonemap-operator` is wired up; no encode-side flag |
 
 `EncoderOptions` (the streaming `Encoder<W>` API, v1.6) is a deliberately smaller struct with no CLI binary of its own — it's a library-only API (`tile_rows`, `level`, `use_filter`/`use_filter_per_row`, `target_color_type`, `target_bit_depth`, `exif`, `json_metadata`, `icc_profile`, `xmp_metadata`, `zstd_dictionary`, `sample_format`, `chdr_metadata`, `filter_heuristic`, `use_byte_shuffle`), so CLI parity doesn't apply to it the same way; see its limitations list in the "Streaming Encoder" section above.
@@ -887,7 +887,8 @@ Before submitting a PR:
 | **v1.6.1** | **CLI: `--icc-profile-file`/`--xmp-file` flags for `cafe-encode`** — closes a CLI-parity gap: `EncodeOptions::icc_profile`/`xmp_metadata` already existed in the library and were written correctly by `encode()`/`encode_indexed()`, but had no CLI flag to populate them — see "v1.6.1" notes below | ✅ |
 | **v1.6.2** | **Real `compression_stats` + `cafe-decode` metadata-export flags**: `DecodeResult::compression_stats` now populated with real per-chunk original/compressed sizes (previously always `None`); new `--show-stats`, `--save-exif`, `--save-icc-profile`, `--save-xmp`, `--save-zstd-dict` flags on `cafe-decode` — see "v1.6.2" notes below | ✅ |
 | **v1.6.3** | **CI: nightly fuzz workflow** — new `.github/workflows/fuzz.yml` runs `decode_fuzz`/`chunk_roundtrip_fuzz` for a full hour nightly (plus on-demand via `workflow_dispatch`), separate from `ci.yml`'s existing 60s-per-push smoke test job — see "v1.6.3" notes below | ✅ |
-| Future | Real hardware validation on physical ARM devices, additional compressors, k-means palette, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
+| **v1.7** | **`PaletteAlgorithm::KMeans`** (`quantize_kmeans` in `src/quantize.rs`): new indexed-palette quantization algorithm implementing Lloyd's algorithm, deterministically initialized from `quantize_median_cut`'s output (no RNG dependency anywhere in the codebase), typically the lowest mean-squared-error palette of the four algorithms at the highest computational cost — `--palette-algorithm kmeans`/`k-means` — see "v1.7" notes below | ✅ |
+| Future | Real hardware validation on physical ARM devices, additional compressors, tone-mapping on encode (SDR→HDR), operator selection via CLI | ⏳ |
 
 ---
 
@@ -957,7 +958,7 @@ cargo build --release --no-default-features
 2. **Real ARM hardware validation on physical devices** — QEMU emulation (v1.4.1) already caught and fixed one real NEON bug (see "v1.4.1" notes below); running the suite on actual ARM64 hardware (Raspberry Pi, mobile, Apple Silicon) would add confidence beyond emulation (e.g. timing-sensitive or alignment-sensitive behavior QEMU might not reproduce exactly)
 3. **Advanced 2D tiling** — iDIM with per-tile IDAT already implemented (row-major and Z-order); evolve with preview/progressive streaming
 4. **Optimized interlace** — Adam7 and even/odd already supported; optimize progressiveness and SIMD of passes
-5. **Optimized indexed palette** — `NearestNeighbor`, `MedianCut`, and a perceptually-weighted (`NearestNeighborWeighted`, redmean distance, v1.5) variant already exist; could still use k-means clustering for the palette-building step itself (all three current algorithms use either greedy incremental collection or median-cut bucket splitting, not iterative clustering)
+5. ~~**Optimized indexed palette**~~ — `NearestNeighbor`, `MedianCut`, `NearestNeighborWeighted` (redmean distance, v1.5), and `KMeans` (Lloyd's algorithm, v1.7) now cover greedy incremental, median-cut bucket-splitting, and iterative-clustering strategies — closed as of v1.7
 6. **Automatic ZSTD dictionary** — Train dictionary for small images
 7. **Tone-mapping on encode (SDR→HDR)** — Inverse of decode; also operator selection (Reinhard/Filmic) via CLI
 8. **In-depth tone-mapping** — Validate color conversions in real HDR scenarios; look-up tables
@@ -1000,7 +1001,20 @@ cargo doc --open
 
 ---
 
-**Last updated:** September 3, 2026 | **Project version:** v1.6.3 | **ARM NEON SIMD Phase (Sep 1/2026) + Compression-Focused Audit (Sep 2/2026) + Streaming Encoder (Sep 3/2026) + CLI ICC/XMP flags (Sep 3/2026, v1.6.1) + Real compression_stats + cafe-decode export flags (Sep 3/2026, v1.6.2) + Nightly fuzz CI workflow (Sep 3/2026, v1.6.3):**
+**Last updated:** September 3, 2026 | **Project version:** v1.7.0 | **ARM NEON SIMD Phase (Sep 1/2026) + Compression-Focused Audit (Sep 2/2026) + Streaming Encoder (Sep 3/2026) + CLI ICC/XMP flags (Sep 3/2026, v1.6.1) + Real compression_stats + cafe-decode export flags (Sep 3/2026, v1.6.2) + Nightly fuzz CI workflow (Sep 3/2026, v1.6.3) + k-means palette quantization (Sep 3/2026, v1.7):**
+
+### v1.7 - `PaletteAlgorithm::KMeans` (k-means palette quantization)
+
+Closes the last open item from the "Optimized indexed palette" line in "Welcome Contributions": `NearestNeighbor` (greedy incremental), `MedianCut` (recursive bisection), and `NearestNeighborWeighted` (v1.5, redmean-weighted greedy) already existed, but none used iterative clustering to directly minimize quantization error.
+
+- **New `quantize_kmeans` function** (`src/quantize.rs`): implements Lloyd's algorithm (assign each unique color to its nearest centroid by squared RGB distance, then recompute each centroid as the pixel-count-weighted mean of its assigned colors), repeated for up to `MAX_KMEANS_ITERATIONS = 20` or until assignments stop changing.
+- **Deterministic initialization**: centroids are seeded from `quantize_median_cut`'s own bucket-averaged output rather than random or k-means++ seeding. CAFE has no RNG dependency anywhere else in the codebase; introducing one purely for stochastic seeding would add a new category of non-determinism to an otherwise fully-reproducible encoder. Median-cut is also a well-established good initializer for k-means in color quantization specifically.
+- **Refactor for code reuse**: `collect_opaque_color_counts` (histogram building) and `palette_from_unique_colors` (the lossless `<= max_colors` short-circuit) were extracted out of `quantize_median_cut` into shared helpers, so `quantize_kmeans` reuses them instead of duplicating the same histogram/short-circuit logic. Similarly, `map_pixels_to_fixed_palette` was extracted out of `quantize_median_cut_wrapper` in `src/cafe.rs`, so both the median-cut and k-means wrappers share the same SIMD-accelerated (`PaletteSoa`, when the `simd` feature is enabled) pixel-to-palette mapping step, rather than each having its own copy.
+- **Empty-cluster handling**: a centroid to which zero colors get assigned (possible on adversarial/synthetic inputs) is dropped rather than re-seeded, which can yield a final palette with fewer than `max_colors` entries — already an accepted behavior of every other `PaletteAlgorithm` variant, none of which guarantee hitting the requested count exactly.
+- **`PaletteAlgorithm::KMeans` enum variant** (`src/types.rs`), parsed from `"kmeans"`/`"k-means"` by `FromStr`; CLI flag `--palette-algorithm kmeans` (`tools/cafe-encode.rs`, help text updated).
+- **New tests**: 5 unit tests in `src/quantize.rs` (`test_kmeans_already_under_max_colors`, `test_kmeans_reduction`, `test_kmeans_deterministic_across_runs` — confirms no RNG dependency by checking byte-identical output across two runs on the same input, `test_kmeans_rejects_invalid_max_colors`, `test_kmeans_rejects_non_rgba_length`) and 3 new integration tests in `tests/palette_algorithm_test.rs` (`palette_algorithm_from_str_kmeans_accepted_end_to_end`, `kmeans_algorithm_maps_exact_palette_colors_losslessly`, `kmeans_reduces_many_colors_to_requested_palette_size`), plus the existing 3-algorithm round-trip test extended to all four algorithms.
+
+**Validation:** `cargo build --lib`/`--bins`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --lib` (317 tests, +5 from v1.6.3's 312), `cargo test --test palette_algorithm_test` (7 tests, +3) all pass with zero regressions. Manually verified end-to-end via release binaries: `cafe-encode --indexed --palette-algorithm kmeans` followed by `cafe-decode` round-trips a 64×64 RGB gradient PNG successfully, and `cafe-encode --help` correctly lists the new `kmeans` option.
 
 ### v1.6.3 - CI: nightly fuzz workflow
 

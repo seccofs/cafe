@@ -7,7 +7,7 @@
 
 Um formato de imagem moderno baseado em chunks, inspirado em PNG, com suporte a compressão ZSTD, filtros preditivos avançados (16 tipos), paleta indexada, metadados estruturados (EXIF, JSON, ICC, XMP) e entrelaçamento progressivo.
 
-**Versão**: 1.6.3  
+**Versão**: 1.7.0  
 **Status**: ✅ Completo, auditado, e com aceleração SIMD  
 **Compatibilidade**: Rust 2021+
 
@@ -51,6 +51,7 @@ Um formato de imagem moderno baseado em chunks, inspirado em PNG, com suporte a 
 - **Garantia de não-regressão do `auto_dictionary`**: um dicionário ZSTD auto-treinado só é usado quando reduz estritamente o tamanho do arquivo, verificado por `IDAT` e no arquivo completo
 - **Quantização de paleta perceptualmente ponderada**: `PaletteAlgorithm::NearestNeighborWeighted` usando a fórmula de distância redmean
 - **Benchmarks de compressão reais + gate de regressão no CI**: `tests/compression_regression.rs` e `benches/encode_decode.rs`
+- **Quantização de paleta k-means** (v1.7): `PaletteAlgorithm::KMeans` refina centróides iterativamente (algoritmo de Lloyd, inicialização determinística via median-cut) para o menor erro quadrático médio entre os quatro algoritmos
 
 ### Segurança
 - ✅ Proteção contra decompression bomb (CWE-409)
@@ -330,6 +331,7 @@ Contribuições são bem-vindas! Áreas com potencial:
 - [x] **Quantização de paleta perceptualmente ponderada** — *completo em v1.5* (`PaletteAlgorithm::NearestNeighborWeighted`, distância redmean)
 - [x] **Benchmarks de compressão reais + gate de regressão no CI** — *completo em v1.5* (`tests/compression_regression.rs`, `benches/encode_decode.rs`)
 - [x] **Encoder em streaming** — *completo em v1.6* (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`, contraparte simétrica do `Decoder<R: Read>` da v1.5)
+- [x] **Quantização de paleta k-means** — *completo em v1.7* (`PaletteAlgorithm::KMeans`, algoritmo de Lloyd determinístico)
 
 ---
 
@@ -350,7 +352,8 @@ Contribuições são bem-vindas! Áreas com potencial:
 | **v1.6.1** | **CLI**: `cafe-encode` ganha as flags `--icc-profile-file`/`--xmp-file`, fechando uma lacuna de paridade de CLI para `EncodeOptions::icc_profile`/`xmp_metadata` | ✅ Completo |
 | **v1.6.2** | **CLI + `compression_stats` real**: `DecodeResult::compression_stats` agora populado de verdade (tamanhos originais/comprimidos por chunk) em vez de sempre `None`; `cafe-decode` ganha `--show-stats` além de `--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict` para exportar metadados embutidos para arquivos separados | ✅ Completo |
 | **v1.6.3** | **CI: workflow noturno de fuzzing** — novo `.github/workflows/fuzz.yml` roda `decode_fuzz`/`chunk_roundtrip_fuzz` por uma hora completa todas as noites (mais sob demanda via `workflow_dispatch`), separado do teste-fumaça de 60s por push já existente no `ci.yml` | ✅ Completo |
-| **Futuro** | Validação real em hardware ARM físico, compressores adicionais, paleta k-means, tone-mapping no encode (SDR→HDR) | 🔮 Planejado |
+| **v1.7** | **`PaletteAlgorithm::KMeans`**: novo algoritmo de paleta indexada implementando o algoritmo de Lloyd (inicialização determinística via median-cut, sem dependência de RNG), tipicamente o menor erro quadrático médio entre os quatro algoritmos ao custo computacional mais alto — `--palette-algorithm kmeans` | ✅ Completo |
+| **Futuro** | Validação real em hardware ARM físico, compressores adicionais, tone-mapping no encode (SDR→HDR) | 🔮 Planejado |
 
 ---
 
@@ -382,6 +385,6 @@ Arquitetura, especificação, implementação de referência em Rust (v1.1)
 
 ---
 
-**Última atualização**: 2026-09-03 (v1.6.3: workflow noturno de fuzzing no CI — `.github/workflows/fuzz.yml`; v1.6.2: rastreamento real de `DecodeResult::compression_stats` + `cafe-decode` ganha `--show-stats`/`--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict`; v1.6.1: `cafe-encode` ganha as flags `--icc-profile-file`/`--xmp-file`; v1.6: encoder em streaming — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, contraparte simétrica do `Decoder<R: Read>` da v1.5)  
-**Cobertura de testes**: 312 testes de lib + 13 suítes de teste de integração (roundtrip, encoder em streaming, SIMD, regressão de compressão, regressão de dicionário, algoritmo de paleta, benchmarks de tile_rows, etc.)  
+**Última atualização**: 2026-09-03 (v1.7: `PaletteAlgorithm::KMeans` — quantização de paleta k-means determinística, `--palette-algorithm kmeans`; v1.6.3: workflow noturno de fuzzing no CI — `.github/workflows/fuzz.yml`; v1.6.2: rastreamento real de `DecodeResult::compression_stats` + `cafe-decode` ganha `--show-stats`/`--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict`; v1.6.1: `cafe-encode` ganha as flags `--icc-profile-file`/`--xmp-file`; v1.6: encoder em streaming — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, contraparte simétrica do `Decoder<R: Read>` da v1.5)  
+**Cobertura de testes**: 317 testes de lib + 13 suítes de teste de integração (roundtrip, encoder em streaming, SIMD, regressão de compressão, regressão de dicionário, algoritmo de paleta, benchmarks de tile_rows, etc.)  
 **Próxima revisão de segurança**: 2027-08-04
