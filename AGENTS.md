@@ -479,6 +479,24 @@ alone does not guarantee) by keeping an in-memory copy of the 19
 already-written `IHDR` chunk bytes (Type + Flag + Data) from `new()`,
 rather than seeking back and re-reading them from `writer`.
 
+**Spec precision (v1.9.3, documentation-only, see "v1.9.3" notes below)**:
+`compression_method` is normatively a **capability declaration** (a required
+*lower bound* on which codecs a decoder must support), not a per-chunk
+record of which codec each chunk actually used — that's `Flag`'s job,
+independently, per chunk. `docs/CAFE-spec.md`/`.pt.md` section 4.1 now
+state this precisely: an encoder must never emit `bit0 = 0` while any chunk
+in the file has `Flag = 0x01` (both `encode()`'s
+`patch_ihdr_compression_method` and `Encoder<W>`'s `finish()`/
+`finish_exact()` already satisfy this — this is a documentation
+clarification of existing, already-correct behavior, not a behavior
+change), but overestimating (`bit0 = 1` when no chunk ends up needing ZSTD,
+exactly `Encoder<W: Write>::finish()`'s own conservative case above) is
+always a safe, permitted direction. The reference decoder does not
+cross-validate `bit0` against per-chunk `Flag` bytes — see the spec's
+"Decoder conformance note" for the resulting interoperability implication
+for other implementations (e.g. `no_std`/embedded decoders that skip
+initializing a ZSTD code path based on `bit0` alone).
+
 **Implementation note**: tiles are compressed sequentially as `add_tile()`
 receives them — no rayon parallelism across tiles, unlike `encode()`'s
 whole-image path, since there's no independent future work to farm out to
@@ -1006,7 +1024,18 @@ cargo doc --open
 
 ---
 
-**Last updated:** September 4, 2026 | **Project version:** v1.9.2 | **ARM NEON SIMD Phase (Sep 1/2026) + Compression-Focused Audit (Sep 2/2026) + Streaming Encoder (Sep 3/2026) + CLI ICC/XMP flags (Sep 3/2026, v1.6.1) + Real compression_stats + cafe-decode export flags (Sep 3/2026, v1.6.2) + Nightly fuzz CI workflow (Sep 3/2026, v1.6.3) + k-means palette quantization (Sep 3/2026, v1.7) + Inverse tone-mapping on encode (Sep 3/2026, v1.8) + Streaming decode of 2D tiling (Sep 4/2026, v1.9) + `Encoder<W>` limitations reclassified as permanent (Sep 4/2026, v1.9.1) + CI: ARM64 native test job (Sep 4/2026, v1.9.2):**
+**Last updated:** September 4, 2026 | **Project version:** v1.9.3 | **ARM NEON SIMD Phase (Sep 1/2026) + Compression-Focused Audit (Sep 2/2026) + Streaming Encoder (Sep 3/2026) + CLI ICC/XMP flags (Sep 3/2026, v1.6.1) + Real compression_stats + cafe-decode export flags (Sep 3/2026, v1.6.2) + Nightly fuzz CI workflow (Sep 3/2026, v1.6.3) + k-means palette quantization (Sep 3/2026, v1.7) + Inverse tone-mapping on encode (Sep 3/2026, v1.8) + Streaming decode of 2D tiling (Sep 4/2026, v1.9) + `Encoder<W>` limitations reclassified as permanent (Sep 4/2026, v1.9.1) + CI: ARM64 native test job (Sep 4/2026, v1.9.2) + `compression_method` spec semantics clarified (Sep 4/2026, v1.9.3):**
+
+### v1.9.3 - Spec precision: `compression_method` semantics clarified (documentation only)
+
+Closes the ambiguity flagged during review of the streaming encoder's `compression_method`-patching logic (v1.6): the spec described *how* the reference encoders fill in `IHDR`'s `Compression method` byte (conservative overestimate for `Write`-only, exact patch for `Write + Seek`) in detail, but never stated precisely *what the field itself means* — specifically, whether `bit0` is a record of which codec(s) each chunk in the file actually used, or a decoder capability pre-check independent of any specific chunk. Both readings were plausible from the existing text, and an independent implementer had no normative way to resolve the ambiguity from the spec alone.
+
+- **`docs/CAFE-spec.md`/`docs/CAFE-spec.pt.md` section 4.1** gained a new "Precise semantics — capability declaration, not a per-chunk record (normative)" note, stating explicitly: `compression_method`'s `bit0` is a **required lower bound** on codecs a decoder must support (an encoder must never emit `bit0 = 0` while any chunk has `Flag = 0x01`), never a per-chunk record — that role belongs exclusively to each chunk's own `Flag` byte (section 3), which a decoder must always dispatch decompression from, never from `IHDR`. The reverse direction (`bit0 = 1` when no chunk ends up needing ZSTD) is explicitly allowed, since it only overestimates the requirement.
+- **New "Decoder conformance note"** in the same section: the reference decoder enforces only that `compression_method` has no unknown/reserved bits set — it does **not** cross-validate `bit0` against the `Flag` bytes actually encountered while reading chunks. This is safe for the reference decoder itself (each chunk is always decoded correctly via its own `Flag`, regardless of what `IHDR` claimed), but is flagged as a real interoperability hazard for independent decoders that might treat `bit0 = 0` as authorization to skip initializing a ZSTD code path entirely (e.g. a `no_std`/embedded decoder built without the ZSTD dependency when `IHDR` claims it isn't needed) — such a decoder would fail unexpectedly on encountering a chunk whose `Flag` says otherwise, if it's talking to a non-conformant encoder that violated the required-lower-bound rule.
+- **Section 8's `IHDR` field summary table** and **section 6.1's streaming-encode "conservative overestimation" prose** both updated with a one-line pointer to the new section 4.1 note, rather than duplicating the full explanation in three places.
+- **No code or runtime behavior change**: this only formalizes semantics that both `encode()`'s `patch_ihdr_compression_method` and `Encoder<W>`'s `finish()`/`finish_exact()` already satisfied correctly (verified by re-reading `src/cafe.rs`'s implementation before writing the spec text — the required-lower-bound rule was already upheld by every code path that sets `compression_method`, this was purely an undocumented invariant, not a bug). `AGENTS.md`'s existing "`compression_method` semantics" note (under "Streaming Encoder") gained a short pointer to this clarification rather than being rewritten.
+
+**Validation:** `cargo build --lib`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --lib` (332 tests, unchanged — no Rust source touched), `cargo test --doc` (2 doc-tests, unchanged) all pass with zero regressions, confirming this is purely a documentation change. Spec prose reviewed for consistency between the English and Portuguese versions (translated, not just mirrored structurally) and cross-checked against `src/cafe.rs`'s actual `compression_method`-setting call sites (`patch_ihdr_compression_method`, `Encoder::new()`'s upfront `COMPRESSION_METHOD_ZSTD_BIT` push, `Encoder::finish_exact()`'s `uses_zstd`-derived patch) to confirm the new normative text describes existing behavior accurately, not aspirational behavior.
 
 ### v1.9.1 - `Encoder<W>` auto_dictionary/indexed/interlace limitations reclassified as permanent (documentation only)
 

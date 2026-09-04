@@ -17,6 +17,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.9.3] - 2026-09-04
+
+### Changed (Documentation only — no code behavior change)
+
+- **`compression_method` (`IHDR` field, section 4.1) semantics clarified in the spec.** The spec described in detail *how* the reference encoders fill in this byte (conservative overestimate for `Write`-only streaming, exact patch for `Write + Seek`) but never stated precisely *what the field means* — specifically, whether `bit0` records which codec(s) each chunk actually used, or is a decoder capability pre-check independent of any specific chunk. Both readings were plausible from the prior text, leaving no normative way for an independent implementer to resolve the ambiguity.
+  - `docs/CAFE-spec.md`/`docs/CAFE-spec.pt.md` section 4.1 gained a new "Precise semantics — capability declaration, not a per-chunk record (normative)" note: `bit0` is a **required lower bound** on codecs a decoder must support (an encoder must never emit `bit0 = 0` while any chunk has `Flag = 0x01`), never a per-chunk record — that role belongs exclusively to each chunk's own `Flag` byte (section 3), which a decoder must always dispatch decompression from, never from `IHDR`. Overestimating (`bit0 = 1` when no chunk ends up needing ZSTD) remains explicitly allowed.
+  - New "Decoder conformance note": the reference decoder only rejects unknown/reserved bits in `compression_method` — it does not cross-validate `bit0` against the `Flag` bytes actually encountered while reading chunks. Flagged as a real interoperability hazard for independent decoders (e.g. `no_std`/embedded) that might treat `bit0 = 0` as authorization to skip initializing a ZSTD code path entirely.
+  - Section 8's `IHDR` field summary table and section 6.1's streaming-encode "conservative overestimation" prose both updated with a one-line pointer to the new section 4.1 note, instead of duplicating it in three places.
+  - `AGENTS.md`'s existing `compression_method` semantics note (under "Streaming Encoder") gained a short pointer to this clarification.
+
+### Notes
+
+- **No code or runtime behavior change**: this formalizes semantics that both `encode()`'s `patch_ihdr_compression_method` and `Encoder<W>`'s `finish()`/`finish_exact()` already satisfied correctly — verified against `src/cafe.rs`'s actual call sites before writing the spec text. This was purely an undocumented invariant, not a bug.
+- Validated: `cargo build --lib`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --lib` (332 tests, unchanged — no Rust source touched), `cargo test --doc` (2 doc-tests, unchanged) all pass with zero regressions. Spec prose reviewed for consistency between the English and Portuguese versions (translated, not just structurally mirrored).
+
+---
+
 ## [1.9.2] - 2026-09-04
 
 ### Added
