@@ -128,6 +128,37 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo clippy --target aarch64-unknown-linux-gnu --lib -- -D warnings
 
+  arm64-native-test:
+    name: ARM64 Native Test (real silicon, GitHub-hosted runner)
+    # Unlike `aarch64-cross-compile` above (type-check/lint only, cross-compiled
+    # from an x86_64 host) and v1.4.1's QEMU-emulated validation (documented in
+    # AGENTS.md/DEVELOPER_GUIDE.md), this job actually builds and executes the
+    # full test suite natively on real ARM64 hardware: `ubuntu-24.04-arm` is a
+    # GitHub-hosted Actions runner backed by physical Arm-based server CPUs
+    # (Cobalt 100 on Azure), not x86_64-with-emulation. This is still not the
+    # same as validating on the specific end-user devices listed under
+    # "Welcome Contributions" (Raspberry Pi, mobile, Apple Silicon) — those
+    # remain a manual/future exercise — but it does close the gap between
+    # "type-checks on aarch64" and "the NEON intrinsics actually executed
+    # correctly," on every push/PR instead of only during ad-hoc local Docker
+    # QEMU sessions like v1.4.1's.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: arm64-native
+
+      - name: Run lib tests natively on arm64
+        run: cargo test --lib --release
+
+      - name: Run integration tests natively on arm64
+        run: cargo test --release
+
   compression-regression:
     name: Compression Regression
     runs-on: ubuntu-latest

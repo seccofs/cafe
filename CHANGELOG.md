@@ -10,10 +10,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Planned (Future)
-- Real ARM hardware validation on physical devices (Raspberry Pi, mobile, Apple Silicon) beyond QEMU emulation
+- Real ARM hardware validation on physical *end-user* devices (Raspberry Pi, mobile, Apple Silicon) — distinct from the native-but-cloud-hosted ARM64 CI coverage added in v1.9.2
 - Cache-friendly blocking in scalar byte-shuffle fallback
 - Runtime CPU detection for optional SIMD forcing
 - An `EncoderOptions`-equivalent CLI surface for the streaming encoder (`Encoder<W>` remains library-only)
+
+---
+
+## [1.9.2] - 2026-09-04
+
+### Added
+
+- **CI: ARM64 native test job (`arm64-native-test`, `.github/workflows/ci.yml`)** — runs `cargo test --lib --release` and `cargo test --release` (full integration suite) on `ubuntu-24.04-arm`, a GitHub-hosted Actions runner backed by real Arm-based server CPUs, on every push/PR. This closes the gap between the pre-existing `aarch64-cross-compile` job (type-checks/lints only, cross-compiled from an x86_64 host, never executes the code) and v1.4.1's one-off, manually-run QEMU-emulated validation (which found and fixed a real NEON index bug that cross-compilation alone couldn't catch, but wasn't automated into CI): NEON intrinsics now actually execute, on real ARM64 silicon, automatically, on every change — not just during ad-hoc local Docker sessions.
+
+### Notes
+
+- **Distinction from "real hardware validation on physical devices"** (the still-open "Welcome Contributions"/roadmap item): `ubuntu-24.04-arm` is a cloud-hosted Actions runner on real Arm server CPUs (Azure Cobalt 100), which is genuinely real ARM64 silicon — not x86_64-with-QEMU-emulation — but it is still not the same as validating on specific end-user-class devices (Raspberry Pi, mobile SoCs, Apple Silicon), which may differ in cache sizes, memory bandwidth, or alignment behavior. That item remains open and is now phrased to make the distinction explicit.
+- No production code changed — this is a CI-only addition, hence the patch-level version bump (matching the precedent set by v1.4.2's `aarch64-cross-compile` job and v1.6.3's nightly fuzz workflow, both CI-only additions that also bumped the patch version).
+- Validated: workflow YAML syntax checked with `rhysd/actionlint` (via Docker, `docker run --rm -v <repo>:/repo rhysd/actionlint`) against the full `ci.yml` — zero errors/warnings. The job's actual execution on `ubuntu-24.04-arm` was not exercised end-to-end locally (that requires pushing to trigger a real GitHub Actions run on that runner label); `actionlint`'s syntax/schema validation plus manual review against the already-proven-working `aarch64-cross-compile`/`fuzz` jobs (identical toolchain/action versions, only the runner label and executed commands differ) is the validation ceiling achievable without pushing. `cargo build --lib`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --lib` (332 tests, unchanged — no Rust source touched) all still pass locally on x86_64, confirming no regressions from the version bump.
 
 ---
 
