@@ -1830,15 +1830,29 @@ fn handle_interlaced_idat(state: &mut DecodeState, decompressed: Vec<u8>) -> Res
     Ok(())
 }
 
-/// Handles a non-interlaced IDAT tile payload when 2D tiling (iDIM) is
-/// present: undoes byte-shuffle/predictive filter for the tile, then copies
-/// it into the correct `(row0, col0)` region of `state.pixel_rows`.
-fn handle_idat_tile_idim(state: &mut DecodeState, tile_payload: Vec<u8>) -> Result<()> {
+/// Computes the next iDIM (2D tiling) tile's geometry and reverses its
+/// byte-shuffle/predictive filtering, without writing the result anywhere —
+/// shared by `handle_idat_tile_idim` (whole-image accumulation: copies the
+/// returned `tile_raw` into the correct `(row0, col0)` region of
+/// `state.pixel_rows`) and `decode_idat_as_tile_idim` (streaming: converts
+/// `tile_raw` directly into a standalone `Tile`, v1.9+), so the two output
+/// paths can never diverge on tile geometry or filter-reversal logic.
+///
+/// Advances `state.tiles_seen` by one on success. Returns
+/// `(tx, ty, tile_w, tile_h, tile_raw)`: `(tx, ty)` is this tile's position
+/// in the tile grid (not pixels — multiply by `tile_width`/`tile_height` for
+/// the pixel offset), `tile_w`/`tile_h` are its real pixel dimensions (may
+/// be smaller than `idim.tile_width`/`tile_height` at the image's right/
+/// bottom edge), and `tile_raw` is `tile_w * tile_h * bpp` bytes of
+/// unfiltered pixel data for the tile's color type/bit depth.
+fn decode_idim_tile_raw(
+    state: &mut DecodeState,
+    tile_payload: Vec<u8>,
+) -> Result<(u16, u16, u32, u32, Vec<u8>)> {
     let idim = state.idim.clone().ok_or_else(|| {
         CafeError::TruncatedFile("iDIM tile handler invoked without iDIM chunk".into())
     })?;
-    // 2D tiling (section 4.2): each IDAT is a tile in the scan_order order;
-    // reassembles the tiles back into the `pixel_rows` buffer.
+    // 2D tiling (section 4.2): each IDAT is a tile in the scan_order order.
     if state.color_type == COLOR_TYPE_INDEXED {
         return Err(CafeError::UnsupportedFeature(
             "iDIM (2D tiling) with indexed palette not supported".into(),
@@ -1857,23 +1871,11 @@ fn handle_idat_tile_idim(state: &mut DecodeState, tile_payload: Vec<u8>) -> Resu
     })?;
     let img_width = state.width.ok_or(CafeError::MissingIhdr)?;
     let img_height = state.height.ok_or(CafeError::MissingIhdr)?;
-    let ih = img_height as usize;
-    let full_size = state.bytes_per_row.checked_mul(ih).ok_or_else(|| {
-        CafeError::TruncatedFile("overflow in bytes_per_row × height (iDIM)".into())
-    })?;
     let tile_count = idim.tiles_x as usize * idim.tiles_y as usize;
     if state.tiles_seen >= tile_count {
         return Err(CafeError::TruncatedFile(format!(
             "Excess IDAT: expected {tile_count} tiles (iDIM)"
         )));
-    }
-    if state.pixel_rows.is_empty() {
-        state.pixel_rows = vec![0u8; full_size];
-    }
-    if state.pixel_rows.len() != full_size {
-        return Err(CafeError::TruncatedFile(
-            "tile buffer inconsistent with IHDR (iDIM)".into(),
-        ));
     }
     // Use the tile order cached once in handle_idim_chunk instead of
     // recomputing it from scratch on every IDAT (would be O(tile_count^2)
@@ -1928,6 +1930,40 @@ fn handle_idat_tile_idim(state: &mut DecodeState, tile_payload: Vec<u8>) -> Resu
             tile_len
         )));
     }
+    Ok((tx, ty, tile_w, tile_h, tile_raw))
+}
+
+/// Handles a non-interlaced IDAT tile payload when 2D tiling (iDIM) is
+/// present: undoes byte-shuffle/predictive filter for the tile (via
+/// `decode_idim_tile_raw`), then copies it into the correct `(row0, col0)`
+/// region of `state.pixel_rows`.
+fn handle_idat_tile_idim(state: &mut DecodeState, tile_payload: Vec<u8>) -> Result<()> {
+    let idim = state.idim.clone().ok_or_else(|| {
+        CafeError::TruncatedFile("iDIM tile handler invoked without iDIM chunk".into())
+    })?;
+    let bpp_for_tile = bytes_per_pixel(state.color_type, state.bit_depth).ok_or_else(|| {
+        CafeError::UnsupportedFeature(format!(
+            "Color type {}, bit depth {} not supported",
+            state.color_type, state.bit_depth
+        ))
+    })?;
+    let img_height = state.height.ok_or(CafeError::MissingIhdr)?;
+    let ih = img_height as usize;
+    let full_size = state.bytes_per_row.checked_mul(ih).ok_or_else(|| {
+        CafeError::TruncatedFile("overflow in bytes_per_row × height (iDIM)".into())
+    })?;
+    if state.pixel_rows.is_empty() {
+        state.pixel_rows = vec![0u8; full_size];
+    }
+    if state.pixel_rows.len() != full_size {
+        return Err(CafeError::TruncatedFile(
+            "tile buffer inconsistent with IHDR (iDIM)".into(),
+        ));
+    }
+
+    let (tx, ty, tile_w, tile_h, tile_raw) = decode_idim_tile_raw(state, tile_payload)?;
+    let th = tile_h as usize;
+    let tile_stride = (tile_w as usize) * bpp_for_tile;
     let row0 = (ty as u32 * idim.tile_height as u32) as usize;
     let col0 = (tx as u32 * idim.tile_width as u32) as usize;
     for r in 0..th {
@@ -1946,6 +1982,69 @@ fn handle_idat_tile_idim(state: &mut DecodeState, tile_payload: Vec<u8>) -> Resu
         state.pixel_rows[dst_start..dst_start + tile_stride].copy_from_slice(src);
     }
     Ok(())
+}
+
+/// Decodes a single non-interlaced IDAT payload into a standalone 2D-tiling
+/// (`iDIM`) `Tile`, already converted to RGBA — the iDIM analogue of
+/// `decode_idat_as_tile_row_strip` (v1.9+). Reuses `decode_idim_tile_raw`
+/// (geometry + filter-reversal, shared with the whole-image
+/// `handle_idat_tile_idim`) and `convert_raw_to_rgba` (color conversion,
+/// shared with `reconstruct_final_pixels`) — the only code unique to this
+/// function is computing the tile's pixel-space `(x, y)` offset from its
+/// grid `(tx, ty)` position and calling `convert_raw_to_rgba` on just that
+/// tile's raw bytes instead of the whole image's.
+///
+/// Does **not** touch `state.pixel_rows` — like
+/// `decode_idat_as_tile_row_strip`, this is for `Decoder<R>::next_tile()`,
+/// which yields tiles one at a time without ever materializing the whole
+/// image in memory.
+fn decode_idat_as_tile_idim(
+    state: &mut DecodeState,
+    tile_payload: Vec<u8>,
+    tonemap_operator: tonemap::ToneMapOperator,
+) -> Result<Tile> {
+    let idim = state.idim.clone().ok_or_else(|| {
+        CafeError::TruncatedFile("iDIM tile handler invoked without iDIM chunk".into())
+    })?;
+    let (tx, ty, tile_w, tile_h, tile_raw) = decode_idim_tile_raw(state, tile_payload)?;
+    let x = tx as u32 * idim.tile_width as u32;
+    let y = ty as u32 * idim.tile_height as u32;
+
+    let pixels = convert_raw_to_rgba(
+        &tile_raw,
+        tile_w,
+        tile_h,
+        state.color_type,
+        state.bit_depth,
+        state.sample_format,
+        state.palette.as_ref(),
+        state.chdr.as_ref(),
+        tonemap_operator,
+    )?;
+
+    Ok(Tile {
+        x,
+        y,
+        width: tile_w,
+        height: tile_h,
+        pixels,
+    })
+}
+
+/// Decompresses a single raw IDAT chunk (flag+data, as read straight off the
+/// file/stream) and decodes it into an iDIM (2D tiling) `Tile` — the iDIM
+/// analogue of `decode_idat_chunk_as_tile_row_strip`. This is the function
+/// `Decoder::next_tile()` calls once per `IDAT` chunk when the file has an
+/// `iDIM` chunk (`DecodeInfo::supports_streaming_tiles` is `true` for such
+/// files as of v1.9).
+fn decode_idat_chunk_as_tile_idim(
+    state: &mut DecodeState,
+    flag: u8,
+    data: &[u8],
+    tonemap_operator: tonemap::ToneMapOperator,
+) -> Result<Tile> {
+    let decompressed = decompress_idat_payload(state, flag, data)?;
+    decode_idat_as_tile_idim(state, decompressed, tonemap_operator)
 }
 
 /// Undoes byte-shuffle and predictive/per-row-predictive filtering for a
@@ -2466,13 +2565,26 @@ fn dispatch_ancillary_chunk(state: &mut DecodeState, chunk: &ReadChunk) -> Resul
 /// metadata (`eXIF`/`jSON`/`iCCP`/`xMPd`/`zDIC`/`cHDR`) that
 /// `decode_bytes`/`decode` return in their `DecodeResult`.
 ///
-/// # Limitations (v1 of this API)
-/// - Does **not** support 2D tiling (`iDIM`) or interlaced (Adam7/even-odd)
-///   files: `next_tile()` returns `Err(CafeError::UnsupportedFeature(..))`
-///   on every call for such a file (`read_info()` itself still succeeds, so
-///   callers can check `DecodeInfo::supports_streaming_tiles` up front and
-///   fall back to `decode_bytes`/`decode` instead of calling `next_tile()`
-///   at all).
+/// # Limitations
+/// - Does **not** support interlaced (Adam7/even-odd) files: `next_tile()`
+///   returns `Err(CafeError::UnsupportedFeature(..))` on every call for such
+///   a file (`read_info()` itself still succeeds, so callers can check
+///   `DecodeInfo::supports_streaming_tiles` up front and fall back to
+///   `decode_bytes`/`decode` instead of calling `next_tile()` at all). This
+///   is a permanent, by-design limitation, not a "not yet implemented" gap:
+///   an interlace pass is not a spatial rectangle (each pass covers a
+///   strided subset of every row/column) and cannot be converted to a
+///   standalone RGBA `Tile` without every other pass also being available —
+///   `decode_bytes`/`decode`, which buffer the whole file, do not have this
+///   restriction.
+/// - 2D tiling (`iDIM`) **is** supported (as of v1.9) — each `IDAT` yields
+///   one `Tile` with its real `(x, y, width, height)` position in the tile
+///   grid (narrower/shorter than `tile_width`/`tile_height` at the image's
+///   right/bottom edges, same as `iDim::tile_dimensions`), in whatever
+///   `scan_order` the file declares (row-major or Z-order) — the same
+///   per-`IDAT` restrictions `handle_idat_tile_idim` already enforces for
+///   the whole-image path apply here too (`COLOR_TYPE_INDEXED` and
+///   `bit_depth < 8` are rejected with `UnsupportedFeature`).
 /// - Relies on the file honoring section 9's mandatory chunk order (all
 ///   ancillary chunks and `PLTE` appear before the first `IDAT`): a
 ///   spec-nonconforming file that places one of those chunks *after* an
@@ -2585,8 +2697,16 @@ impl<R: Read> Decoder<R> {
 
         let width = self.state.width.ok_or(CafeError::MissingIhdr)?;
         let height = self.state.height.ok_or(CafeError::MissingIhdr)?;
-        let supports_streaming_tiles =
-            self.state.idim.is_none() && self.state.interlace_method_read == INTERLACE_NONE;
+        // Interlaced files never support streaming tiles (see `next_tile()`'s
+        // doc comment: an interlace pass is not a spatial rectangle). iDIM
+        // (2D tiling) files do support it as of v1.9, except for the same
+        // color-type/bit-depth combinations `handle_idat_tile_idim` already
+        // rejects for the whole-image path (indexed palette, bit_depth < 8)
+        // — checked here too so callers can find out from `read_info()`
+        // alone, without needing to call `next_tile()` first to discover it.
+        let supports_streaming_tiles = self.state.interlace_method_read == INTERLACE_NONE
+            && (self.state.idim.is_none()
+                || (self.state.color_type != COLOR_TYPE_INDEXED && self.state.bit_depth >= 8));
 
         let info = DecodeInfo {
             width,
@@ -2606,10 +2726,11 @@ impl<R: Read> Decoder<R> {
     ///
     /// # Errors
     /// - `UnsupportedFeature` if called before `read_info()`.
-    /// - `UnsupportedFeature` if the file uses 2D tiling (`iDIM`) or
-    ///   interlacing — check `DecodeInfo::supports_streaming_tiles` (from
-    ///   `read_info()`'s return value) before calling this in a loop, and
-    ///   fall back to `decode_bytes`/`decode` if `false`.
+    /// - `UnsupportedFeature` if the file is interlaced, or uses 2D tiling
+    ///   (`iDIM`) combined with an indexed palette / `bit_depth < 8` — check
+    ///   `DecodeInfo::supports_streaming_tiles` (from `read_info()`'s return
+    ///   value) before calling this in a loop, and fall back to
+    ///   `decode_bytes`/`decode` if `false`.
     /// - Any error `chunk::read_chunk_from`/the per-tile decode pipeline
     ///   can return (CRC mismatch, truncation, decompression-budget
     ///   exceeded, unknown critical chunk, etc.)
@@ -2619,11 +2740,12 @@ impl<R: Read> Decoder<R> {
         })?;
         if !info.supports_streaming_tiles {
             return Err(CafeError::UnsupportedFeature(
-                "Decoder::next_tile() does not support 2D tiling (iDIM) or interlaced \
-                 images in this version; use decode_bytes()/decode() for this file"
+                "Decoder::next_tile() does not support this file (interlaced, or iDIM combined \
+                 with indexed palette / bit_depth < 8); use decode_bytes()/decode() instead"
                     .into(),
             ));
         }
+        let is_idim = self.state.idim.is_some();
         if self.finished {
             return Ok(None);
         }
@@ -2645,12 +2767,21 @@ impl<R: Read> Decoder<R> {
             }
         };
 
-        let tile = decode_idat_chunk_as_tile_row_strip(
-            &mut self.state,
-            chunk.flag,
-            &chunk.data,
-            self.tonemap_operator,
-        )?;
+        let tile = if is_idim {
+            decode_idat_chunk_as_tile_idim(
+                &mut self.state,
+                chunk.flag,
+                &chunk.data,
+                self.tonemap_operator,
+            )?
+        } else {
+            decode_idat_chunk_as_tile_row_strip(
+                &mut self.state,
+                chunk.flag,
+                &chunk.data,
+                self.tonemap_operator,
+            )?
+        };
         Ok(Some(tile))
     }
 
@@ -6200,6 +6331,66 @@ mod tests {
         );
     }
 
+    /// Asserts `tiles` (in whatever `scan_order` they were produced) fully
+    /// and exclusively cover a `width`×`height` image, each written into
+    /// its declared `(x, y, width, height)` rectangle, reassembling to
+    /// exactly `expected_rgba` — the 2D-tiling (`iDIM`) analogue of
+    /// `assert_tiles_reassemble_to` above, which assumes row-strip (`x=0`,
+    /// full-width) tiles instead.
+    fn assert_idim_tiles_reassemble_to(
+        tiles: &[Tile],
+        width: u32,
+        height: u32,
+        expected_rgba: &[u8],
+    ) {
+        assert!(!tiles.is_empty(), "expected at least one tile");
+        let mut reassembled = vec![0u8; expected_rgba.len()];
+        let mut covered = vec![false; (width * height) as usize];
+        for tile in tiles {
+            assert_eq!(
+                tile.pixels.len(),
+                (tile.width * tile.height * 4) as usize,
+                "tile pixel buffer size must match width*height*4"
+            );
+            assert!(
+                tile.x + tile.width <= width && tile.y + tile.height <= height,
+                "tile ({}, {}, {}, {}) must fit within the {}x{} image",
+                tile.x,
+                tile.y,
+                tile.width,
+                tile.height,
+                width,
+                height
+            );
+            for r in 0..tile.height {
+                let src_start = (r * tile.width * 4) as usize;
+                let src_end = src_start + (tile.width * 4) as usize;
+                let dst_row = tile.y + r;
+                let dst_start = ((dst_row * width + tile.x) * 4) as usize;
+                let dst_end = dst_start + (tile.width * 4) as usize;
+                reassembled[dst_start..dst_end].copy_from_slice(&tile.pixels[src_start..src_end]);
+                for c in 0..tile.width {
+                    let idx = (dst_row * width + tile.x + c) as usize;
+                    assert!(
+                        !covered[idx],
+                        "pixel ({}, {}) covered by multiple tiles",
+                        tile.x + c,
+                        dst_row
+                    );
+                    covered[idx] = true;
+                }
+            }
+        }
+        assert!(
+            covered.iter().all(|&c| c),
+            "every pixel of the image must be covered by exactly one tile"
+        );
+        assert_eq!(
+            reassembled, expected_rgba,
+            "per-tile iDIM decode must match whole-image decode pixel-for-pixel"
+        );
+    }
+
     /// Fase 2 (streaming-prep) parity test, direct-color path (RGBA): the
     /// concatenation of tiles produced by `decode_idat_chunk_as_tile_row_strip`
     /// must be byte-for-byte identical to what `decode_bytes()` produces for
@@ -6595,15 +6786,26 @@ mod tests {
         assert_eq!(result2.json_metadata, whole_result.json_metadata);
     }
 
-    /// A file using 2D tiling (`iDIM`) must be reported as not supporting
-    /// streaming tiles, and `next_tile()` must reject it with a clear
-    /// error rather than silently misinterpreting `iDIM` tile payloads as
-    /// row-strips.
+    /// A file using 2D tiling (`iDIM`) must be reported as supporting
+    /// streaming tiles (v1.9+), and `next_tile()`'s loop must reassemble to
+    /// exactly the same pixels as `decode_bytes()`, with each yielded
+    /// `Tile` carrying its real `(x, y, width, height)` position in the
+    /// tile grid (including a partial last row/column, since 33x23 with an
+    /// 8x8 tile does not divide evenly).
     #[test]
-    fn test_decoder_next_tile_rejects_idim_2d_tiling() {
-        let width = 32u32;
-        let height = 32u32;
-        let img_data = vec![64u8; (width * height * 4) as usize];
+    fn test_decoder_next_tile_loop_matches_whole_image_decode_idim() {
+        let width = 33u32;
+        let height = 23u32;
+        let mut img_data = vec![0u8; (width * height * 4) as usize];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = ((y * width + x) * 4) as usize;
+                img_data[idx] = ((x * 7 + y * 3) % 256) as u8;
+                img_data[idx + 1] = ((x * 13 + y) % 256) as u8;
+                img_data[idx + 2] = ((x + y * 29) % 256) as u8;
+                img_data[idx + 3] = ((x * 3 + y * 5) % 256) as u8;
+            }
+        }
         let img =
             image::RgbaImage::from_raw(width, height, img_data).expect("failed to create image");
         let temp_dir = std::env::temp_dir();
@@ -6616,17 +6818,199 @@ mod tests {
         let opts = EncodeOptions {
             use_filter: true,
             level: 5,
-            idim: Some(iDim {
-                tile_width: 16,
-                tile_height: 16,
-                tiles_x: 2,
-                tiles_y: 2,
-                scan_order: 0,
-            }),
+            idim: Some(iDim::new(8, 8, width, height, 0)),
             ..EncodeOptions::default()
         };
         let cafe_path = temp_dir
             .join("test_decoder_idim.cafe")
+            .to_string_lossy()
+            .to_string();
+        encode(&input_path, &cafe_path, &opts).expect("failed to encode");
+        let buf = std::fs::read(&cafe_path).expect("failed to read encoded file");
+        let (whole_pixels, _whole_result) = decode_bytes(&buf).expect("whole-image decode failed");
+
+        let cursor = std::io::Cursor::new(buf.as_slice());
+        let mut decoder = Decoder::new(cursor);
+        let info = decoder.read_info().expect("read_info failed");
+        assert!(info.supports_streaming_tiles);
+
+        let mut tiles = Vec::new();
+        while let Some(tile) = decoder.next_tile().expect("next_tile failed") {
+            tiles.push(tile);
+        }
+        assert!(decoder
+            .next_tile()
+            .expect("next_tile after None failed")
+            .is_none());
+
+        assert_idim_tiles_reassemble_to(&tiles, width, height, &whole_pixels);
+    }
+
+    /// Same as above, but with `scan_order=1` (Z-order/Morton) — confirms
+    /// `next_tile()` yields tiles in the file's declared visitation order
+    /// and each still lands at its correct `(x, y)` regardless of the
+    /// order tiles arrive in.
+    #[test]
+    fn test_decoder_next_tile_loop_matches_whole_image_decode_idim_zorder() {
+        let width = 33u32;
+        let height = 23u32;
+        let img_data: Vec<u8> = (0..(width * height * 4)).map(|i| (i % 256) as u8).collect();
+        let img =
+            image::RgbaImage::from_raw(width, height, img_data).expect("failed to create image");
+        let temp_dir = std::env::temp_dir();
+        let input_path = temp_dir
+            .join("test_decoder_idim_zorder_input.png")
+            .to_string_lossy()
+            .to_string();
+        img.save(&input_path).expect("failed to save PNG");
+
+        let opts = EncodeOptions {
+            use_filter: true,
+            level: 5,
+            idim: Some(iDim::new(8, 8, width, height, 1)),
+            ..EncodeOptions::default()
+        };
+        let cafe_path = temp_dir
+            .join("test_decoder_idim_zorder.cafe")
+            .to_string_lossy()
+            .to_string();
+        encode(&input_path, &cafe_path, &opts).expect("failed to encode");
+        let buf = std::fs::read(&cafe_path).expect("failed to read encoded file");
+        let (whole_pixels, _whole_result) = decode_bytes(&buf).expect("whole-image decode failed");
+
+        let cursor = std::io::Cursor::new(buf.as_slice());
+        let mut decoder = Decoder::new(cursor);
+        let info = decoder.read_info().expect("read_info failed");
+        assert!(info.supports_streaming_tiles);
+
+        let mut tiles = Vec::new();
+        while let Some(tile) = decoder.next_tile().expect("next_tile failed") {
+            tiles.push(tile);
+        }
+        assert_idim_tiles_reassemble_to(&tiles, width, height, &whole_pixels);
+    }
+
+    /// `iDIM` combined with an indexed palette is rejected outright by
+    /// `encode_indexed()` (no CAFE writer can currently produce such a
+    /// file), which in turn means `Decoder`'s
+    /// `handle_idat_tile_idim`/`decode_idim_tile_raw` indexed-palette guard
+    /// can only ever be reached by an adversarial/hand-crafted file — see
+    /// `test_decode_adversarial_idim_with_indexed_color_type` below for
+    /// that direct decode-side check. This test instead pins down the
+    /// encoder-side rejection so a future change can't silently start
+    /// allowing this combination without the decoder story being revisited.
+    #[test]
+    fn test_encode_indexed_rejects_idim() {
+        let width = 32u32;
+        let height = 32u32;
+        let mut img_data = vec![0u8; (width * height * 4) as usize];
+        let colors = [[255u8, 0, 0, 255], [0, 255, 0, 255]];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = ((y * width + x) * 4) as usize;
+                let c = colors[((x + y) as usize) % colors.len()];
+                img_data[idx..idx + 4].copy_from_slice(&c);
+            }
+        }
+        let img =
+            image::RgbaImage::from_raw(width, height, img_data).expect("failed to create image");
+        let temp_dir = std::env::temp_dir();
+        let input_path = temp_dir
+            .join("test_decoder_idim_indexed_input.png")
+            .to_string_lossy()
+            .to_string();
+        img.save(&input_path).expect("failed to save PNG");
+
+        let opts = EncodeOptions {
+            use_filter: true,
+            level: 5,
+            idim: Some(iDim::new(16, 16, width, height, 0)),
+            ..EncodeOptions::default()
+        };
+        let cafe_path = temp_dir
+            .join("test_decoder_idim_indexed.cafe")
+            .to_string_lossy()
+            .to_string();
+        let result = encode_indexed(&input_path, &cafe_path, &opts);
+        assert!(
+            result.is_err(),
+            "encode_indexed must reject iDIM combined with indexed palette"
+        );
+    }
+
+    /// Direct decode-side check (adversarial, hand-crafted file, since no
+    /// encoder can produce this combination — see
+    /// `test_encode_indexed_rejects_idim` above): `iDIM` + `color_type=3`
+    /// (indexed) must be reported as not supporting streaming tiles, and
+    /// `next_tile()` must reject it cleanly instead of misinterpreting the
+    /// tile payload as unpacked direct-color bytes.
+    #[test]
+    fn test_decode_adversarial_idim_with_indexed_color_type() {
+        let mut evil = Vec::new();
+        evil.extend_from_slice(&SIGNATURE);
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&8u32.to_be_bytes());
+        ihdr.extend_from_slice(&8u32.to_be_bytes());
+        ihdr.push(8); // bit_depth
+        ihdr.push(SAMPLE_FORMAT_UINT);
+        ihdr.push(COLOR_TYPE_INDEXED);
+        ihdr.push(COMPRESSION_METHOD_ZSTD_BIT);
+        ihdr.push(FILTER_METHOD_NONE);
+        ihdr.push(INTERLACE_NONE);
+        evil.extend_from_slice(&write_chunk(CHUNK_IHDR, FLAG_RAW, &ihdr));
+
+        let mut idim = Vec::new();
+        idim.extend_from_slice(&4u16.to_be_bytes()); // tile_width
+        idim.extend_from_slice(&4u16.to_be_bytes()); // tile_height
+        idim.extend_from_slice(&2u16.to_be_bytes()); // tiles_x
+        idim.extend_from_slice(&2u16.to_be_bytes()); // tiles_y
+        idim.push(0); // scan_order
+        evil.extend_from_slice(&write_chunk(CHUNK_IDIM, FLAG_RAW, &idim));
+
+        let mut plte = Vec::new();
+        plte.push(0); // entry_format=RGB
+        plte.extend_from_slice(&[255, 0, 0]);
+        plte.extend_from_slice(&[0, 255, 0]);
+        evil.extend_from_slice(&write_chunk(CHUNK_PLTE, FLAG_RAW, &plte));
+        evil.extend_from_slice(&write_chunk(CHUNK_IEND, FLAG_RAW, &[]));
+
+        let cursor = std::io::Cursor::new(evil.as_slice());
+        let mut decoder = Decoder::new(cursor);
+        let info = decoder.read_info().expect("read_info failed");
+        assert!(!info.supports_streaming_tiles);
+        assert!(matches!(
+            decoder.next_tile(),
+            Err(CafeError::UnsupportedFeature(_))
+        ));
+    }
+
+    /// Interlaced files (Adam7/even-odd) remain permanently unsupported by
+    /// `next_tile()` even after v1.9's iDIM support — an interlace pass is
+    /// not a spatial rectangle, so this is a by-design limitation, not a
+    /// gap. `supports_streaming_tiles` must be `false` and `next_tile()`
+    /// must reject with a clear error.
+    #[test]
+    fn test_decoder_next_tile_rejects_interlaced_adam7() {
+        let width = 32u32;
+        let height = 32u32;
+        let img_data = vec![64u8; (width * height * 4) as usize];
+        let img =
+            image::RgbaImage::from_raw(width, height, img_data).expect("failed to create image");
+        let temp_dir = std::env::temp_dir();
+        let input_path = temp_dir
+            .join("test_decoder_adam7_input.png")
+            .to_string_lossy()
+            .to_string();
+        img.save(&input_path).expect("failed to save PNG");
+
+        let opts = EncodeOptions {
+            use_filter: true,
+            level: 5,
+            interlace_method: INTERLACE_ADAM7,
+            ..EncodeOptions::default()
+        };
+        let cafe_path = temp_dir
+            .join("test_decoder_adam7.cafe")
             .to_string_lossy()
             .to_string();
         encode(&input_path, &cafe_path, &opts).expect("failed to encode");

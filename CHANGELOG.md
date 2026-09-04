@@ -13,8 +13,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Real ARM hardware validation on physical devices (Raspberry Pi, mobile, Apple Silicon) beyond QEMU emulation
 - Cache-friendly blocking in scalar byte-shuffle fallback
 - Runtime CPU detection for optional SIMD forcing
-- `Decoder<R: Read>::next_tile()` support for 2D tiling (`iDIM`) and interlaced (Adam7/even-odd) files
+- `Encoder<W>` support for `auto_dictionary`, indexed palette, and interlace (currently row-strip direct-color only, by design — see `EncoderOptions`'s doc comment)
 - An `EncoderOptions`-equivalent CLI surface for the streaming encoder (`Encoder<W>` remains library-only)
+
+---
+
+## [1.9.0] - 2026-09-04
+
+### Added
+
+- **`Decoder<R: Read>::next_tile()` now supports 2D tiling (`iDIM`)**: previously, any file with an `iDIM` chunk made `DecodeInfo::supports_streaming_tiles` `false` and every `next_tile()` call return `Err(UnsupportedFeature)` unconditionally, forcing a fallback to `decode_bytes`/`decode` for such files. As of this version, `next_tile()` yields one `Tile` per `IDAT` with its real `(x, y, width, height)` position in the tile grid — narrower/shorter than `tile_width`/`tile_height` at the image's right/bottom edges, exactly as `iDim::tile_dimensions` computes for the whole-image path — in whatever `scan_order` the file declares (row-major or Z-order).
+  - **`decode_idim_tile_raw`** (new private helper, `src/cafe.rs`): factored out of `handle_idat_tile_idim`'s existing tile-geometry-lookup + byte-shuffle/predictive-filter-reversal logic, so both the whole-image accumulation path (`handle_idat_tile_idim`, unchanged in behavior) and the new streaming path share the exact same code for computing a tile's `(tx, ty, width, height)` and unfiltered raw bytes — they can never diverge on tile geometry or filter reversal.
+  - **`decode_idat_as_tile_idim` / `decode_idat_chunk_as_tile_idim`** (new private functions): the iDIM analogues of the existing row-strip streaming functions (`decode_idat_as_tile_row_strip` / `decode_idat_chunk_as_tile_row_strip`), converting one tile's raw bytes to RGBA via the same shared `convert_raw_to_rgba` and returning a `Tile` with its pixel-space `(x, y)` offset — does not touch `state.pixel_rows`.
+  - **`DecodeInfo::supports_streaming_tiles`** is now `true` for `iDIM` files too, except when combined with `COLOR_TYPE_INDEXED` or `bit_depth < 8` — the same two restrictions `handle_idat_tile_idim` already enforces for the whole-image path (an indexed-palette `iDIM` file can't currently be produced by any CAFE encoder — `encode_indexed()` rejects `opts.idim` outright — so this only matters for adversarial/hand-crafted files, which `next_tile()` now also rejects cleanly instead of misinterpreting the payload).
+  - **Interlace (Adam7/even-odd) support in `next_tile()` remains permanently out of scope** — this is a documented design limitation, not a "not yet implemented" gap: an interlace pass is not a spatial rectangle (each pass strides across every row/column of the full image) and cannot be converted to a standalone RGBA `Tile` without every other pass also being available. `DecodeInfo::supports_streaming_tiles` stays `false` for interlaced files, and `next_tile()` still returns `Err(UnsupportedFeature)` for them.
+  - `Decoder`'s struct-level doc comment (`src/cafe.rs`) and `Tile`'s doc comment (`src/types.rs`) updated to reflect the new iDIM support and the permanent interlace limitation.
+
+### Notes
+
+- Purely additive, no breaking changes: `Decoder<R>`'s public API surface (`new`, `with_tonemap_operator`, `read_info`, `next_tile`, `finish`) is unchanged in signature — only `next_tile()`'s *behavior* for iDIM files changes (from always erroring to succeeding, for the files it can now handle), and `DecodeInfo::supports_streaming_tiles` now correctly reports `true` for a strictly larger set of files than before. No changes to the `.cafe` binary format itself.
+- **New tests** (`src/cafe.rs`): `test_decoder_next_tile_loop_matches_whole_image_decode_idim` (row-major, non-power-of-two 33×23 image with an 8×8 tile — exercises partial edge tiles), `test_decoder_next_tile_loop_matches_whole_image_decode_idim_zorder` (same but `scan_order=1`), `test_encode_indexed_rejects_idim` (pins down the existing encoder-side rejection), `test_decode_adversarial_idim_with_indexed_color_type` (hand-crafted file confirming the decoder itself also rejects this combination cleanly), and `test_decoder_next_tile_rejects_interlaced_adam7` (replaces the now-obsolete `test_decoder_next_tile_rejects_idim_2d_tiling`, confirming interlace rejection is unaffected by this change). New `assert_idim_tiles_reassemble_to` test helper verifies full, non-overlapping pixel coverage in addition to pixel-exact reassembly.
+- Validated: `cargo build --lib`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --lib` (332 tests, +4 from v1.8.0's 328), `cargo test` (full workspace — all integration suites including `roundtrip_formats.rs`'s existing `iDIM` round-trip tests, doc-tests) all pass with zero regressions.
 
 ---
 

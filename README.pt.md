@@ -199,10 +199,12 @@ if info.supports_streaming_tiles {
 let result = decoder.finish()?; // metadados EXIF/JSON/ICC/XMP/HDR
 ```
 
-Veja `examples/streaming_decode.rs` para um exemplo completo executável,
-incluindo o caminho de fallback para arquivos com tiling 2D (`iDIM`) ou
-entrelaçamento, que `next_tile()` não suporta (verifique
-`info.supports_streaming_tiles`).
+Veja `examples/streaming_decode.rs` para um exemplo completo executável.
+`next_tile()` suporta tiling 2D (`iDIM`, desde v1.9) além de arquivos em
+faixas de linhas simples, mas ainda não suporta arquivos entrelaçados (uma
+limitação de design permanente) nem `iDIM` combinado com paleta indexada /
+`bit_depth < 8` — verifique `info.supports_streaming_tiles` e recorra a
+`decode`/`decode_bytes` caso seja `false`.
 
 #### Codificação em streaming (imagens grandes / produtores incrementais)
 
@@ -334,6 +336,7 @@ Contribuições são bem-vindas! Áreas com potencial:
 - [x] **Encoder em streaming** — *completo em v1.6* (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`, contraparte simétrica do `Decoder<R: Read>` da v1.5)
 - [x] **Quantização de paleta k-means** — *completo em v1.7* (`PaletteAlgorithm::KMeans`, algoritmo de Lloyd determinístico)
 - [x] **Tone-mapping inverso no encode (SDR→HDR)** — *completo em v1.8* (`EncodeOptions::inverse_tonemap`, `--inverse-tonemap reinhard`)
+- [x] **Decodificação em streaming com tiling 2D (`iDIM`)** — *completo em v1.9* (`Decoder<R>::next_tile()` agora transmite tiles reais `(x, y, width, height)` para arquivos `iDIM`; entrelaçamento continua sendo uma limitação de design permanente)
 
 ---
 
@@ -356,7 +359,8 @@ Contribuições são bem-vindas! Áreas com potencial:
 | **v1.6.3** | **CI: workflow noturno de fuzzing** — novo `.github/workflows/fuzz.yml` roda `decode_fuzz`/`chunk_roundtrip_fuzz` por uma hora completa todas as noites (mais sob demanda via `workflow_dispatch`), separado do teste-fumaça de 60s por push já existente no `ci.yml` | ✅ Completo |
 | **v1.7** | **`PaletteAlgorithm::KMeans`**: novo algoritmo de paleta indexada implementando o algoritmo de Lloyd (inicialização determinística via median-cut, sem dependência de RNG), tipicamente o menor erro quadrático médio entre os quatro algoritmos ao custo computacional mais alto — `--palette-algorithm kmeans` | ✅ Completo |
 | **v1.8** | **Tone-mapping inverso no encode (síntese SDR→HDR)**: `EncodeOptions::inverse_tonemap`/`--inverse-tonemap reinhard` opt-in sintetiza dados HDR float a partir de entrada SDR (só Reinhard, sem inversa em forma fechada para Filmic); requer `sample_format=float` + `chdr_transfer` linear + RGBA | ✅ Completo |
-| **Futuro** | Validação real em hardware ARM físico, compressores adicionais, seleção de operador de tone-mapping via CLI para PQ/HLG/sRGB e Filmic no encode | 🔮 Planejado |
+| **v1.9** | **Suporte de `Decoder<R>::next_tile()` a tiling 2D (`iDIM`)**: gera um `Tile` por `IDAT` com sua posição real `(x, y, width, height)` na grade de tiles (row-major ou Z-order, incluindo tiles parciais de borda) em vez de sempre falhar para arquivos `iDIM`; entrelaçamento (Adam7/par-ímpar) continua sendo uma limitação de design permanente e documentada do `next_tile()` | ✅ Completo |
+| **Futuro** | Validação real em hardware ARM físico, compressores adicionais, seleção de operador de tone-mapping via CLI para PQ/HLG/sRGB e Filmic no encode, suporte do `Encoder<W>` a auto_dictionary/indexado/entrelaçamento | 🔮 Planejado |
 
 ---
 
@@ -388,6 +392,6 @@ Arquitetura, especificação, implementação de referência em Rust (v1.1)
 
 ---
 
-**Última atualização**: 2026-09-03 (v1.8: tone-mapping inverso no encode — `EncodeOptions::inverse_tonemap`, `--inverse-tonemap reinhard`, síntese SDR→HDR; v1.7: `PaletteAlgorithm::KMeans` — quantização de paleta k-means determinística, `--palette-algorithm kmeans`; v1.6.3: workflow noturno de fuzzing no CI — `.github/workflows/fuzz.yml`; v1.6.2: rastreamento real de `DecodeResult::compression_stats` + `cafe-decode` ganha `--show-stats`/`--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict`; v1.6.1: `cafe-encode` ganha as flags `--icc-profile-file`/`--xmp-file`; v1.6: encoder em streaming — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, contraparte simétrica do `Decoder<R: Read>` da v1.5)  
-**Cobertura de testes**: 328 testes de lib + 13 suítes de teste de integração (roundtrip, encoder em streaming, SIMD, regressão de compressão, regressão de dicionário, algoritmo de paleta, benchmarks de tile_rows, etc.)  
+**Última atualização**: 2026-09-04 (v1.9: decodificação em streaming com tiling 2D — `Decoder<R>::next_tile()` agora suporta arquivos `iDIM`, transmitindo tiles reais `(x, y, width, height)` em vez de falhar; entrelaçamento continua sendo uma limitação documentada permanente; v1.8: tone-mapping inverso no encode — `EncodeOptions::inverse_tonemap`, `--inverse-tonemap reinhard`, síntese SDR→HDR; v1.7: `PaletteAlgorithm::KMeans` — quantização de paleta k-means determinística, `--palette-algorithm kmeans`; v1.6.3: workflow noturno de fuzzing no CI — `.github/workflows/fuzz.yml`; v1.6.2: rastreamento real de `DecodeResult::compression_stats` + `cafe-decode` ganha `--show-stats`/`--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict`; v1.6.1: `cafe-encode` ganha as flags `--icc-profile-file`/`--xmp-file`; v1.6: encoder em streaming — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, contraparte simétrica do `Decoder<R: Read>` da v1.5)  
+**Cobertura de testes**: 332 testes de lib + 13 suítes de teste de integração (roundtrip, encoder em streaming, SIMD, regressão de compressão, regressão de dicionário, algoritmo de paleta, benchmarks de tile_rows, etc.)  
 **Próxima revisão de segurança**: 2027-08-04

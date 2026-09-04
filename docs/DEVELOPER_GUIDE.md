@@ -388,11 +388,15 @@ impl<R: Read> Decoder<R> {
 
 **Call order**: `read_info()` exactly once, then `next_tile()` in a loop
 until `Ok(None)`, then optionally `finish()` for ancillary metadata.
-`next_tile()` returns `UnsupportedFeature` for files with `iDIM` (2D tiling)
-or Adam7/even-odd interlacing — check `DecodeInfo::supports_streaming_tiles`
-first and fall back to `decode`/`decode_bytes` for those. See
-`examples/streaming_decode.rs` for a complete runnable example, and
-`AGENTS.md`'s "Streaming Decoder" section for full field-by-field detail.
+`next_tile()` supports `iDIM` (2D tiling, since v1.9 — yields tiles at their
+real `(x, y)` grid position) as well as plain row-strip files, but still
+returns `UnsupportedFeature` for Adam7/even-odd interlacing (a permanent
+design limitation — an interlace pass is not a spatial rectangle) and for
+`iDIM` combined with `COLOR_TYPE_INDEXED` or `bit_depth < 8` — check
+`DecodeInfo::supports_streaming_tiles` first and fall back to
+`decode`/`decode_bytes` for those. See `examples/streaming_decode.rs` for a
+complete runnable example, and `AGENTS.md`'s "Streaming Decoder" section for
+full field-by-field detail.
 
 #### Streaming Encoder (`Encoder<W: Write>` / `Encoder<W: Write + Seek>`, v1.6+)
 
@@ -830,7 +834,8 @@ Before submitting a PR:
 | **v1.6.3** | **CI: nightly fuzz workflow** — new `.github/workflows/fuzz.yml` runs `decode_fuzz`/`chunk_roundtrip_fuzz` for a full hour nightly (plus on-demand via `workflow_dispatch`), separate from `ci.yml`'s existing 60s-per-push smoke test job | ✅ |
 | **v1.7** | **`PaletteAlgorithm::KMeans`**: new indexed-palette quantization algorithm implementing Lloyd's algorithm, deterministically initialized from `MedianCut`'s output (no RNG dependency), typically the lowest mean-squared-error palette of the four algorithms at the highest computational cost — `--palette-algorithm kmeans` | ✅ |
 | **v1.8** | **Inverse tone-mapping on encode (SDR→HDR synthesis)**: `ToneMapOperator::apply_inverse` (Reinhard only), `apply_inverse_tone_mapping_to_image`, opt-in `EncodeOptions::inverse_tonemap: Option<ToneMapOperator>` field (default `None`, non-breaking), `--inverse-tonemap reinhard` CLI flag; requires `sample_format=1` + `chdr_transfer=0` (linear) + RGBA color type | ✅ |
-| Future | Real hardware validation on physical ARM devices, additional compressors, tone-mapping operator selection via CLI for PQ/HLG/sRGB transfer functions and Filmic on encode | ⏳ |
+| **v1.9** | **`Decoder<R>::next_tile()` support for 2D tiling (`iDIM`)**: yields one `Tile` per `IDAT` with its real `(x, y, width, height)` grid position (row-major or Z-order, partial edge tiles included) instead of unconditionally erroring for `iDIM` files; `decode_idim_tile_raw` shared between the whole-image and streaming paths; interlace (Adam7/even-odd) remains a permanent, documented design limitation of `next_tile()` | ✅ |
+| Future | Real hardware validation on physical ARM devices, additional compressors, tone-mapping operator selection via CLI for PQ/HLG/sRGB transfer functions and Filmic on encode, `Encoder<W>` support for auto_dictionary/indexed/interlace | ⏳ |
 
 ---
 
@@ -885,7 +890,7 @@ cargo build --release --no-default-features
 
 1. **SIMD for sub-byte packing** — Extend AVX2/NEON to the scalar-only parts of `pack/unpack_samples_row` (partially vectorized as of v1.4)
 2. **Real ARM hardware validation on physical devices** — QEMU emulation (v1.4.1) already caught and fixed one real NEON bug; running the suite on actual ARM64 hardware (Raspberry Pi, mobile, Apple Silicon) would add confidence beyond emulation (e.g. timing-sensitive or alignment-sensitive behavior QEMU might not reproduce exactly)
-3. **Advanced 2D tiling** — iDIM with per-tile IDAT already implemented; evolve with preview/progressive streaming
+3. **Advanced 2D tiling** — iDIM with per-tile IDAT already implemented, including streaming decode via `Decoder<R>::next_tile()` (v1.9); evolve with preview/progressive streaming, and `Encoder<W>` write-side support (currently row-strip only, no iDIM)
 4. **Optimized interlace** — Adam7 and even/odd already supported; optimize progressiveness and SIMD of passes
 5. ~~**Optimized indexed palette**~~ — `NearestNeighbor`, `MedianCut`, `NearestNeighborWeighted` (redmean distance, v1.5), and `KMeans` (Lloyd's algorithm, v1.7) now cover greedy incremental, median-cut bucket-splitting, and iterative-clustering strategies — closed as of v1.7
 6. **Automatic ZSTD dictionary** — Train dictionary for small images (non-regression guarantee already added in v1.5)
@@ -929,4 +934,4 @@ cargo doc --open
 
 ---
 
-**Last updated:** September 3, 2026 (v1.8: inverse tone-mapping on encode — `EncodeOptions::inverse_tonemap`, `--inverse-tonemap reinhard`, SDR→HDR synthesis; v1.7: `PaletteAlgorithm::KMeans` — deterministic k-means palette quantization, `--palette-algorithm kmeans`; v1.6.3: nightly fuzz CI workflow — `.github/workflows/fuzz.yml`; v1.6.2: real `compression_stats` tracking + `cafe-decode` gains `--show-stats`/`--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict` flags; v1.6.1: `cafe-encode` gains `--icc-profile-file`/`--xmp-file` CLI flags; v1.6: streaming encoder — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`) | **Project version:** v1.8.0
+**Last updated:** September 4, 2026 (v1.9: `Decoder<R>::next_tile()` streaming support for 2D tiling — `iDIM` files now stream real `(x, y, width, height)` tiles instead of erroring, interlace remains a permanent documented limitation; v1.8: inverse tone-mapping on encode — `EncodeOptions::inverse_tonemap`, `--inverse-tonemap reinhard`, SDR→HDR synthesis; v1.7: `PaletteAlgorithm::KMeans` — deterministic k-means palette quantization, `--palette-algorithm kmeans`; v1.6.3: nightly fuzz CI workflow — `.github/workflows/fuzz.yml`; v1.6.2: real `compression_stats` tracking + `cafe-decode` gains `--show-stats`/`--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict` flags; v1.6.1: `cafe-encode` gains `--icc-profile-file`/`--xmp-file` CLI flags; v1.6: streaming encoder — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`) | **Project version:** v1.9.0
