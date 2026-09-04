@@ -223,9 +223,26 @@ let _file = encoder.finish_exact()?; // exact compression_method (requires Seek)
 // or encoder.finish()? for Write-only destinations (conservative compression_method)
 ```
 
-See `examples/streaming_encode.rs` for a complete runnable example. `Encoder<W>`
-v1 supports row-strip tiling and direct color types only (no indexed palette,
-2D tiling, or interlace — see `EncoderOptions`'s doc comment).
+`Encoder<W>` also supports 2D tiling (`iDIM`, since v1.10) as an alternative to
+row-strip submission — opt in via `EncoderOptions::idim: Some((tile_width, tile_height, scan_order))`
+and call `add_idim_tile()` (mutually exclusive with `add_tile()`) once per tile
+in the grid, in `iDim::tile_order()`'s sequence (row-major or Z-order):
+
+```rust
+let opts = EncoderOptions { idim: Some((tile_w, tile_h, 0)), ..Default::default() }; // 0=row-major, 1=Z-order
+let mut encoder = Encoder::new(file, width, height, &opts)?; // writes IHDR + iDIM immediately
+
+for tile in tiles_in_grid_order {
+    encoder.add_idim_tile(&tile)?; // exact tile_w * tile_h * 4 bytes RGBA per call (narrower/shorter at edges)
+}
+
+let _file = encoder.finish_exact()?;
+```
+
+See `examples/streaming_encode.rs` for a complete runnable example (its 4th CLI
+argument demonstrates `add_idim_tile()`). `Encoder<W>` supports row-strip tiling,
+2D tiling (`iDIM`), and direct color types only — no indexed palette or interlace
+(permanent design limitations — see `EncoderOptions`'s doc comment).
 
 ### CLI
 
@@ -332,6 +349,7 @@ Contributions welcome! High-potential areas:
 - [x] **k-means palette quantization** — *complete in v1.7* (`PaletteAlgorithm::KMeans`, deterministic Lloyd's algorithm)
 - [x] **Inverse tone-mapping on encode (SDR→HDR)** — *complete in v1.8* (`EncodeOptions::inverse_tonemap`, `--inverse-tonemap reinhard`)
 - [x] **Streaming decode of 2D tiling (`iDIM`)** — *complete in v1.9* (`Decoder<R>::next_tile()` now streams real `(x, y, width, height)` tiles for `iDIM` files; interlace remains a permanent design limitation)
+- [x] **Streaming encode of 2D tiling (`iDIM`)** — *complete in v1.10* (`Encoder<W>::add_idim_tile()`, symmetric counterpart to v1.9's streaming decode; row-major and Z-order both supported; `auto_dictionary`/indexed/interlace remain permanent `Encoder<W>` limitations)
 
 ---
 
@@ -358,6 +376,7 @@ Contributions welcome! High-potential areas:
 | **v1.9.1** | **Documentation-only**: `Encoder<W>`'s missing `auto_dictionary`/indexed/interlace support reclassified from "v1 gap" to permanent, investigated design limitation — no code or behavior change | ✅ Complete |
 | **v1.9.2** | **CI: ARM64 native test job** — new `arm64-native-test` job runs the full test suite natively on `ubuntu-24.04-arm` (real Arm server CPUs, not x86_64-with-emulation), closing the gap between the pre-existing cross-compile-only check and v1.4.1's one-off manual QEMU validation | ✅ Complete |
 | **v1.9.3** | **Documentation-only**: `compression_method` spec semantics clarified — new normative note states `bit0` is a required-lower-bound capability declaration, never a per-chunk record (that's `Flag`'s job); new decoder conformance note documents the reference decoder's non-cross-validating behavior | ✅ Complete |
+| **v1.10** | **`Encoder<W>::add_idim_tile()`** — 2D tiling (`iDIM`) support for the streaming encoder, symmetric counterpart to v1.9's streaming decode; corrects v1.9.1's classification of `iDIM` as a permanent `Encoder<W>` limitation (only geometry is needed upfront, not pixel data); new `EncoderOptions::idim: Option<(u16, u16, u8)>` field (default `None`, non-breaking), row-major and Z-order both supported, `add_tile()`/`add_idim_tile()` mutually exclusive | ✅ Complete |
 | **Future** | Real hardware validation on physical *end-user* ARM devices (Raspberry Pi, mobile, Apple Silicon), additional compressors, tone-mapping operator selection via CLI for PQ/HLG/sRGB and Filmic on encode | 🔮 Planned |
 
 ---
@@ -390,6 +409,6 @@ Architecture, specification, Rust reference implementation (v1.1)
 
 ---
 
-**Last updated**: 2026-09-04 (v1.9.3: `compression_method` spec semantics clarified — normative "required lower bound" definition and decoder conformance note added to section 4.1, documentation only, no code change; v1.9.2: CI gains an `arm64-native-test` job running the full test suite natively on `ubuntu-24.04-arm` (real ARM64 silicon, not emulated); v1.9.1: `Encoder<W>`'s `auto_dictionary`/indexed/interlace limitations reclassified from "v1 gap" to permanent, investigated design limitation — documentation only, no code change; v1.9: streaming decode of 2D tiling — `Decoder<R>::next_tile()` now supports `iDIM` files, streaming real `(x, y, width, height)` tiles instead of erroring; interlace remains a permanent documented limitation; v1.8: inverse tone-mapping on encode — `EncodeOptions::inverse_tonemap`, `--inverse-tonemap reinhard`, SDR→HDR synthesis; v1.7: `PaletteAlgorithm::KMeans` — deterministic k-means palette quantization, `--palette-algorithm kmeans`; v1.6.3: nightly fuzz CI workflow — `.github/workflows/fuzz.yml`; v1.6.2: real `DecodeResult::compression_stats` tracking + `cafe-decode` gains `--show-stats`/`--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict`; v1.6.1: `cafe-encode` gains `--icc-profile-file`/`--xmp-file` CLI flags; v1.6: streaming encoder — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`)  
-**Test Coverage**: 332 lib tests + 13 integration test suites (roundtrip, streaming encode, SIMD, compression regression, dictionary regression, palette algorithm, tile_rows benchmarks, etc.)  
+**Last updated**: 2026-09-04 (v1.10: streaming encode of 2D tiling — `Encoder<W>::add_idim_tile()` now supports `iDIM` files (row-major and Z-order), symmetric counterpart to v1.9's streaming decode; `EncoderOptions::idim` opt-in field, `add_tile()`/`add_idim_tile()` mutually exclusive; v1.9.3: `compression_method` spec semantics clarified — normative "required lower bound" definition and decoder conformance note added to section 4.1, documentation only, no code change; v1.9.2: CI gains an `arm64-native-test` job running the full test suite natively on `ubuntu-24.04-arm` (real ARM64 silicon, not emulated); v1.9.1: `Encoder<W>`'s `auto_dictionary`/indexed/interlace limitations reclassified from "v1 gap" to permanent, investigated design limitation — documentation only, no code change; v1.9: streaming decode of 2D tiling — `Decoder<R>::next_tile()` now supports `iDIM` files, streaming real `(x, y, width, height)` tiles instead of erroring; interlace remains a permanent documented limitation; v1.8: inverse tone-mapping on encode — `EncodeOptions::inverse_tonemap`, `--inverse-tonemap reinhard`, SDR→HDR synthesis; v1.7: `PaletteAlgorithm::KMeans` — deterministic k-means palette quantization, `--palette-algorithm kmeans`; v1.6.3: nightly fuzz CI workflow — `.github/workflows/fuzz.yml`; v1.6.2: real `DecodeResult::compression_stats` tracking + `cafe-decode` gains `--show-stats`/`--save-exif`/`--save-icc-profile`/`--save-xmp`/`--save-zstd-dict`; v1.6.1: `cafe-encode` gains `--icc-profile-file`/`--xmp-file` CLI flags; v1.6: streaming encoder — `Encoder<W: Write>` / `Encoder<W: Write + Seek>`, symmetric counterpart to the v1.5 `Decoder<R: Read>`)  
+**Test Coverage**: 332 lib tests + 13 integration test suites (roundtrip, streaming encode with 30 tests including 2D tiling, SIMD, compression regression, dictionary regression, palette algorithm, tile_rows benchmarks, etc.)  
 **Next security audit**: 2027-08-04

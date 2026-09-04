@@ -473,3 +473,297 @@ fn test_streaming_encoder_matches_whole_file_encode_byte_for_byte() {
     let _ = std::fs::remove_file(&input_png);
     let _ = std::fs::remove_file(&output_cafe);
 }
+
+/// Extracts a `tile_w * tile_h * 4`-byte RGBA sub-buffer for tile `(tx, ty)`
+/// out of a full-image RGBA buffer, matching `add_idim_tile()`'s expected
+/// per-tile input shape (used by both the row-major and Z-order tests
+/// below, and by the whole-image-vs-streaming comparison test).
+fn extract_idim_tile(
+    pixels: &[u8],
+    img_width: u32,
+    tx: u16,
+    ty: u16,
+    tile_w: u32,
+    tile_h: u32,
+    idim: &iDim,
+) -> Vec<u8> {
+    let x0 = (tx as u32) * (idim.tile_width as u32);
+    let y0 = (ty as u32) * (idim.tile_height as u32);
+    let mut out = Vec::with_capacity((tile_w * tile_h * 4) as usize);
+    for row in 0..tile_h {
+        let src_y = y0 + row;
+        let start = ((src_y * img_width + x0) * 4) as usize;
+        let end = start + (tile_w * 4) as usize;
+        out.extend_from_slice(&pixels[start..end]);
+    }
+    out
+}
+
+/// Feeds `pixels` into a fresh iDIM-mode `Encoder<Cursor<Vec<u8>>>`, one
+/// `add_idim_tile()` call per tile in `idim.tile_order()`'s sequence,
+/// returning the finished byte buffer.
+fn encode_via_streaming_encoder_idim(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    opts: &EncoderOptions,
+    use_finish_exact: bool,
+) -> Vec<u8> {
+    let (tile_width, tile_height, scan_order) =
+        opts.idim.expect("opts.idim must be Some for this helper");
+    let idim = iDim::new(tile_width, tile_height, width, height, scan_order);
+    let order = idim.tile_order().expect("tile_order failed");
+
+    let mut encoder =
+        Encoder::new(Cursor::new(Vec::new()), width, height, opts).expect("Encoder::new failed");
+
+    for &(tx, ty) in &order {
+        let (tile_w, tile_h) = idim.tile_dimensions(tx, ty, width, height);
+        let tile_bytes = extract_idim_tile(pixels, width, tx, ty, tile_w, tile_h, &idim);
+        encoder
+            .add_idim_tile(&tile_bytes)
+            .expect("add_idim_tile failed");
+    }
+
+    let cursor = if use_finish_exact {
+        encoder.finish_exact().expect("finish_exact failed")
+    } else {
+        encoder.finish().expect("finish failed")
+    };
+    cursor.into_inner()
+}
+
+/// Round-trips a non-tile-aligned image (33x23 with 8x8 tiles, so the last
+/// column/row of tiles is a partial edge tile) through the streaming
+/// encoder's `add_idim_tile()` path, row-major scan order, comparing
+/// against `decode_bytes()`'s reassembled pixels.
+#[test]
+fn test_streaming_encoder_idim_row_major_roundtrip() {
+    let width = 33u32;
+    let height = 23u32;
+    let pixels = generate_rgba(width, height);
+
+    let opts = EncoderOptions {
+        level: 6,
+        use_filter: true,
+        target_color_type: constants::COLOR_TYPE_RGBA,
+        idim: Some((8, 8, 0)),
+        ..Default::default()
+    };
+
+    let bytes = encode_via_streaming_encoder_idim(&pixels, width, height, &opts, false);
+    let (decoded_pixels, result) = decode_bytes(&bytes).expect("decode_bytes failed");
+    assert_eq!(result.width, width);
+    assert_eq!(result.height, height);
+    assert_eq!(decoded_pixels, pixels, "pixel mismatch for iDIM row-major");
+}
+
+/// Same as above but with Z-order (Morton) scan order (`scan_order = 1`).
+#[test]
+fn test_streaming_encoder_idim_zorder_roundtrip() {
+    let width = 33u32;
+    let height = 23u32;
+    let pixels = generate_rgba(width, height);
+
+    let opts = EncoderOptions {
+        level: 6,
+        use_filter: true,
+        target_color_type: constants::COLOR_TYPE_RGBA,
+        idim: Some((8, 8, 1)),
+        ..Default::default()
+    };
+
+    let bytes = encode_via_streaming_encoder_idim(&pixels, width, height, &opts, true);
+    let (decoded_pixels, result) = decode_bytes(&bytes).expect("decode_bytes failed");
+    assert_eq!(result.width, width);
+    assert_eq!(result.height, height);
+    assert_eq!(decoded_pixels, pixels, "pixel mismatch for iDIM Z-order");
+}
+
+/// Compares the streaming iDIM encoder's `finish_exact()` output
+/// byte-for-byte against `encode()`'s whole-file `EncodeOptions::idim` path
+/// for the exact same pixels/options.
+#[test]
+fn test_streaming_encoder_idim_matches_whole_file_encode_byte_for_byte() {
+    let temp_dir = std::env::temp_dir().join("cafe_streaming_encode_idim_tests");
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let input_png = temp_dir.join("streaming_idim_vs_whole_input.png");
+    let output_cafe = temp_dir.join("streaming_idim_vs_whole_output.cafe");
+
+    let width = 40u32;
+    let height = 30u32;
+    let pixels = generate_rgba(width, height);
+
+    let image_buffer = image::RgbaImage::from_raw(width, height, pixels.clone()).unwrap();
+    image_buffer.save(&input_png).expect("save png failed");
+
+    let whole_file_opts = EncodeOptions {
+        use_filter: true,
+        level: 6,
+        adaptive_analysis: false,
+        target_color_type: constants::COLOR_TYPE_RGBA,
+        idim: Some(iDim::new(10, 10, width, height, 0)),
+        ..Default::default()
+    };
+    encode(
+        input_png.to_str().unwrap(),
+        output_cafe.to_str().unwrap(),
+        &whole_file_opts,
+    )
+    .expect("encode failed");
+    let whole_file_bytes = std::fs::read(&output_cafe).expect("read output failed");
+
+    let streaming_opts = EncoderOptions {
+        level: 6,
+        use_filter: true,
+        target_color_type: constants::COLOR_TYPE_RGBA,
+        idim: Some((10, 10, 0)),
+        ..Default::default()
+    };
+    let streaming_bytes =
+        encode_via_streaming_encoder_idim(&pixels, width, height, &streaming_opts, true);
+
+    assert_eq!(
+        streaming_bytes, whole_file_bytes,
+        "Encoder<W>::add_idim_tile()+finish_exact() output must match encode()'s whole-file \
+         iDIM output byte-for-byte for the same pixels/options"
+    );
+
+    let _ = std::fs::remove_file(&input_png);
+    let _ = std::fs::remove_file(&output_cafe);
+}
+
+#[test]
+fn test_streaming_encoder_add_tile_rejects_idim_mode() {
+    let opts = EncoderOptions {
+        idim: Some((4, 4, 0)),
+        ..Default::default()
+    };
+    let mut encoder =
+        Encoder::new(Cursor::new(Vec::new()), 8, 8, &opts).expect("Encoder::new failed");
+    let tile = vec![0u8; 8 * 4 * 4];
+    let err = encoder.add_tile(&tile).unwrap_err();
+    assert!(matches!(err, CafeError::UnsupportedFeature(_)));
+}
+
+#[test]
+fn test_streaming_encoder_add_idim_tile_rejects_row_strip_mode() {
+    let opts = EncoderOptions::default();
+    let mut encoder =
+        Encoder::new(Cursor::new(Vec::new()), 8, 8, &opts).expect("Encoder::new failed");
+    let tile = vec![0u8; 4 * 4 * 4];
+    let err = encoder.add_idim_tile(&tile).unwrap_err();
+    assert!(matches!(err, CafeError::UnsupportedFeature(_)));
+}
+
+#[test]
+fn test_streaming_encoder_add_idim_tile_rejects_wrong_size_buffer() {
+    let opts = EncoderOptions {
+        idim: Some((4, 4, 0)),
+        ..Default::default()
+    };
+    let mut encoder =
+        Encoder::new(Cursor::new(Vec::new()), 8, 8, &opts).expect("Encoder::new failed");
+    // First tile is 4x4, so 4*4*4=64 bytes expected; supply 60 instead.
+    let bad_tile = vec![0u8; 60];
+    let err = encoder.add_idim_tile(&bad_tile).unwrap_err();
+    assert!(matches!(err, CafeError::UnsupportedFeature(_)));
+}
+
+#[test]
+fn test_streaming_encoder_add_idim_tile_rejects_extra_tile_after_grid_complete() {
+    let opts = EncoderOptions {
+        idim: Some((4, 4, 0)),
+        ..Default::default()
+    };
+    let mut encoder =
+        Encoder::new(Cursor::new(Vec::new()), 4, 4, &opts).expect("Encoder::new failed");
+    // 4x4 image with 4x4 tiles = exactly 1 tile in the grid.
+    let tile = vec![0u8; 4 * 4 * 4];
+    encoder
+        .add_idim_tile(&tile)
+        .expect("first add_idim_tile failed");
+    let err = encoder.add_idim_tile(&tile).unwrap_err();
+    assert!(matches!(err, CafeError::UnsupportedFeature(_)));
+}
+
+#[test]
+fn test_streaming_encoder_idim_finish_rejects_incomplete_submission() {
+    let opts = EncoderOptions {
+        idim: Some((4, 4, 0)),
+        ..Default::default()
+    };
+    let mut encoder =
+        Encoder::new(Cursor::new(Vec::new()), 8, 8, &opts).expect("Encoder::new failed");
+    // 8x8 image with 4x4 tiles = 4 tiles in the grid; submit only 1.
+    let tile = vec![0u8; 4 * 4 * 4];
+    encoder.add_idim_tile(&tile).expect("add_idim_tile failed");
+
+    let err = encoder.finish().unwrap_err();
+    assert!(matches!(err, CafeError::UnsupportedFeature(_)));
+}
+
+#[test]
+fn test_streaming_encoder_new_rejects_idim_invalid_scan_order() {
+    let opts = EncoderOptions {
+        idim: Some((4, 4, 2)),
+        ..Default::default()
+    };
+    match Encoder::new(Cursor::new(Vec::new()), 8, 8, &opts) {
+        Ok(_) => panic!("expected UnsupportedFeature error for invalid scan_order"),
+        Err(err) => assert!(matches!(err, CafeError::UnsupportedFeature(_))),
+    }
+}
+
+#[test]
+fn test_streaming_encoder_new_rejects_idim_zero_tile_dims() {
+    let opts = EncoderOptions {
+        idim: Some((0, 4, 0)),
+        ..Default::default()
+    };
+    match Encoder::new(Cursor::new(Vec::new()), 8, 8, &opts) {
+        Ok(_) => panic!("expected UnsupportedFeature error for zero tile_width"),
+        Err(err) => assert!(matches!(err, CafeError::UnsupportedFeature(_))),
+    }
+}
+
+#[test]
+fn test_streaming_encoder_new_rejects_idim_with_bit_depth_below_8() {
+    let opts = EncoderOptions {
+        idim: Some((4, 4, 0)),
+        target_bit_depth: Some(4),
+        target_color_type: constants::COLOR_TYPE_GRAY,
+        ..Default::default()
+    };
+    match Encoder::new(Cursor::new(Vec::new()), 8, 8, &opts) {
+        Ok(_) => panic!("expected UnsupportedFeature error for bit_depth < 8 with iDIM"),
+        Err(err) => assert!(matches!(err, CafeError::UnsupportedFeature(_))),
+    }
+}
+
+#[test]
+fn test_streaming_encoder_new_rejects_idim_with_filter_per_row() {
+    let opts = EncoderOptions {
+        idim: Some((4, 4, 0)),
+        use_filter: true,
+        use_filter_per_row: true,
+        ..Default::default()
+    };
+    match Encoder::new(Cursor::new(Vec::new()), 8, 8, &opts) {
+        Ok(_) => panic!("expected UnsupportedFeature error for iDIM + use_filter_per_row"),
+        Err(err) => assert!(matches!(err, CafeError::UnsupportedFeature(_))),
+    }
+}
+
+#[test]
+fn test_streaming_encoder_new_rejects_idim_tile_count_exceeding_max() {
+    // 1x1 tiles over an image large enough that tiles_x * tiles_y > MAX_TILE_COUNT.
+    let opts = EncoderOptions {
+        idim: Some((1, 1, 0)),
+        ..Default::default()
+    };
+    match Encoder::new(Cursor::new(Vec::new()), 2000, 2000, &opts) {
+        Ok(_) => panic!("expected UnsupportedFeature error for excessive tile count"),
+        Err(err) => assert!(matches!(err, CafeError::UnsupportedFeature(_))),
+    }
+}

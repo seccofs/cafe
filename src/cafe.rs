@@ -2905,18 +2905,26 @@ impl<R: Read> Decoder<R> {
 /// supports seeking.
 ///
 /// # Permanent limitations (see `EncoderOptions`'s doc comment for the full analysis)
-/// No `auto_dictionary`, no `iDIM` (2D tiling), no interlace (Adam7/
-/// even-odd), no indexed palette (`COLOR_TYPE_INDEXED`). These were each
-/// investigated (not merely deferred) and found to require either
-/// buffering the whole image first (defeating this API's purpose) or a
-/// fundamentally different two-pass API shape — see `EncoderOptions`'s doc
-/// comment for the per-item reasoning. Only row-strip tiling is supported,
-/// mirroring the same limitation `Decoder<R>` has for interlace (though
-/// `Decoder<R>` did go on to gain real streaming `iDIM` support in v1.9 —
-/// the decode direction doesn't share the same "palette/dictionary must be
-/// known before the first chunk" ordering constraint the encode direction
-/// does, since a decoder reads `PLTE`/`zDIC` before any `IDAT` rather than
-/// having to produce them from data it hasn't seen yet).
+/// No `auto_dictionary`, no interlace (Adam7/even-odd), no indexed palette
+/// (`COLOR_TYPE_INDEXED`). These were each investigated (not merely
+/// deferred) and found to require either buffering the whole image first
+/// (defeating this API's purpose) or a fundamentally different two-pass API
+/// shape — see `EncoderOptions`'s doc comment for the per-item reasoning.
+/// This mirrors the same limitation `Decoder<R>` has for interlace (though
+/// `Decoder<R>` did go on to gain real streaming `iDIM` support in v1.9,
+/// and `Encoder<W>` symmetrically gained it in v1.10 — see
+/// `add_idim_tile()` below — since a decoder reads `PLTE`/`zDIC` before any
+/// `IDAT` rather than having to produce them from data it hasn't seen yet,
+/// unlike palette/dictionary training, which do require it).
+///
+/// # 2D tiling (`iDIM`, v1.10+)
+/// When `EncoderOptions::idim` is `Some((tile_width, tile_height,
+/// scan_order))`, `new()` writes the `iDIM` chunk immediately after `IHDR`
+/// and tiles must be submitted one full rectangle at a time via
+/// `add_idim_tile()` (in `iDim::tile_order()`'s sequence) instead of
+/// `add_tile()` — calling the wrong method for the configured mode returns
+/// `UnsupportedFeature`. See `add_idim_tile()`'s doc comment for the full
+/// contract.
 pub struct Encoder<W: Write> {
     writer: W,
     width: u32,
@@ -2933,10 +2941,27 @@ pub struct Encoder<W: Write> {
     use_filter_per_row: bool,
     filter_heuristic: FilterHeuristic,
     zstd_dictionary: Option<Vec<u8>>,
+    /// `Some` when `EncoderOptions::idim` was set in `new()` — selects 2D
+    /// tiling mode (`add_idim_tile()` only, `add_tile()` rejected) instead
+    /// of the default row-strip mode (`add_tile()` only). Precomputed once
+    /// in `new()` (both the `iDim` geometry and its `tile_order()`
+    /// sequence), mirroring `DecodeState::idim_tile_order`'s decode-side
+    /// rationale: recomputing per-tile would be wasted work at best and a
+    /// correctness hazard at worst if it could ever disagree with itself
+    /// between calls.
+    idim: Option<iDim>,
+    /// Precomputed `idim.tile_order()` (empty when `idim` is `None`).
+    /// `add_idim_tile()` indexes into this with `idim_next_tile_idx` to
+    /// determine which `(tx, ty)` grid cell the next call fills.
+    idim_tile_order: Vec<(u16, u16)>,
+    /// Index into `idim_tile_order` of the next tile `add_idim_tile()` will
+    /// write. Unused (stays `0`) in row-strip mode.
+    idim_next_tile_idx: usize,
     /// Row index (within the full image) of the next row that has not yet
     /// been submitted via `add_tile()`. Used to reject tiles that would
     /// overrun `height`, and to compute each tile's height from the number
-    /// of rows in the caller-supplied buffer.
+    /// of rows in the caller-supplied buffer. Unused (stays `0`) in `iDIM`
+    /// mode — see `idim_next_tile_idx` instead.
     rows_written: u32,
     /// Tracks whether any chunk written so far (ancillary or `IDAT`) used
     /// ZSTD (`Flag = 0x01`). Used only by `finish_exact()` (`W: Write +
@@ -3055,6 +3080,45 @@ impl<W: Write> Encoder<W> {
             )));
         }
 
+        // --- iDIM validation (2D tiling, v1.10+) ---
+        // Mirrors encode()'s own iDIM validation (bit_depth >= 8 so tile
+        // columns are byte-aligned) plus the use_filter_per_row rejection —
+        // both checked upfront here too, before any byte is written, for
+        // the same reasons documented at encode()'s own call sites.
+        let idim = match opts.idim {
+            Some((tile_width, tile_height, scan_order)) => {
+                if bit_depth < 8 {
+                    return Err(CafeError::UnsupportedFeature(
+                        "iDIM (2D tiling) requires bit_depth >= 8 in Encoder::new()".into(),
+                    ));
+                }
+                if opts.use_filter && opts.use_filter_per_row {
+                    return Err(CafeError::UnsupportedFeature(
+                        "use_filter_per_row is incompatible with iDIM (2D tiling)".into(),
+                    ));
+                }
+                if tile_width == 0 || tile_height == 0 {
+                    return Err(CafeError::UnsupportedFeature(
+                        "iDIM: tile_width and tile_height must be nonzero".into(),
+                    ));
+                }
+                if scan_order > 1 {
+                    return Err(CafeError::UnsupportedFeature(format!(
+                        "iDIM: invalid scan_order {scan_order} (supports only 0=row-major, 1=Z-order/Morton)"
+                    )));
+                }
+                let idim = iDim::new(tile_width, tile_height, width, height, scan_order);
+                let tile_count = (idim.tiles_x as u64) * (idim.tiles_y as u64);
+                if tile_count > MAX_TILE_COUNT {
+                    return Err(CafeError::UnsupportedFeature(format!(
+                        "iDIM: tiles_x * tiles_y = {tile_count} exceeds maximum allowed tile count ({MAX_TILE_COUNT})"
+                    )));
+                }
+                Some(idim)
+            }
+            None => None,
+        };
+
         // --- Signature + IHDR ---
         // compression_method: set the ZSTD bit unconditionally and upfront
         // (conservative — see struct doc comment) since this Write-only
@@ -3079,6 +3143,18 @@ impl<W: Write> Encoder<W> {
         writer.write_all(&ihdr_chunk)?;
 
         let mut uses_zstd = false;
+
+        // --- iDIM (optional, 2D tiling, section 4.2) ---
+        // Must appear immediately after IHDR (section 9, mandatory order),
+        // same placement as encode()'s own append_idim_chunk_if_present.
+        let idim_tile_order = if let Some(idim) = &idim {
+            let chunk = write_idim_chunk(idim)?;
+            uses_zstd |= chunk_uses_zstd(&chunk);
+            writer.write_all(&chunk)?;
+            idim.tile_order()?
+        } else {
+            Vec::new()
+        };
 
         // --- cHDR (optional) ---
         if let Some(chdr) = &opts.chdr_metadata {
@@ -3122,6 +3198,9 @@ impl<W: Write> Encoder<W> {
             use_filter_per_row: opts.use_filter_per_row,
             filter_heuristic: opts.filter_heuristic,
             zstd_dictionary: opts.zstd_dictionary.clone(),
+            idim,
+            idim_tile_order,
+            idim_next_tile_idx: 0,
             rows_written: 0,
             uses_zstd,
             ihdr_type_flag_data,
@@ -3146,6 +3225,13 @@ impl<W: Write> Encoder<W> {
     /// - Any error from color conversion, filtering, compression, or
     ///   writing to the underlying `W`.
     pub fn add_tile(&mut self, rgba_tile: &[u8]) -> Result<()> {
+        if self.idim.is_some() {
+            return Err(CafeError::UnsupportedFeature(
+                "add_tile() called on an Encoder configured with EncoderOptions::idim — use \
+                 add_idim_tile() instead"
+                    .into(),
+            ));
+        }
         let row_bytes_rgba = (self.width as usize).checked_mul(4).ok_or_else(|| {
             CafeError::UnsupportedFeature("overflow computing RGBA row size".into())
         })?;
@@ -3225,17 +3311,149 @@ impl<W: Write> Encoder<W> {
         Ok(())
     }
 
-    /// Writes the `IEND` chunk and returns the underlying `writer`. Must be
-    /// called after all `height` rows have been submitted via `add_tile()`
-    /// — returns `UnsupportedFeature` otherwise (a truncated image would
-    /// otherwise be silently accepted as valid).
-    pub fn finish(mut self) -> Result<W> {
-        if self.rows_written != self.height {
+    /// Encodes one rectangular tile of RGBA pixels for 2D tiling (`iDIM`,
+    /// section 4.2) and writes the resulting `IDAT` chunk immediately. Only
+    /// valid on an `Encoder` created with `EncoderOptions::idim = Some(_)`
+    /// — returns `UnsupportedFeature` on a row-strip-mode `Encoder`
+    /// (use `add_tile()` instead).
+    ///
+    /// Must be called exactly once per tile in `iDim::tile_order()`'s
+    /// sequence (the same order `encode()`'s own iDIM path and
+    /// `Decoder<R>::next_tile()` use) — row-major (`scan_order = 0`) visits
+    /// tiles left-to-right then top-to-bottom; Z-order (`scan_order = 1`)
+    /// visits them by Morton code. `finish()`/`finish_exact()` require
+    /// every tile in the grid to have been submitted first. `rgba_tile`
+    /// must be exactly `tile_width * tile_height * 4` bytes for that
+    /// specific tile's position — edge tiles (last column/row, when
+    /// `width`/`height` are not exact multiples of the declared tile size)
+    /// are narrower/shorter per `iDim::tile_dimensions()`, mirroring
+    /// `decode_idim_tile_raw`'s decode-side handling of the same edge case.
+    ///
+    /// # Errors
+    /// - `UnsupportedFeature` if this `Encoder` was not configured with
+    ///   `EncoderOptions::idim`, if every tile in the grid has already been
+    ///   submitted, or if `rgba_tile.len()` does not match the expected
+    ///   size for the next tile's position.
+    /// - Any error from color conversion, filtering, compression, or
+    ///   writing to the underlying `W`.
+    pub fn add_idim_tile(&mut self, rgba_tile: &[u8]) -> Result<()> {
+        let idim = self.idim.as_ref().ok_or_else(|| {
+            CafeError::UnsupportedFeature(
+                "add_idim_tile() called on an Encoder not configured with EncoderOptions::idim \
+                 — use add_tile() instead"
+                    .into(),
+            )
+        })?;
+        let &(tx, ty) = self
+            .idim_tile_order
+            .get(self.idim_next_tile_idx)
+            .ok_or_else(|| {
+                CafeError::UnsupportedFeature(format!(
+                    "add_idim_tile(): all {} tiles have already been submitted",
+                    self.idim_tile_order.len()
+                ))
+            })?;
+        let (tile_w, tile_h) = idim.tile_dimensions(tx, ty, self.width, self.height);
+        let tile_stride = (tile_w as usize).checked_mul(self.bpp).ok_or_else(|| {
+            CafeError::UnsupportedFeature("overflow in tile stride during add_idim_tile".into())
+        })?;
+        let expected_rgba_len = (tile_w as usize)
+            .checked_mul(tile_h as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| {
+                CafeError::UnsupportedFeature("overflow computing expected tile RGBA length".into())
+            })?;
+        if rgba_tile.len() != expected_rgba_len {
             return Err(CafeError::UnsupportedFeature(format!(
-                "Encoder::finish() called after only {} of {} declared rows were submitted \
-                 via add_tile()",
-                self.rows_written, self.height
+                "add_idim_tile(): buffer length {} does not match expected {expected_rgba_len} \
+                 bytes for tile ({tx}, {ty}) of size {tile_w}x{tile_h}",
+                rgba_tile.len()
             )));
+        }
+
+        let sample_format_final = self.sample_format;
+        let target_bit_depth = self.bit_depth;
+        let tile_raw = if self.target_color_type == COLOR_TYPE_RGBA
+            && sample_format_final == SAMPLE_FORMAT_UINT
+            && target_bit_depth == 8
+        {
+            rgba_tile.to_vec()
+        } else if sample_format_final == SAMPLE_FORMAT_UINT {
+            convert_rgba_to_color_type(
+                rgba_tile,
+                tile_w,
+                tile_h,
+                self.target_color_type,
+                target_bit_depth,
+            )?
+        } else {
+            convert_rgba_to_color_type_with_format(
+                rgba_tile,
+                tile_w,
+                tile_h,
+                self.target_color_type,
+                target_bit_depth,
+                sample_format_final,
+            )?
+        };
+
+        let tile_payload = apply_single_tile_filter(
+            &tile_raw,
+            tile_h as usize,
+            tile_stride,
+            self.bpp,
+            tile_w,
+            self.use_byte_shuffle,
+            self.use_filter,
+            self.use_filter_per_row,
+            self.filter_heuristic,
+            self.opts_level,
+        )?;
+
+        let (flag, compressed, _used_dict) = compress_with_fallback_dict(
+            &tile_payload,
+            self.opts_level,
+            self.zstd_dictionary.as_deref(),
+        )?;
+        self.uses_zstd |= flag == FLAG_ZSTD;
+        self.writer
+            .write_all(&write_chunk(CHUNK_IDAT, flag, &compressed))?;
+
+        self.idim_next_tile_idx += 1;
+        Ok(())
+    }
+
+    /// Returns `true` once every declared row (row-strip mode) or every
+    /// tile in the grid (`iDIM` mode) has been submitted — the same
+    /// completeness check `finish()`/`finish_exact()` perform, exposed so
+    /// callers can assert it themselves before calling either.
+    fn is_complete(&self) -> bool {
+        match &self.idim {
+            Some(_) => self.idim_next_tile_idx == self.idim_tile_order.len(),
+            None => self.rows_written == self.height,
+        }
+    }
+
+    /// Writes the `IEND` chunk and returns the underlying `writer`. Must be
+    /// called after all `height` rows (row-strip mode, via `add_tile()`) or
+    /// all tiles in the grid (`iDIM` mode, via `add_idim_tile()`) have been
+    /// submitted — returns `UnsupportedFeature` otherwise (a truncated
+    /// image would otherwise be silently accepted as valid).
+    pub fn finish(mut self) -> Result<W> {
+        if !self.is_complete() {
+            return Err(CafeError::UnsupportedFeature(match &self.idim {
+                Some(_) => format!(
+                    "Encoder::finish() called after only {} of {} declared iDIM tiles were \
+                     submitted via add_idim_tile()",
+                    self.idim_next_tile_idx,
+                    self.idim_tile_order.len()
+                ),
+                None => format!(
+                    "Encoder::finish() called after only {} of {} declared rows were submitted \
+                     via add_tile()",
+                    self.rows_written, self.height
+                ),
+            }));
         }
         self.writer
             .write_all(&write_chunk(CHUNK_IEND, FLAG_RAW, &[]))?;
@@ -3259,12 +3477,20 @@ impl<W: Write + Seek> Encoder<W> {
     /// already-written bytes (`W: Write + Seek` alone does not guarantee
     /// `Read`).
     pub fn finish_exact(mut self) -> Result<W> {
-        if self.rows_written != self.height {
-            return Err(CafeError::UnsupportedFeature(format!(
-                "Encoder::finish_exact() called after only {} of {} declared rows were submitted \
-                 via add_tile()",
-                self.rows_written, self.height
-            )));
+        if !self.is_complete() {
+            return Err(CafeError::UnsupportedFeature(match &self.idim {
+                Some(_) => format!(
+                    "Encoder::finish_exact() called after only {} of {} declared iDIM tiles \
+                     were submitted via add_idim_tile()",
+                    self.idim_next_tile_idx,
+                    self.idim_tile_order.len()
+                ),
+                None => format!(
+                    "Encoder::finish_exact() called after only {} of {} declared rows were \
+                     submitted via add_tile()",
+                    self.rows_written, self.height
+                ),
+            }));
         }
         self.writer
             .write_all(&write_chunk(CHUNK_IEND, FLAG_RAW, &[]))?;

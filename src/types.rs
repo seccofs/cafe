@@ -554,10 +554,19 @@ impl Default for EncodeOptions {
 /// whole-file `encode()`/`encode_indexed()` path, but deliberately smaller:
 /// a handful of `EncodeOptions` features fundamentally require seeing the
 /// whole image up front (auto-trained dictionary sampling, indexed-palette
-/// quantization) or the whole image geometry ahead of tiling (2D tiling via
-/// `iDIM`, Adam7/even-odd interlacing) — none of these fit a caller that
-/// wants to push tiles through as they become available, so they are not
-/// offered here at all rather than silently ignored or erroring at runtime.
+/// quantization) or the whole image's pixels at once (Adam7/even-odd
+/// interlacing) — none of these fit a caller that wants to push tiles
+/// through as they become available, so they are not offered here at all
+/// rather than silently ignored or erroring at runtime.
+///
+/// **2D tiling (`idim`, v1.10+)** is the one item from this list that
+/// turned out *not* to require whole-image buffering after all: unlike
+/// `auto_dictionary`/indexed/interlace below, `iDim::tile_order()` only
+/// needs `tile_width`/`tile_height`/`scan_order` plus the `width`/`height`
+/// already required by `Encoder::new()` — no pixel data. See the `idim`
+/// field below and `Encoder::add_idim_tile()` (`cafe.rs`) for the resolved
+/// design (row-major and Z-order both supported, one full rectangular tile
+/// submitted per call, in `tile_order()`'s sequence).
 ///
 /// # Permanently out of scope (investigated, decided against — not a "v1" gap)
 /// Each of the following was investigated for a possible incremental
@@ -609,19 +618,11 @@ impl Default for EncodeOptions {
 ///   support level everywhere else in the codebase (`Decoder<R>::next_tile()`
 ///   rejects both equally too, for the same architectural reason in reverse
 ///   — see `Decoder`'s doc comment). Both remain rejected together.
-/// - **`idim` (2D tiling)**: requires knowing the full tile grid upfront and
-///   addressing tiles out of row-major order (Z-order); `Encoder<W>` only
-///   supports row-strip tiling (the same limitation `Decoder<R>` had prior
-///   to v1.9 — see `Decoder`'s doc comment in `cafe.rs` for how that side
-///   was eventually resolved for *decode*; the *encode* side still needs
-///   the complete tile grid decided upfront, which is incompatible with an
-///   incremental producer that doesn't yet know its own image dimensions'
-///   tile layout).
 ///
-/// All of the above remain available through the existing
-/// `encode()`/`encode_indexed()` (`&str` path-based) or `encode_bytes()`
-/// (whole-buffer) APIs, which still require the whole image in memory
-/// first.
+/// `auto_dictionary` and indexed-palette/interlace support all remain
+/// available through the existing `encode()`/`encode_indexed()` (`&str`
+/// path-based) or `encode_bytes()` (whole-buffer) APIs, which still require
+/// the whole image in memory first.
 #[derive(Clone, Debug)]
 pub struct EncoderOptions {
     /// Number of rows per row-strip tile (one `IDAT` per tile, section 4.3).
@@ -664,6 +665,17 @@ pub struct EncoderOptions {
     /// filter. Mutually exclusive with `use_filter` (byte-shuffle takes
     /// precedence).
     pub use_byte_shuffle: bool,
+    /// Enables real 2D tiling (`iDIM`, section 4.2) instead of row-strip
+    /// tiling, as `(tile_width, tile_height, scan_order)`. `scan_order`
+    /// must be `0` (row-major) or `1` (Z-order/Morton) — any other value is
+    /// rejected by `Encoder::new()`. When `Some`, tiles must be submitted
+    /// via `Encoder::add_idim_tile()` instead of `add_tile()` (calling the
+    /// wrong one for the configured mode is an error) — see
+    /// `add_idim_tile()`'s doc comment (`cafe.rs`) for the exact submission
+    /// contract (one full rectangular tile per call, in `iDim::tile_order()`
+    /// sequence). Default: `None` (row-strip tiling via `add_tile()`,
+    /// unchanged from pre-v1.10 behavior).
+    pub idim: Option<(u16, u16, u8)>,
 }
 
 impl Default for EncoderOptions {
@@ -684,6 +696,7 @@ impl Default for EncoderOptions {
             chdr_metadata: None,
             filter_heuristic: FilterHeuristic::Entropy,
             use_byte_shuffle: false,
+            idim: None,
         }
     }
 }

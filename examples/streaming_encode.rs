@@ -14,19 +14,25 @@
 //! For demonstration purposes only, this example still loads the whole
 //! source PNG into memory via the `image` crate (since that's the simplest
 //! way to obtain RGBA pixels from a file) and then slices it into tiles —
-//! a real streaming producer would hand `Encoder::add_tile()` each tile as
-//! it becomes available instead.
+//! a real streaming producer would hand `Encoder::add_tile()`/
+//! `add_idim_tile()` each tile as it becomes available instead.
+//!
+//! Pass an optional 4th argument (`<tile_w>x<tile_h>` or
+//! `<tile_w>x<tile_h>:z`) to switch from the default row-strip mode
+//! (`add_tile()`) to real 2D tiling (`add_idim_tile()`, v1.10+) — row-major
+//! scan order by default, or Z-order (Morton) with the `:z` suffix.
 //!
 //! # Limitations
-//! `Encoder<W>` only supports row-strip tiling (no `iDIM` 2D tiling, no
-//! Adam7/even-odd interlacing) and direct color types (no indexed palette —
-//! use `encode_indexed()` for that, since palette quantization requires
-//! seeing the whole image upfront). See `EncoderOptions`'s doc comment for
-//! the full list of what's out of scope for this streaming API.
+//! `Encoder<W>` does not support Adam7/even-odd interlacing or indexed
+//! color types (use `encode_indexed()` for the latter, since palette
+//! quantization requires seeing the whole image upfront). See
+//! `EncoderOptions`'s doc comment for the full list of what's out of scope
+//! for this streaming API.
 //!
 //! Usage:
 //! ```bash
 //! cargo run --example streaming_encode -- input.png output.cafe [tile_rows]
+//! cargo run --example streaming_encode -- input.png output.cafe - <tile_w>x<tile_h>[:z]
 //! ```
 
 use cafe::{constants, Encoder, EncoderOptions};
@@ -48,6 +54,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get(3)
         .and_then(|s| s.parse().ok())
         .unwrap_or(constants::DEFAULT_TILE_ROWS);
+    // Optional 4th argument switches to iDIM (2D tiling) mode: "<w>x<h>" or
+    // "<w>x<h>:z" for Z-order. Ignored unless present.
+    let idim_spec: Option<(u16, u16, u8)> = args.get(4).and_then(|s| {
+        let (dims, scan_order) = match s.strip_suffix(":z") {
+            Some(rest) => (rest, 1u8),
+            None => (s.as_str(), 0u8),
+        };
+        let (w, h) = dims.split_once('x')?;
+        Some((w.parse().ok()?, h.parse().ok()?, scan_order))
+    });
 
     println!("📦 Streaming encode of {} → {}", input_path, output_path);
 
@@ -61,8 +77,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opts = EncoderOptions {
         tile_rows,
         level: 19,
-        use_filter: true,
+        use_filter: idim_spec.is_none(), // use_filter_per_row/idim combos aside, keep it simple
         target_color_type: constants::COLOR_TYPE_RGBA,
+        idim: idim_spec,
         ..Default::default()
     };
 
@@ -74,20 +91,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let writer = BufWriter::new(File::create(output_path)?);
     let mut encoder = Encoder::new(writer, width, height, &opts)?;
 
-    let row_bytes = (width as usize) * 4;
     let mut tile_count = 0usize;
-    let mut y = 0u32;
-    while y < height {
-        let rows_this_tile = tile_rows.min(height - y);
-        let start = (y as usize) * row_bytes;
-        let end = start + (rows_this_tile as usize) * row_bytes;
-        encoder.add_tile(&pixels[start..end])?;
-        tile_count += 1;
-        println!(
-            "   tile {}: y={}, {} rows submitted",
-            tile_count, y, rows_this_tile
-        );
-        y += rows_this_tile;
+    if let Some((tile_w, tile_h, scan_order)) = idim_spec {
+        // 2D tiling (iDIM, v1.10+): one full rectangular tile per
+        // `add_idim_tile()` call, in `iDim::tile_order()`'s sequence.
+        let idim = cafe::iDim::new(tile_w, tile_h, width, height, scan_order);
+        for (tx, ty) in idim.tile_order()? {
+            let (tw, th) = idim.tile_dimensions(tx, ty, width, height);
+            let x0 = (tx as u32) * (tile_w as u32);
+            let y0 = (ty as u32) * (tile_h as u32);
+            let mut tile_buf = Vec::with_capacity((tw * th * 4) as usize);
+            for row in 0..th {
+                let start = (((y0 + row) * width + x0) * 4) as usize;
+                let end = start + (tw * 4) as usize;
+                tile_buf.extend_from_slice(&pixels[start..end]);
+            }
+            encoder.add_idim_tile(&tile_buf)?;
+            tile_count += 1;
+            println!(
+                "   tile {}: grid=({}, {}), {}x{} pixels submitted",
+                tile_count, tx, ty, tw, th
+            );
+        }
+    } else {
+        let row_bytes = (width as usize) * 4;
+        let mut y = 0u32;
+        while y < height {
+            let rows_this_tile = tile_rows.min(height - y);
+            let start = (y as usize) * row_bytes;
+            let end = start + (rows_this_tile as usize) * row_bytes;
+            encoder.add_tile(&pixels[start..end])?;
+            tile_count += 1;
+            println!(
+                "   tile {}: y={}, {} rows submitted",
+                tile_count, y, rows_this_tile
+            );
+            y += rows_this_tile;
+        }
     }
 
     let writer = encoder.finish_exact()?;

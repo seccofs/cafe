@@ -530,7 +530,10 @@ Requirements for incremental decoding:
 
 ### 6.1 Streaming encode (`Encoder<W>`, reference implementation, v1.6+)
 
-Symmetric to streaming decode: an encoder can write `IHDR` and each row-strip `IDAT` incrementally as tiles become available, instead of requiring the whole image in memory before producing any output. The reference implementation's `Encoder<W: Write>` supports this for direct color types only (`gray`/`RGB`/`gray+alpha`/`RGBA` — not indexed, since palette quantization needs to see every pixel before a single index can be emitted) and row-strip tiling only (not `iDIM` 2D tiling, which needs the full tile grid upfront, and not Adam7/even-odd interlacing, which needs the whole image's pixels to interleave).
+Symmetric to streaming decode: an encoder can write `IHDR` and each tile's `IDAT` incrementally as tiles become available, instead of requiring the whole image in memory before producing any output. The reference implementation's `Encoder<W: Write>` supports this for direct color types only (`gray`/`RGB`/`gray+alpha`/`RGBA` — not indexed, since palette quantization needs to see every pixel before a single index can be emitted) and not Adam7/even-odd interlacing (which needs the whole image's pixels to interleave). Two tiling schemes are supported:
+
+- **Row-strip tiling** (default): the caller submits horizontal strips of arbitrary height via `add_tile()`, one `IDAT` per call.
+- **2D tiling (`iDIM`, since v1.10)**: the caller opts in by supplying `tile_width`/`tile_height`/`scan_order` before writing any tile — unlike row-strip mode, this requires knowing the full tile grid geometry upfront (so `iDIM` can be written immediately after `IHDR`, per section 9's mandatory chunk order), but not the pixel data itself, so it remains fully streamable. Tiles are submitted one at a time via `add_idim_tile()`, in the precomputed grid order (row-major or Z-order, section 5.2), each sized to its exact `tile_width × tile_height` (narrower/shorter at right/bottom edges when `width`/`height` aren't exact multiples of the declared tile size). The two submission methods (`add_tile()` and `add_idim_tile()`) are mutually exclusive per encoder instance.
 
 Two variants exist, differing only in how precisely they can fill in `IHDR`'s `Compression method` field (section 4.1) once it's already been written to the output:
 
