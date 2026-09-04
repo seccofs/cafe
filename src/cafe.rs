@@ -2904,12 +2904,19 @@ impl<R: Read> Decoder<R> {
 /// below for the exact (non-conservative) alternative when the destination
 /// supports seeking.
 ///
-/// # Limitations (v1 of this API, see `EncoderOptions`)
+/// # Permanent limitations (see `EncoderOptions`'s doc comment for the full analysis)
 /// No `auto_dictionary`, no `iDIM` (2D tiling), no interlace (Adam7/
-/// even-odd), no indexed palette (`COLOR_TYPE_INDEXED`) — see
-/// `EncoderOptions`'s doc comment for why each is out of scope. Only
-/// row-strip tiling is supported, mirroring `Decoder<R>`'s existing
-/// limitation for symmetry between the two streaming APIs.
+/// even-odd), no indexed palette (`COLOR_TYPE_INDEXED`). These were each
+/// investigated (not merely deferred) and found to require either
+/// buffering the whole image first (defeating this API's purpose) or a
+/// fundamentally different two-pass API shape — see `EncoderOptions`'s doc
+/// comment for the per-item reasoning. Only row-strip tiling is supported,
+/// mirroring the same limitation `Decoder<R>` has for interlace (though
+/// `Decoder<R>` did go on to gain real streaming `iDIM` support in v1.9 —
+/// the decode direction doesn't share the same "palette/dictionary must be
+/// known before the first chunk" ordering constraint the encode direction
+/// does, since a decoder reads `PLTE`/`zDIC` before any `IDAT` rather than
+/// having to produce them from data it hasn't seen yet).
 pub struct Encoder<W: Write> {
     writer: W,
     width: u32,

@@ -559,25 +559,64 @@ impl Default for EncodeOptions {
 /// wants to push tiles through as they become available, so they are not
 /// offered here at all rather than silently ignored or erroring at runtime.
 ///
-/// # Out of scope for v1 (by design, not yet implemented)
-/// - **`auto_dictionary`**: training a dictionary requires sampling several
-///   tiles before compressing any of them — incompatible with a caller that
-///   hands tiles over one at a time and expects each to be flushed as it
-///   arrives. An explicit, caller-supplied `zstd_dictionary` (trained
-///   offline, e.g. across a batch of related images) is still supported.
+/// # Permanently out of scope (investigated, decided against — not a "v1" gap)
+/// Each of the following was investigated for a possible incremental
+/// `Encoder<W>`-compatible implementation; each turned out to require
+/// either buffering the whole image in memory (defeating the entire point
+/// of this API) or a fundamentally different, two-pass API shape — neither
+/// of which is an incremental extension of today's single-pass, zero-buffer
+/// `add_tile()` contract. See AGENTS.md's "`Encoder<W>` auto_dictionary/
+/// indexed/interlace investigation" section for the full per-item analysis;
+/// summary:
+/// - **`auto_dictionary`**: `train_zstd_dictionary` needs several already-
+///   *compressed* tile samples before it can train a useful dictionary, but
+///   using that dictionary on the earliest tiles (where it helps compression
+///   the most, since it "warms up" ZSTD's context) would require having
+///   *not yet written* those tiles — and unlike `finish_exact()`'s single
+///   fixed-position `compression_method` byte patch, recompressing an
+///   already-written tile changes its length, which would shift every
+///   subsequent byte in the file (there is no seek-and-patch fix for a
+///   variable-length field). The only fix is buffering the first N tiles
+///   before writing anything, which is not a small extension — it is a
+///   different contract for `add_tile()`. An explicit, caller-supplied
+///   `zstd_dictionary` (trained offline, e.g. across a batch of related
+///   images) remains fully supported and requires no such buffering.
+/// - **Indexed palette (`COLOR_TYPE_INDEXED`)**: palette quantization needs
+///   a color histogram of the *entire* image, and — because `PLTE` must
+///   appear before any `IDAT` (section 9's mandatory chunk order) — the
+///   final palette must be complete before the first pixel is written.
+///   There is no incremental middle ground: either the whole image is
+///   buffered (making this just `encode_indexed()` in disguise, not a
+///   streaming API), or callers submit tiles twice (once to collect
+///   per-tile color statistics, once to actually encode against the now-
+///   known palette) — a fundamentally different, two-pass API shape that
+///   would deserve its own type (e.g. a hypothetical `Encoder2Pass<W>`)
+///   rather than a mode of today's single-pass `Encoder<W>`.
+///   `target_color_type` here is therefore restricted to the direct color
+///   types (Gray/RGB/GrayAlpha/RGBA); `Encoder<W>::new()` rejects
+///   `COLOR_TYPE_INDEXED` explicitly.
+/// - **`interlace_method` (Adam7/even-odd)**: Adam7's `extract_adam7_pass`
+///   reads directly from the *entire* image buffer, because each of its 7
+///   passes picks pixels scattered non-contiguously across the whole
+///   image (e.g. pass 0 = every 8th pixel in both X and Y) — a contiguous
+///   row-strip tile does not correspond to "one pass," it is a horizontal
+///   band spanning parts of all 7 passes, so generating passes requires the
+///   whole image up front. Even/odd is structurally simpler (2 passes =
+///   even/odd rows, both already present within any contiguous row range)
+///   and could in principle be supported per-tile, but doing so alone would
+///   introduce an asymmetry — even/odd supported, Adam7 not — that breaks
+///   the deliberate decision to treat both interlace methods at the same
+///   support level everywhere else in the codebase (`Decoder<R>::next_tile()`
+///   rejects both equally too, for the same architectural reason in reverse
+///   — see `Decoder`'s doc comment). Both remain rejected together.
 /// - **`idim` (2D tiling)**: requires knowing the full tile grid upfront and
 ///   addressing tiles out of row-major order (Z-order); `Encoder<W>` only
-///   supports row-strip tiling (the same limitation `Decoder<R>` already
-///   has — see its doc comment in `cafe.rs`), for symmetry between the two
-///   streaming APIs.
-/// - **`interlace_method` (Adam7/even-odd)**: each pass needs the whole
-///   image's pixels to interleave rows/columns; incompatible with
-///   incremental tile submission.
-/// - **Indexed palette (`COLOR_TYPE_INDEXED`)**: palette quantization
-///   (median-cut or nearest-neighbor) needs to see every pixel before a
-///   single index can be emitted. `target_color_type` here is therefore
-///   restricted to the direct color types (Gray/RGB/GrayAlpha/RGBA);
-///   `Encoder<W>::new()` rejects `COLOR_TYPE_INDEXED` explicitly.
+///   supports row-strip tiling (the same limitation `Decoder<R>` had prior
+///   to v1.9 — see `Decoder`'s doc comment in `cafe.rs` for how that side
+///   was eventually resolved for *decode*; the *encode* side still needs
+///   the complete tile grid decided upfront, which is incompatible with an
+///   incremental producer that doesn't yet know its own image dimensions'
+///   tile layout).
 ///
 /// All of the above remain available through the existing
 /// `encode()`/`encode_indexed()` (`&str` path-based) or `encode_bytes()`

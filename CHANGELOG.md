@@ -13,8 +13,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Real ARM hardware validation on physical devices (Raspberry Pi, mobile, Apple Silicon) beyond QEMU emulation
 - Cache-friendly blocking in scalar byte-shuffle fallback
 - Runtime CPU detection for optional SIMD forcing
-- `Encoder<W>` support for `auto_dictionary`, indexed palette, and interlace (currently row-strip direct-color only, by design — see `EncoderOptions`'s doc comment)
 - An `EncoderOptions`-equivalent CLI surface for the streaming encoder (`Encoder<W>` remains library-only)
+
+---
+
+## [1.9.1] - 2026-09-04
+
+### Changed (Documentation only — no code behavior change)
+
+- **`Encoder<W>`'s missing `auto_dictionary`/indexed-palette/interlace support reclassified from "v1 gap" to permanent, investigated design limitation.** Previously, `EncoderOptions`'s and `Encoder<W>`'s doc comments (and this changelog's "Planned (Future)" section) described these as deferred work ("out of scope for v1", "not yet implemented"). Each was investigated for a possible incremental, buffer-free implementation; none has one:
+  - **`auto_dictionary`**: training needs several already-*compressed* tile samples, but applying the trained dictionary to the earliest tiles — where it helps most — would require not having already written them. Unlike `finish_exact()`'s single fixed-position `compression_method` byte patch, recompressing an already-written tile changes its length, shifting every subsequent byte with no seek-and-patch fix available. Only remedy: buffer the first N tiles before writing anything, which is a different contract for `add_tile()`, not an extension of it.
+  - **Indexed palette (`COLOR_TYPE_INDEXED`)**: quantization needs a full-image color histogram, and `PLTE` must precede every `IDAT` (section 9's mandatory chunk order) — so the final palette must be known before the first pixel is written. No incremental middle ground exists short of buffering the whole image (making this just `encode_indexed()` in disguise) or a genuinely different two-pass API shape (submit tiles once for statistics, again to encode) that would deserve its own type rather than a mode of today's single-pass `Encoder<W>`.
+  - **Interlace (Adam7/even-odd)**: Adam7's `extract_adam7_pass` reads the *entire* image buffer, since each of its 7 passes picks pixels scattered non-contiguously across the whole image — a contiguous row-strip tile spans parts of every pass, not one pass in isolation. Even/odd is structurally simpler and could in principle be supported per-tile, but doing so alone would introduce an asymmetry (even/odd supported, Adam7 not) inconsistent with how both methods are treated everywhere else in the codebase (e.g. `Decoder<R>::next_tile()` rejects both equally, for the mirror-image reason). Both remain rejected together.
+  - `EncoderOptions`'s doc comment (`src/types.rs`) rewritten with the above per-item reasoning under a new "Permanently out of scope (investigated, decided against)" heading; `Encoder<W>`'s own doc comment (`src/cafe.rs`) updated to match and point to `EncoderOptions`'s for detail.
+  - Removed the now-resolved "`Encoder<W>` support for `auto_dictionary`, indexed palette, and interlace" line from this changelog's "Planned (Future)" section — it will not become a future work item, since the investigation concluded no viable buffer-free design exists.
+
+### Notes
+
+- **No functional or API changes**: doc comments only. `EncoderOptions` and `Encoder<W>`'s fields, methods, signatures, and runtime behavior are byte-for-byte unchanged from v1.9.0. This entry exists purely so the "why" behind an already-existing limitation is discoverable without reading source comments, and so the changelog's "Planned (Future)" section accurately reflects what is and isn't expected to be addressed later.
+- Validated: `cargo build --lib`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --lib` (332 tests, unchanged from v1.9.0 — no test code touched), `cargo test --doc` (2 doc-tests, unchanged) all pass with zero regressions.
 
 ---
 
