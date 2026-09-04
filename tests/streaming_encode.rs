@@ -767,3 +767,374 @@ fn test_streaming_encoder_new_rejects_idim_tile_count_exceeding_max() {
         Err(err) => assert!(matches!(err, CafeError::UnsupportedFeature(_))),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Even/odd interlace (v1.11+): `EncoderOptions::even_odd_interlace` +
+// `Encoder::add_even_odd_rows()`.
+// ---------------------------------------------------------------------------
+
+/// Feeds `pixels` into a fresh even/odd-mode `Encoder<Cursor<Vec<u8>>>`, one
+/// `add_even_odd_rows()` call per `rows_per_call`-row group (last group may
+/// be shorter) — mirrors `encode_via_streaming_encoder()`'s row-strip
+/// grouping helper, but for the even/odd submission method instead.
+fn encode_via_streaming_encoder_even_odd(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    rows_per_call: u32,
+    opts: &EncoderOptions,
+    use_finish_exact: bool,
+) -> Vec<u8> {
+    let mut encoder =
+        Encoder::new(Cursor::new(Vec::new()), width, height, opts).expect("Encoder::new failed");
+
+    let row_bytes = (width as usize) * 4;
+    let mut y = 0u32;
+    while y < height {
+        let rows_this_call = rows_per_call.min(height - y) as usize;
+        let start = (y as usize) * row_bytes;
+        let end = start + rows_this_call * row_bytes;
+        encoder
+            .add_even_odd_rows(&pixels[start..end])
+            .expect("add_even_odd_rows failed");
+        y += rows_this_call as u32;
+    }
+
+    let cursor = if use_finish_exact {
+        encoder.finish_exact().expect("finish_exact failed")
+    } else {
+        encoder.finish().expect("finish failed")
+    };
+    cursor.into_inner()
+}
+
+/// Round-trips a non-tile-aligned image (37x29, odd width/height so the
+/// last even/odd pass row count differs from the first) through
+/// `add_even_odd_rows()`, submitting rows in `tile_rows`-sized groups,
+/// comparing against `decode_bytes()`'s reassembled pixels.
+#[test]
+fn test_streaming_encoder_even_odd_finish_roundtrip_pixel_exact() {
+    let width = 37u32;
+    let height = 29u32;
+    let pixels = generate_rgba(width, height);
+
+    let opts = EncoderOptions {
+        level: 6,
+        tile_rows: 8,
+        even_odd_interlace: true,
+        target_color_type: constants::COLOR_TYPE_RGBA,
+        ..Default::default()
+    };
+
+    let bytes = encode_via_streaming_encoder_even_odd(&pixels, width, height, 8, &opts, false);
+    let (decoded_pixels, result) = decode_bytes(&bytes).expect("decode_bytes failed");
+    assert_eq!(result.width, width);
+    assert_eq!(result.height, height);
+    assert_eq!(
+        decoded_pixels, pixels,
+        "pixel mismatch for even/odd via finish()"
+    );
+}
+
+/// Same as above, but via `finish_exact()`.
+#[test]
+fn test_streaming_encoder_even_odd_finish_exact_roundtrip_pixel_exact() {
+    let width = 37u32;
+    let height = 29u32;
+    let pixels = generate_rgba(width, height);
+
+    let opts = EncoderOptions {
+        level: 6,
+        tile_rows: 8,
+        even_odd_interlace: true,
+        target_color_type: constants::COLOR_TYPE_RGBA,
+        ..Default::default()
+    };
+
+    let bytes = encode_via_streaming_encoder_even_odd(&pixels, width, height, 8, &opts, true);
+    let (decoded_pixels, result) = decode_bytes(&bytes).expect("decode_bytes failed");
+    assert_eq!(result.width, width);
+    assert_eq!(result.height, height);
+    assert_eq!(
+        decoded_pixels, pixels,
+        "pixel mismatch for even/odd via finish_exact()"
+    );
+}
+
+/// Submits rows one at a time (the most granular, worst-case-for-batching
+/// grouping) and confirms the result is still pixel-exact — the whole
+/// point of `add_even_odd_rows()` not requiring pass- or tile_rows-aligned
+/// batches.
+#[test]
+fn test_streaming_encoder_even_odd_one_row_at_a_time_roundtrip() {
+    let width = 21u32;
+    let height = 17u32;
+    let pixels = generate_rgba(width, height);
+
+    let opts = EncoderOptions {
+        level: 3,
+        tile_rows: 4,
+        even_odd_interlace: true,
+        target_color_type: constants::COLOR_TYPE_RGBA,
+        ..Default::default()
+    };
+
+    let bytes = encode_via_streaming_encoder_even_odd(&pixels, width, height, 1, &opts, true);
+    let (decoded_pixels, result) = decode_bytes(&bytes).expect("decode_bytes failed");
+    assert_eq!(result.width, width);
+    assert_eq!(result.height, height);
+    assert_eq!(
+        decoded_pixels, pixels,
+        "pixel mismatch for even/odd, one row per add_even_odd_rows() call"
+    );
+}
+
+/// Submits the entire image in a single `add_even_odd_rows()` call (the
+/// least granular grouping) and confirms the result is still pixel-exact.
+#[test]
+fn test_streaming_encoder_even_odd_whole_image_single_call_roundtrip() {
+    let width = 25u32;
+    let height = 19u32;
+    let pixels = generate_rgba(width, height);
+
+    let opts = EncoderOptions {
+        level: 9,
+        tile_rows: 6,
+        even_odd_interlace: true,
+        target_color_type: constants::COLOR_TYPE_RGBA,
+        ..Default::default()
+    };
+
+    let bytes = encode_via_streaming_encoder_even_odd(&pixels, width, height, height, &opts, false);
+    let (decoded_pixels, result) = decode_bytes(&bytes).expect("decode_bytes failed");
+    assert_eq!(result.width, width);
+    assert_eq!(result.height, height);
+    assert_eq!(
+        decoded_pixels, pixels,
+        "pixel mismatch for even/odd, whole image in one add_even_odd_rows() call"
+    );
+}
+
+/// Compares the streaming even/odd encoder's `finish_exact()` output
+/// byte-for-byte against `encode()`'s whole-file
+/// `EncodeOptions::interlace_method = INTERLACE_EVEN_ODD` path for the same
+/// pixels/options — confirms row-grouping choice during streaming has no
+/// effect on the final bytes, not just on decoded pixels.
+///
+/// `tile_rows` is deliberately set larger than `height` (so larger than
+/// either pass's row count, `ceil(height/2)` at most) on both sides: unlike
+/// row-strip/iDIM mode, `encode()`'s whole-file `build_interlaced_idats`
+/// path always emits **exactly one** `IDAT` per pass regardless of
+/// `tile_rows` (it has no row-strip tiling concept at all for the
+/// interlaced case) — the streaming encoder only matches that exactly when
+/// `tile_rows` is large enough that `flush_even_odd_full_tiles()` never
+/// fires mid-stream and every row ends up in `flush_even_odd_remaining()`'s
+/// single final `IDAT` per pass, same as the non-streaming path.
+#[test]
+fn test_streaming_encoder_even_odd_matches_whole_file_encode_byte_for_byte() {
+    let temp_dir = std::env::temp_dir().join("cafe_streaming_encode_even_odd_tests");
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let input_png = temp_dir.join("streaming_even_odd_vs_whole_input.png");
+    let output_cafe = temp_dir.join("streaming_even_odd_vs_whole_output.cafe");
+
+    let width = 40u32;
+    let height = 30u32;
+    let pixels = generate_rgba(width, height);
+
+    let image_buffer = image::RgbaImage::from_raw(width, height, pixels.clone()).unwrap();
+    image_buffer.save(&input_png).expect("save png failed");
+
+    let whole_file_opts = EncodeOptions {
+        use_filter: false, // interlace forces FILTER_METHOD_NONE; keep both paths aligned
+        level: 6,
+        adaptive_analysis: false,
+        target_color_type: constants::COLOR_TYPE_RGBA,
+        interlace_method: constants::INTERLACE_EVEN_ODD,
+        ..Default::default()
+    };
+    encode(
+        input_png.to_str().unwrap(),
+        output_cafe.to_str().unwrap(),
+        &whole_file_opts,
+    )
+    .expect("encode failed");
+    let whole_file_bytes = std::fs::read(&output_cafe).expect("read output failed");
+
+    let streaming_opts = EncoderOptions {
+        level: 6,
+        tile_rows: height, // larger than any single pass's row count
+        even_odd_interlace: true,
+        target_color_type: constants::COLOR_TYPE_RGBA,
+        ..Default::default()
+    };
+    // Deliberately group rows differently (7 at a time) from tile_rows
+    // (height) to confirm the final bytes only depend on the one-IDAT-per-
+    // pass flush granularity, not on the caller's add_even_odd_rows() call
+    // pattern.
+    let streaming_bytes =
+        encode_via_streaming_encoder_even_odd(&pixels, width, height, 7, &streaming_opts, true);
+
+    assert_eq!(
+        streaming_bytes, whole_file_bytes,
+        "Encoder<W>::add_even_odd_rows()+finish_exact() output must match encode()'s whole-file \
+         even/odd output byte-for-byte for the same pixels/options"
+    );
+
+    let _ = std::fs::remove_file(&input_png);
+    let _ = std::fs::remove_file(&output_cafe);
+}
+
+#[test]
+fn test_streaming_encoder_add_tile_rejects_even_odd_mode() {
+    let opts = EncoderOptions {
+        even_odd_interlace: true,
+        ..Default::default()
+    };
+    let mut encoder =
+        Encoder::new(Cursor::new(Vec::new()), 8, 8, &opts).expect("Encoder::new failed");
+    let tile = vec![0u8; 8 * 4 * 4];
+    let err = encoder.add_tile(&tile).unwrap_err();
+    assert!(matches!(err, CafeError::UnsupportedFeature(_)));
+}
+
+#[test]
+fn test_streaming_encoder_add_idim_tile_rejects_even_odd_mode() {
+    let opts = EncoderOptions {
+        even_odd_interlace: true,
+        ..Default::default()
+    };
+    let mut encoder =
+        Encoder::new(Cursor::new(Vec::new()), 8, 8, &opts).expect("Encoder::new failed");
+    let tile = vec![0u8; 4 * 4 * 4];
+    let err = encoder.add_idim_tile(&tile).unwrap_err();
+    assert!(matches!(err, CafeError::UnsupportedFeature(_)));
+}
+
+#[test]
+fn test_streaming_encoder_add_even_odd_rows_rejects_row_strip_mode() {
+    let opts = EncoderOptions::default();
+    let mut encoder =
+        Encoder::new(Cursor::new(Vec::new()), 8, 8, &opts).expect("Encoder::new failed");
+    let rows = vec![0u8; 8 * 4];
+    let err = encoder.add_even_odd_rows(&rows).unwrap_err();
+    assert!(matches!(err, CafeError::UnsupportedFeature(_)));
+}
+
+#[test]
+fn test_streaming_encoder_add_even_odd_rows_rejects_wrong_size_buffer() {
+    let opts = EncoderOptions {
+        even_odd_interlace: true,
+        ..Default::default()
+    };
+    let mut encoder =
+        Encoder::new(Cursor::new(Vec::new()), 8, 8, &opts).expect("Encoder::new failed");
+    // width=8 => row_bytes=32; supply 30 (not a multiple).
+    let bad_rows = vec![0u8; 30];
+    let err = encoder.add_even_odd_rows(&bad_rows).unwrap_err();
+    assert!(matches!(err, CafeError::UnsupportedFeature(_)));
+}
+
+#[test]
+fn test_streaming_encoder_add_even_odd_rows_rejects_height_overflow() {
+    let opts = EncoderOptions {
+        even_odd_interlace: true,
+        ..Default::default()
+    };
+    let mut encoder =
+        Encoder::new(Cursor::new(Vec::new()), 4, 4, &opts).expect("Encoder::new failed");
+    // height=4; submit 5 rows in one call.
+    let rows = vec![0u8; 5 * 4 * 4];
+    let err = encoder.add_even_odd_rows(&rows).unwrap_err();
+    assert!(matches!(err, CafeError::UnsupportedFeature(_)));
+}
+
+#[test]
+fn test_streaming_encoder_even_odd_finish_rejects_incomplete_submission() {
+    let opts = EncoderOptions {
+        even_odd_interlace: true,
+        ..Default::default()
+    };
+    let mut encoder =
+        Encoder::new(Cursor::new(Vec::new()), 8, 8, &opts).expect("Encoder::new failed");
+    // height=8; submit only 3 rows.
+    let rows = vec![0u8; 3 * 8 * 4];
+    encoder
+        .add_even_odd_rows(&rows)
+        .expect("add_even_odd_rows failed");
+
+    let err = encoder.finish().unwrap_err();
+    assert!(matches!(err, CafeError::UnsupportedFeature(_)));
+}
+
+#[test]
+fn test_streaming_encoder_new_rejects_idim_with_even_odd_interlace() {
+    let opts = EncoderOptions {
+        idim: Some((4, 4, 0)),
+        even_odd_interlace: true,
+        ..Default::default()
+    };
+    match Encoder::new(Cursor::new(Vec::new()), 8, 8, &opts) {
+        Ok(_) => panic!("expected UnsupportedFeature error for idim + even_odd_interlace"),
+        Err(err) => assert!(matches!(err, CafeError::UnsupportedFeature(_))),
+    }
+}
+
+#[test]
+fn test_streaming_encoder_new_rejects_even_odd_interlace_with_filter_per_row() {
+    let opts = EncoderOptions {
+        even_odd_interlace: true,
+        use_filter_per_row: true,
+        ..Default::default()
+    };
+    match Encoder::new(Cursor::new(Vec::new()), 8, 8, &opts) {
+        Ok(_) => {
+            panic!("expected UnsupportedFeature error for even_odd_interlace + use_filter_per_row")
+        }
+        Err(err) => assert!(matches!(err, CafeError::UnsupportedFeature(_))),
+    }
+}
+
+#[test]
+fn test_streaming_encoder_new_rejects_even_odd_interlace_with_byte_shuffle() {
+    let opts = EncoderOptions {
+        even_odd_interlace: true,
+        use_byte_shuffle: true,
+        ..Default::default()
+    };
+    match Encoder::new(Cursor::new(Vec::new()), 8, 8, &opts) {
+        Ok(_) => {
+            panic!("expected UnsupportedFeature error for even_odd_interlace + use_byte_shuffle")
+        }
+        Err(err) => assert!(matches!(err, CafeError::UnsupportedFeature(_))),
+    }
+}
+
+#[test]
+fn test_streaming_encoder_new_rejects_even_odd_interlace_with_non_rgba_color_type() {
+    let opts = EncoderOptions {
+        even_odd_interlace: true,
+        target_color_type: constants::COLOR_TYPE_GRAY,
+        ..Default::default()
+    };
+    match Encoder::new(Cursor::new(Vec::new()), 8, 8, &opts) {
+        Ok(_) => {
+            panic!("expected UnsupportedFeature error for even_odd_interlace + non-RGBA color type")
+        }
+        Err(err) => assert!(matches!(err, CafeError::UnsupportedFeature(_))),
+    }
+}
+
+#[test]
+fn test_streaming_encoder_new_rejects_even_odd_interlace_with_non_default_bit_depth() {
+    let opts = EncoderOptions {
+        even_odd_interlace: true,
+        target_bit_depth: Some(16),
+        ..Default::default()
+    };
+    match Encoder::new(Cursor::new(Vec::new()), 8, 8, &opts) {
+        Ok(_) => {
+            panic!("expected UnsupportedFeature error for even_odd_interlace + bit_depth != 8")
+        }
+        Err(err) => assert!(matches!(err, CafeError::UnsupportedFeature(_))),
+    }
+}

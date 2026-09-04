@@ -105,7 +105,16 @@ fn compute_decompress_budget(
             .unwrap_or(u64::MAX),
         INTERLACE_EVEN_ODD => pixels
             .checked_mul(BPP as u64)
-            .and_then(|v| v.checked_add(EVEN_ODD_NUM_PASSES as u64))
+            // v1.11: margin widened from a flat EVEN_ODD_NUM_PASSES (2, one
+            // pass_number prefix byte per pass) to `h` (one row's worth of
+            // margin) — the streaming encoder (`Encoder::add_even_odd_rows`)
+            // may split each pass across multiple IDATs (one prefix byte
+            // each), unlike the whole-file `encode()` path, which always
+            // emits exactly one IDAT per pass. `h` is a generous but still
+            // bounded upper bound on how many IDATs a legitimate encoder
+            // would ever emit for one pass (at most one per row), so this
+            // remains a real ceiling, not an unbounded allowance.
+            .and_then(|v| v.checked_add(h as u64))
             .unwrap_or(u64::MAX),
         _ => {
             // No interlace: data packed per row + 1 filter byte per block
@@ -1796,6 +1805,25 @@ fn handle_chdr_chunk(state: &mut DecodeState, flag: u8, data: &[u8]) {
 /// Handles a decompressed IDAT payload for the interlaced case (Adam7 or
 /// even/odd): extracts the 1-byte pass-number prefix and stashes the
 /// remainder in the appropriate pass slot.
+///
+/// Adam7 IDATs are **overwritten** per pass slot (`encode()`'s whole-file
+/// path always emits exactly one IDAT per Adam7 pass — a second IDAT for a
+/// pass already seen would indicate a malformed/adversarial file, not a
+/// legitimate multi-chunk pass, so overwriting silently rather than
+/// concatenating or rejecting matches pre-v1.11 behavior unchanged).
+///
+/// Even/odd IDATs are **concatenated** per pass slot (v1.11+): unlike
+/// Adam7, the streaming encoder (`Encoder::add_even_odd_rows()`) may split
+/// a single pass's rows across multiple IDATs as rows arrive incrementally
+/// — concatenating in arrival order reconstructs the exact same
+/// `pass_data` a non-streaming encoder would have produced as one IDAT,
+/// since `Encoder::add_even_odd_rows()` always appends complete rows in
+/// increasing row order within a pass. The whole-file `encode()` path
+/// still emits exactly one IDAT per even/odd pass, so this is a strict
+/// superset of the prior (overwrite) behavior for that case, not a
+/// behavior change for non-streaming-encoded files (concatenating onto an
+/// initially-empty `Vec` for a pass slot that only ever receives one IDAT
+/// is equivalent to what overwriting it once would have produced).
 fn handle_interlaced_idat(state: &mut DecodeState, decompressed: Vec<u8>) -> Result<()> {
     if state.interlace_method_read == INTERLACE_ADAM7 {
         if decompressed.is_empty() {
@@ -1823,9 +1851,9 @@ fn handle_interlaced_idat(state: &mut DecodeState, decompressed: Vec<u8>) -> Res
                 pass_number
             )));
         }
-        let pass_data = decompressed[1..].to_vec();
+        let pass_data = &decompressed[1..];
         let pass_idx = (pass_number - 1) as usize;
-        state.even_odd_passes[pass_idx] = pass_data;
+        state.even_odd_passes[pass_idx].extend_from_slice(pass_data);
     }
     Ok(())
 }
@@ -2905,14 +2933,16 @@ impl<R: Read> Decoder<R> {
 /// supports seeking.
 ///
 /// # Permanent limitations (see `EncoderOptions`'s doc comment for the full analysis)
-/// No `auto_dictionary`, no interlace (Adam7/even-odd), no indexed palette
+/// No `auto_dictionary`, no Adam7 interlace, no indexed palette
 /// (`COLOR_TYPE_INDEXED`). These were each investigated (not merely
 /// deferred) and found to require either buffering the whole image first
 /// (defeating this API's purpose) or a fundamentally different two-pass API
 /// shape — see `EncoderOptions`'s doc comment for the per-item reasoning.
-/// This mirrors the same limitation `Decoder<R>` has for interlace (though
-/// `Decoder<R>` did go on to gain real streaming `iDIM` support in v1.9,
-/// and `Encoder<W>` symmetrically gained it in v1.10 — see
+/// Even/odd interlace is *not* in this list — see "Even/odd interlace"
+/// below, and `EncoderOptions`'s doc comment for why it didn't share Adam7's
+/// fate. This mirrors the same limitation `Decoder<R>` has for Adam7
+/// (though `Decoder<R>` did go on to gain real streaming `iDIM` support in
+/// v1.9, and `Encoder<W>` symmetrically gained it in v1.10 — see
 /// `add_idim_tile()` below — since a decoder reads `PLTE`/`zDIC` before any
 /// `IDAT` rather than having to produce them from data it hasn't seen yet,
 /// unlike palette/dictionary training, which do require it).
@@ -2924,6 +2954,17 @@ impl<R: Read> Decoder<R> {
 /// `add_idim_tile()` (in `iDim::tile_order()`'s sequence) instead of
 /// `add_tile()` — calling the wrong method for the configured mode returns
 /// `UnsupportedFeature`. See `add_idim_tile()`'s doc comment for the full
+/// contract.
+///
+/// # Even/odd interlace (v1.11+)
+/// When `EncoderOptions::even_odd_interlace` is `true`, `new()` writes
+/// `INTERLACE_EVEN_ODD` into `IHDR` and rows must be submitted via
+/// `add_even_odd_rows()` (any row-count grouping, not required to align to
+/// pass or `tile_rows` boundaries) instead of `add_tile()`/`add_idim_tile()`
+/// — calling the wrong method for the configured mode returns
+/// `UnsupportedFeature`. Mutually exclusive with `idim`,
+/// `use_filter_per_row`, and `use_byte_shuffle`; requires uint RGBA 8-bit
+/// (section 5). See `add_even_odd_rows()`'s doc comment for the full
 /// contract.
 pub struct Encoder<W: Write> {
     writer: W,
@@ -2957,11 +2998,24 @@ pub struct Encoder<W: Write> {
     /// Index into `idim_tile_order` of the next tile `add_idim_tile()` will
     /// write. Unused (stays `0`) in row-strip mode.
     idim_next_tile_idx: usize,
+    /// `true` when `EncoderOptions::even_odd_interlace` was set in `new()`
+    /// — selects even/odd interlace mode (`add_even_odd_rows()` only,
+    /// `add_tile()`/`add_idim_tile()` rejected) instead of row-strip or
+    /// `iDIM` mode. Mutually exclusive with `idim.is_some()` (enforced in
+    /// `new()`). Rows are still counted via `rows_written` — even/odd
+    /// shares row-strip mode's "submit until `height` rows written"
+    /// completeness semantics exactly (each row belongs to exactly one of
+    /// the 2 passes by parity, but every row still gets submitted exactly
+    /// once, same as row-strip mode), so `is_complete()`/`finish()`/
+    /// `finish_exact()` need no even/odd-specific branch beyond error-
+    /// message wording.
+    even_odd_interlace: bool,
     /// Row index (within the full image) of the next row that has not yet
-    /// been submitted via `add_tile()`. Used to reject tiles that would
-    /// overrun `height`, and to compute each tile's height from the number
-    /// of rows in the caller-supplied buffer. Unused (stays `0`) in `iDIM`
-    /// mode — see `idim_next_tile_idx` instead.
+    /// been submitted via `add_tile()`/`add_even_odd_rows()`. Used to
+    /// reject tiles/row-ranges that would overrun `height`, to compute each
+    /// call's row count from the caller-supplied buffer, and (even/odd mode
+    /// only) to determine each submitted row's absolute parity. Unused
+    /// (stays `0`) in `iDIM` mode — see `idim_next_tile_idx` instead.
     rows_written: u32,
     /// Tracks whether any chunk written so far (ancillary or `IDAT`) used
     /// ZSTD (`Flag = 0x01`). Used only by `finish_exact()` (`W: Write +
@@ -2977,6 +3031,18 @@ pub struct Encoder<W: Write> {
     /// instead recomputed from this in-memory copy and the patched byte
     /// value, then both are written back at their known offsets.
     ihdr_type_flag_data: [u8; 19],
+    /// Even/odd interlace mode only (v1.11+, `even_odd_interlace = true`):
+    /// accumulated raw row bytes (`width * bpp` each) for each of the 2
+    /// passes (index 0 = even rows, index 1 = odd rows), not yet flushed as
+    /// an `IDAT`. `add_even_odd_rows()` appends each incoming row to the
+    /// correct pass buffer by its absolute row-index parity, then flushes
+    /// (writes an `IDAT` and clears the buffer) whichever pass buffer has
+    /// accumulated `opts_tile_rows` complete rows — mirroring row-strip
+    /// mode's `tile_rows`-sized `IDAT` granularity, applied per-pass rather
+    /// than per-image-row-range. A final, possibly-shorter flush of any
+    /// remaining buffered rows happens in `finish()`/`finish_exact()`.
+    /// Always empty (unused) outside even/odd mode.
+    even_odd_pending: [Vec<u8>; EVEN_ODD_NUM_PASSES],
 }
 
 impl<W: Write> Encoder<W> {
@@ -3087,6 +3153,11 @@ impl<W: Write> Encoder<W> {
         // the same reasons documented at encode()'s own call sites.
         let idim = match opts.idim {
             Some((tile_width, tile_height, scan_order)) => {
+                if opts.even_odd_interlace {
+                    return Err(CafeError::UnsupportedFeature(
+                        "EncoderOptions::idim is incompatible with even_odd_interlace".into(),
+                    ));
+                }
                 if bit_depth < 8 {
                     return Err(CafeError::UnsupportedFeature(
                         "iDIM (2D tiling) requires bit_depth >= 8 in Encoder::new()".into(),
@@ -3119,6 +3190,45 @@ impl<W: Write> Encoder<W> {
             None => None,
         };
 
+        // --- even/odd interlace validation (v1.11+) ---
+        // Mirrors encode()'s own interlace validation (uint RGBA 8-bit only,
+        // section 5) plus the use_filter_per_row/use_byte_shuffle rejections
+        // encode() also enforces for interlace in general — all checked
+        // upfront here, before any byte is written, same rationale as the
+        // iDIM validation block above.
+        if opts.even_odd_interlace {
+            if opts.use_filter_per_row {
+                return Err(CafeError::UnsupportedFeature(
+                    "use_filter_per_row is incompatible with interlace (Adam7/even-odd)".into(),
+                ));
+            }
+            if opts.use_byte_shuffle {
+                return Err(CafeError::UnsupportedFeature(
+                    "Byte-shuffle is incompatible with interlace (section 4.3.1)".into(),
+                ));
+            }
+            if sample_format_final != SAMPLE_FORMAT_UINT || target_color_type != COLOR_TYPE_RGBA {
+                return Err(CafeError::UnsupportedFeature(
+                    "Interlace (Adam7/even-odd) requires sample format uint and color type RGBA (section 5)"
+                        .into(),
+                ));
+            }
+            if bit_depth != 8 {
+                return Err(CafeError::UnsupportedFeature(
+                    "Interlace (Adam7/even-odd) requires bit_depth = 8 (section 5)".into(),
+                ));
+            }
+        }
+        // filter_method is forced to FILTER_METHOD_NONE for even/odd
+        // interlace, mirroring encode()'s own behavior — Adam7/even/odd
+        // passes are not byte-shuffled or predictively filtered (section
+        // 4.3.2/5).
+        let filter_method = if opts.even_odd_interlace {
+            FILTER_METHOD_NONE
+        } else {
+            filter_method
+        };
+
         // --- Signature + IHDR ---
         // compression_method: set the ZSTD bit unconditionally and upfront
         // (conservative — see struct doc comment) since this Write-only
@@ -3132,7 +3242,11 @@ impl<W: Write> Encoder<W> {
         ihdr.push(target_color_type);
         ihdr.push(COMPRESSION_METHOD_ZSTD_BIT);
         ihdr.push(filter_method);
-        ihdr.push(INTERLACE_NONE);
+        ihdr.push(if opts.even_odd_interlace {
+            INTERLACE_EVEN_ODD
+        } else {
+            INTERLACE_NONE
+        });
         let ihdr_chunk = write_chunk(CHUNK_IHDR, FLAG_RAW, &ihdr);
         // Type(4) + Flag(1) + Data(14) = bytes [4..23) of the written chunk
         // (skipping the 4-byte Length prefix) — exactly the span
@@ -3201,9 +3315,11 @@ impl<W: Write> Encoder<W> {
             idim,
             idim_tile_order,
             idim_next_tile_idx: 0,
+            even_odd_interlace: opts.even_odd_interlace,
             rows_written: 0,
             uses_zstd,
             ihdr_type_flag_data,
+            even_odd_pending: Default::default(),
         })
     }
 
@@ -3229,6 +3345,13 @@ impl<W: Write> Encoder<W> {
             return Err(CafeError::UnsupportedFeature(
                 "add_tile() called on an Encoder configured with EncoderOptions::idim — use \
                  add_idim_tile() instead"
+                    .into(),
+            ));
+        }
+        if self.even_odd_interlace {
+            return Err(CafeError::UnsupportedFeature(
+                "add_tile() called on an Encoder configured with EncoderOptions::even_odd_interlace \
+                 — use add_even_odd_rows() instead"
                     .into(),
             ));
         }
@@ -3337,6 +3460,13 @@ impl<W: Write> Encoder<W> {
     /// - Any error from color conversion, filtering, compression, or
     ///   writing to the underlying `W`.
     pub fn add_idim_tile(&mut self, rgba_tile: &[u8]) -> Result<()> {
+        if self.even_odd_interlace {
+            return Err(CafeError::UnsupportedFeature(
+                "add_idim_tile() called on an Encoder configured with \
+                 EncoderOptions::even_odd_interlace — use add_even_odd_rows() instead"
+                    .into(),
+            ));
+        }
         let idim = self.idim.as_ref().ok_or_else(|| {
             CafeError::UnsupportedFeature(
                 "add_idim_tile() called on an Encoder not configured with EncoderOptions::idim \
@@ -3423,10 +3553,164 @@ impl<W: Write> Encoder<W> {
         Ok(())
     }
 
-    /// Returns `true` once every declared row (row-strip mode) or every
-    /// tile in the grid (`iDIM` mode) has been submitted — the same
-    /// completeness check `finish()`/`finish_exact()` perform, exposed so
-    /// callers can assert it themselves before calling either.
+    /// Compresses and writes one `IDAT` for `row_count` complete rows
+    /// drained from the front of `self.even_odd_pending[pass_idx]` (each row
+    /// is `width * bpp` bytes — `bpp` is always 4 in even/odd mode, since
+    /// `Encoder::new()` requires uint RGBA 8-bit for `even_odd_interlace`),
+    /// prefixed with the 1-byte `pass_number` (`pass_idx + 1`) the decoder's
+    /// `handle_interlaced_idat` expects (section 5). Shared by
+    /// `add_even_odd_rows()`'s opportunistic mid-stream flush and
+    /// `finish()`/`finish_exact()`'s final flush of any remaining
+    /// less-than-`tile_rows` residue.
+    fn flush_even_odd_idat(&mut self, pass_idx: usize, row_count: usize) -> Result<()> {
+        let row_bytes = (self.width as usize) * self.bpp;
+        let drain_len = row_count * row_bytes;
+        let drained: Vec<u8> = self.even_odd_pending[pass_idx]
+            .drain(0..drain_len)
+            .collect();
+        let mut pass_payload = Vec::with_capacity(1 + drained.len());
+        pass_payload.push((pass_idx + 1) as u8);
+        pass_payload.extend_from_slice(&drained);
+        let (flag, compressed, _used_dict) = compress_with_fallback_dict(
+            &pass_payload,
+            self.opts_level,
+            self.zstd_dictionary.as_deref(),
+        )?;
+        self.uses_zstd |= flag == FLAG_ZSTD;
+        self.writer
+            .write_all(&write_chunk(CHUNK_IDAT, flag, &compressed))?;
+        Ok(())
+    }
+
+    /// Flushes as many full `opts_tile_rows`-sized chunks as are currently
+    /// buffered in each even/odd pass (zero, one, or more per call,
+    /// depending on how many rows `add_even_odd_rows()` was just given) —
+    /// mirrors row-strip mode's per-`tile_rows` `IDAT` granularity, applied
+    /// per-pass. Any remainder smaller than `opts_tile_rows` rows stays
+    /// buffered until either more rows arrive or `finish()`/`finish_exact()`
+    /// flushes it as a final, possibly-shorter `IDAT`.
+    fn flush_even_odd_full_tiles(&mut self) -> Result<()> {
+        let row_bytes = (self.width as usize) * self.bpp;
+        let tile_rows = self.opts_tile_rows as usize;
+        if tile_rows == 0 || row_bytes == 0 {
+            return Ok(());
+        }
+        for pass_idx in 0..EVEN_ODD_NUM_PASSES {
+            loop {
+                let buffered_rows = self.even_odd_pending[pass_idx].len() / row_bytes;
+                if buffered_rows < tile_rows {
+                    break;
+                }
+                self.flush_even_odd_idat(pass_idx, tile_rows)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Flushes any remaining buffered rows (fewer than `opts_tile_rows`,
+    /// otherwise `flush_even_odd_full_tiles()` would already have emitted
+    /// them) in each even/odd pass as one final `IDAT` each — called by
+    /// `finish()`/`finish_exact()` once every row has been submitted, since
+    /// a pass's last partial chunk would otherwise never be written. A pass
+    /// whose buffer happens to be empty (e.g. `height` is even and evenly
+    /// divisible by `2 * opts_tile_rows`) is skipped — an empty `IDAT` isn't
+    /// wrong, but it isn't produced by the non-streaming `encode()` path
+    /// either, and skipping it keeps output byte-for-byte comparable.
+    fn flush_even_odd_remaining(&mut self) -> Result<()> {
+        let row_bytes = (self.width as usize) * self.bpp;
+        if row_bytes == 0 {
+            return Ok(());
+        }
+        for pass_idx in 0..EVEN_ODD_NUM_PASSES {
+            let buffered_rows = self.even_odd_pending[pass_idx].len() / row_bytes;
+            if buffered_rows > 0 {
+                self.flush_even_odd_idat(pass_idx, buffered_rows)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Encodes a contiguous, top-to-bottom range of RGBA rows
+    /// (`width * 4 * n_rows` bytes, `n_rows` inferred from the buffer's
+    /// length) for even/odd interlace (`EncoderOptions::even_odd_interlace =
+    /// true`, section 5) — the streaming counterpart to `encode()`'s
+    /// whole-image `build_interlaced_idats(INTERLACE_EVEN_ODD, ...)` path.
+    ///
+    /// Unlike `add_tile()`, no color conversion is needed: `Encoder::new()`
+    /// already requires uint RGBA 8-bit for `even_odd_interlace = true`
+    /// (section 5's own restriction on which formats interlace supports),
+    /// so `rgba_rows` is used as-is. Each row is bucketed into one of the 2
+    /// passes (index 0 = even absolute row index, index 1 = odd) and
+    /// buffered; whenever a pass accumulates `opts_tile_rows`-or-more
+    /// complete rows, one or more `IDAT`s are flushed immediately — the same
+    /// `tile_rows`-sized granularity `add_tile()` uses for row-strip mode,
+    /// applied per-pass here since a single call's rows are split across
+    /// both passes by parity. `finish()`/`finish_exact()` flush any
+    /// remaining (`< opts_tile_rows`-row) buffered residue per pass as a
+    /// final `IDAT` each.
+    ///
+    /// May be called any number of times with any row-count grouping
+    /// (including one row at a time) — rows do not need to be submitted in
+    /// pass-aligned or `tile_rows`-aligned batches, only in overall
+    /// top-to-bottom image order across calls.
+    ///
+    /// # Errors
+    /// - `UnsupportedFeature` if this `Encoder` was not configured with
+    ///   `EncoderOptions::even_odd_interlace = true` (points the caller at
+    ///   `add_tile()`/`add_idim_tile()` instead).
+    /// - `UnsupportedFeature` if `rgba_rows.len()` is not a multiple of
+    ///   `width * 4` bytes, or if this call would submit more rows than
+    ///   `height` (declared in `Encoder::new()`).
+    /// - Any error from compression or writing to the underlying `W`.
+    pub fn add_even_odd_rows(&mut self, rgba_rows: &[u8]) -> Result<()> {
+        if !self.even_odd_interlace {
+            return Err(CafeError::UnsupportedFeature(
+                "add_even_odd_rows() called on an Encoder not configured with \
+                 EncoderOptions::even_odd_interlace — use add_tile()/add_idim_tile() instead"
+                    .into(),
+            ));
+        }
+        let row_bytes_rgba = (self.width as usize).checked_mul(4).ok_or_else(|| {
+            CafeError::UnsupportedFeature("overflow computing RGBA row size".into())
+        })?;
+        if row_bytes_rgba == 0 || !rgba_rows.len().is_multiple_of(row_bytes_rgba) {
+            return Err(CafeError::UnsupportedFeature(format!(
+                "add_even_odd_rows(): buffer length {} is not a multiple of width*4={row_bytes_rgba}",
+                rgba_rows.len()
+            )));
+        }
+        let n_rows = rgba_rows.len() / row_bytes_rgba;
+        let n_rows_u32 = u32::try_from(n_rows)
+            .map_err(|_| CafeError::UnsupportedFeature("row count exceeds u32::MAX".into()))?;
+        let new_rows_written = self.rows_written.checked_add(n_rows_u32).ok_or_else(|| {
+            CafeError::UnsupportedFeature("overflow accumulating rows_written".into())
+        })?;
+        if new_rows_written > self.height {
+            return Err(CafeError::UnsupportedFeature(format!(
+                "add_even_odd_rows(): submitting {n_rows} rows would exceed the declared height \
+                 {} ({} rows already written)",
+                self.height, self.rows_written
+            )));
+        }
+
+        for i in 0..n_rows {
+            let abs_row = self.rows_written + i as u32;
+            let pass_idx = (abs_row % 2) as usize;
+            let row_start = i * row_bytes_rgba;
+            let row_end = row_start + row_bytes_rgba;
+            self.even_odd_pending[pass_idx].extend_from_slice(&rgba_rows[row_start..row_end]);
+        }
+        self.rows_written = new_rows_written;
+
+        self.flush_even_odd_full_tiles()?;
+        Ok(())
+    }
+
+    /// Returns `true` once every declared row (row-strip mode, `iDIM` mode,
+    /// or even/odd interlace mode — all three count rows/tiles via
+    /// `rows_written`/`idim_next_tile_idx` the same way) has been submitted
+    /// — the same completeness check `finish()`/`finish_exact()` perform,
+    /// exposed so callers can assert it themselves before calling either.
     fn is_complete(&self) -> bool {
         match &self.idim {
             Some(_) => self.idim_next_tile_idx == self.idim_tile_order.len(),
@@ -3434,26 +3718,49 @@ impl<W: Write> Encoder<W> {
         }
     }
 
+    /// Builds the `UnsupportedFeature` message for an incomplete
+    /// `finish()`/`finish_exact()` call, naming the correct submission
+    /// method (`add_tile()`, `add_idim_tile()`, or `add_even_odd_rows()`)
+    /// for whichever mode this `Encoder` was configured in — shared so the
+    /// three modes' wording can't drift apart between `finish()` and
+    /// `finish_exact()`.
+    fn incomplete_message(&self, caller: &str) -> String {
+        match &self.idim {
+            Some(_) => format!(
+                "Encoder::{caller} called after only {} of {} declared iDIM tiles were \
+                 submitted via add_idim_tile()",
+                self.idim_next_tile_idx,
+                self.idim_tile_order.len()
+            ),
+            None if self.even_odd_interlace => format!(
+                "Encoder::{caller} called after only {} of {} declared rows were submitted \
+                 via add_even_odd_rows()",
+                self.rows_written, self.height
+            ),
+            None => format!(
+                "Encoder::{caller} called after only {} of {} declared rows were submitted \
+                 via add_tile()",
+                self.rows_written, self.height
+            ),
+        }
+    }
+
     /// Writes the `IEND` chunk and returns the underlying `writer`. Must be
-    /// called after all `height` rows (row-strip mode, via `add_tile()`) or
-    /// all tiles in the grid (`iDIM` mode, via `add_idim_tile()`) have been
-    /// submitted — returns `UnsupportedFeature` otherwise (a truncated
-    /// image would otherwise be silently accepted as valid).
+    /// called after all `height` rows (row-strip mode via `add_tile()`, or
+    /// even/odd interlace mode via `add_even_odd_rows()`) or all tiles in
+    /// the grid (`iDIM` mode, via `add_idim_tile()`) have been submitted —
+    /// returns `UnsupportedFeature` otherwise (a truncated image would
+    /// otherwise be silently accepted as valid). In even/odd mode, also
+    /// flushes any buffered residual rows (fewer than `opts_tile_rows`) per
+    /// pass as a final `IDAT` each before writing `IEND`.
     pub fn finish(mut self) -> Result<W> {
         if !self.is_complete() {
-            return Err(CafeError::UnsupportedFeature(match &self.idim {
-                Some(_) => format!(
-                    "Encoder::finish() called after only {} of {} declared iDIM tiles were \
-                     submitted via add_idim_tile()",
-                    self.idim_next_tile_idx,
-                    self.idim_tile_order.len()
-                ),
-                None => format!(
-                    "Encoder::finish() called after only {} of {} declared rows were submitted \
-                     via add_tile()",
-                    self.rows_written, self.height
-                ),
-            }));
+            return Err(CafeError::UnsupportedFeature(
+                self.incomplete_message("finish()"),
+            ));
+        }
+        if self.even_odd_interlace {
+            self.flush_even_odd_remaining()?;
         }
         self.writer
             .write_all(&write_chunk(CHUNK_IEND, FLAG_RAW, &[]))?;
@@ -3478,19 +3785,12 @@ impl<W: Write + Seek> Encoder<W> {
     /// `Read`).
     pub fn finish_exact(mut self) -> Result<W> {
         if !self.is_complete() {
-            return Err(CafeError::UnsupportedFeature(match &self.idim {
-                Some(_) => format!(
-                    "Encoder::finish_exact() called after only {} of {} declared iDIM tiles \
-                     were submitted via add_idim_tile()",
-                    self.idim_next_tile_idx,
-                    self.idim_tile_order.len()
-                ),
-                None => format!(
-                    "Encoder::finish_exact() called after only {} of {} declared rows were \
-                     submitted via add_tile()",
-                    self.rows_written, self.height
-                ),
-            }));
+            return Err(CafeError::UnsupportedFeature(
+                self.incomplete_message("finish_exact()"),
+            ));
+        }
+        if self.even_odd_interlace {
+            self.flush_even_odd_remaining()?;
         }
         self.writer
             .write_all(&write_chunk(CHUNK_IEND, FLAG_RAW, &[]))?;
@@ -4893,10 +5193,12 @@ mod tests {
             compute_decompress_budget(INTERLACE_ADAM7, COLOR_TYPE_RGBA, 4, 4, 16),
             71
         );
-        // Even/odd 4×4 RGBA: 64 + 2 = 66
+        // Even/odd 4×4 RGBA: 64 + h(4) = 68 (v1.11: margin widened from a
+        // flat EVEN_ODD_NUM_PASSES=2 to `h` rows, to allow the streaming
+        // encoder to split each pass across multiple IDATs).
         assert_eq!(
             compute_decompress_budget(INTERLACE_EVEN_ODD, COLOR_TYPE_RGBA, 4, 4, 16),
-            66
+            68
         );
     }
 

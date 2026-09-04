@@ -568,6 +568,27 @@ impl Default for EncodeOptions {
 /// design (row-major and Z-order both supported, one full rectangular tile
 /// submitted per call, in `tile_order()`'s sequence).
 ///
+/// **Even/odd interlace (`even_odd_interlace`, v1.11+)** is the second item
+/// from this list that turned out not to require whole-image buffering:
+/// unlike Adam7 (permanently out of scope, see below), even/odd's 2 passes
+/// (even rows, odd rows) are each already fully present within any
+/// contiguous row range — a streaming caller submitting rows top-to-bottom
+/// via `add_even_odd_rows()` can bucket each row into its pass by row
+/// parity and flush a pass's accumulated rows as an `IDAT` once enough have
+/// built up, with no need to see rows it hasn't been given yet. See the
+/// `even_odd_interlace` field below and `Encoder::add_even_odd_rows()`
+/// (`cafe.rs`) for the resolved design. Adam7 remains permanently
+/// unsupported by `Encoder<W>` (see below) — the asymmetry this creates
+/// (even/odd streamable, Adam7 not) is intentional and mirrors
+/// `Decoder<R>::next_tile()`'s own v1.9 resolution (streaming `iDIM`
+/// support without streaming interlace support at all); it no longer
+/// mirrors `Decoder<R>`'s interlace support *itself*, since
+/// `Decoder<R>::next_tile()` continues to reject even/odd files exactly
+/// like Adam7 ones (an even/odd pass is still not a spatial rectangle, so
+/// it cannot become a standalone `Tile` — this asymmetry, encode can
+/// stream row-parity passes but decode cannot yield row-parity passes as
+/// tiles, is inherent to the shapes of the two problems, not an oversight).
+///
 /// # Permanently out of scope (investigated, decided against — not a "v1" gap)
 /// Each of the following was investigated for a possible incremental
 /// `Encoder<W>`-compatible implementation; each turned out to require
@@ -604,20 +625,18 @@ impl Default for EncodeOptions {
 ///   `target_color_type` here is therefore restricted to the direct color
 ///   types (Gray/RGB/GrayAlpha/RGBA); `Encoder<W>::new()` rejects
 ///   `COLOR_TYPE_INDEXED` explicitly.
-/// - **`interlace_method` (Adam7/even-odd)**: Adam7's `extract_adam7_pass`
-///   reads directly from the *entire* image buffer, because each of its 7
-///   passes picks pixels scattered non-contiguously across the whole
-///   image (e.g. pass 0 = every 8th pixel in both X and Y) — a contiguous
-///   row-strip tile does not correspond to "one pass," it is a horizontal
-///   band spanning parts of all 7 passes, so generating passes requires the
-///   whole image up front. Even/odd is structurally simpler (2 passes =
-///   even/odd rows, both already present within any contiguous row range)
-///   and could in principle be supported per-tile, but doing so alone would
-///   introduce an asymmetry — even/odd supported, Adam7 not — that breaks
-///   the deliberate decision to treat both interlace methods at the same
-///   support level everywhere else in the codebase (`Decoder<R>::next_tile()`
-///   rejects both equally too, for the same architectural reason in reverse
-///   — see `Decoder`'s doc comment). Both remain rejected together.
+/// - **Adam7 interlace**: `extract_adam7_pass` reads directly from the
+///   *entire* image buffer, because each of its 7 passes picks pixels
+///   scattered non-contiguously across the whole image (e.g. pass 0 =
+///   every 8th pixel in both X and Y) — a contiguous row-strip tile does
+///   not correspond to "one pass," it is a horizontal band spanning parts
+///   of all 7 passes, so generating any pass requires the whole image up
+///   front. This is a structural property of Adam7 itself, not a
+///   pixel-data-volume problem `add_tile()`-style incremental buffering
+///   could solve. (Even/odd interlace does *not* share this problem — see
+///   `even_odd_interlace` above and `Encoder::add_even_odd_rows()` for why
+///   it's supported instead of being included in this permanently-out-of-
+///   scope list.)
 ///
 /// `auto_dictionary` and indexed-palette/interlace support all remain
 /// available through the existing `encode()`/`encode_indexed()` (`&str`
@@ -676,6 +695,27 @@ pub struct EncoderOptions {
     /// sequence). Default: `None` (row-strip tiling via `add_tile()`,
     /// unchanged from pre-v1.10 behavior).
     pub idim: Option<(u16, u16, u8)>,
+    /// Enables even/odd interlacing (`INTERLACE_EVEN_ODD`, section 5)
+    /// instead of the default non-interlaced layout. When `true`, rows must
+    /// be submitted via `Encoder::add_even_odd_rows()` instead of
+    /// `add_tile()`/`add_idim_tile()` (calling the wrong one for the
+    /// configured mode is an error) — see `add_even_odd_rows()`'s doc
+    /// comment (`cafe.rs`) for the exact submission contract (a contiguous,
+    /// top-to-bottom range of rows per call, not required to align to any
+    /// particular boundary).
+    ///
+    /// Mutually exclusive with `idim`, `use_filter_per_row`, and
+    /// `use_byte_shuffle` (`Encoder::new()` rejects combining any of them
+    /// with `even_odd_interlace = true`, mirroring `encode()`'s own
+    /// interlace-incompatibility checks). Also requires `sample_format =
+    /// None` (uint), `target_color_type = COLOR_TYPE_RGBA`, and
+    /// `target_bit_depth = None` (8) — the same restriction interlace
+    /// already has in `encode()` (section 5: Adam7/even-odd only operate on
+    /// uint RGBA 8-bit data). Adam7 is *not* offered here — see this
+    /// struct's doc comment above for why only even/odd could be made to
+    /// fit `Encoder<W>`'s incremental, zero-whole-image-buffer contract.
+    /// Default: `false`.
+    pub even_odd_interlace: bool,
 }
 
 impl Default for EncoderOptions {
@@ -697,6 +737,7 @@ impl Default for EncoderOptions {
             filter_heuristic: FilterHeuristic::Entropy,
             use_byte_shuffle: false,
             idim: None,
+            even_odd_interlace: false,
         }
     }
 }
