@@ -17,6 +17,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.12.0] - 2026-09-04
+
+### Added
+
+- **Format versioning, decoupled from the implementation version.** The project's release cadence (v1.6 through v1.10 in a matter of days) made it easy to mistake `cafe-rs`'s own SemVer for a signal about on-disk compatibility, when in nearly every one of those releases the on-disk bytes never changed at all. This release formalizes the distinction that was already true in practice into an explicit, documented rule going forward.
+  - **New public constants `FORMAT_VERSION_MAJOR`/`FORMAT_VERSION_MINOR`** (`src/constants.rs`, re-exported from the crate root): `1`/`0`. Deliberately **not** a byte written anywhere in a `.cafe` file — see `docs/CAFE-spec.md` section 13.3 for the full rationale (mirrors PNG's own decades-long precedent of no `IHDR` version field). These exist purely so the CLI and any future programmatic capability check have one source of truth instead of a version string duplicated independently across the CLI, the spec, and `AGENTS.md`.
+  - **New `-V`/`--version` flag on both `cafe-encode` and `cafe-decode`**: prints the crate's own SemVer (`CARGO_PKG_VERSION`) on one line and `CAFE format {major}.{minor}` on the next — two numbers, deliberately kept visually distinct, so a user diagnosing "can this build read/write files another CAFE tool produced" looks at the right one.
+  - **New `docs/CAFE-spec.md`/`.pt.md` section 13 ("Versioning")**: normatively defines the CAFE Format Version (`MAJOR.MINOR`, no patch component — a format has no "bugfix releases") as tracking only breaking changes or normative extensions, independent of `cafe-rs`'s own per-release SemVer bump. Declares **CAFE Format 1.0 frozen as of this release**, retroactively encompassing every on-disk addition shipped between the original v1.0 and now (filters 14–15, byte-shuffle, per-row filtering, 2D tiling, even/odd interlacing — all real wire-format additions, but never released under a distinct format-version label of their own) — see the new section for the full two-category breakdown (genuine on-disk additions vs. pure implementation work) and 13.3's rationale for why `IHDR` still has no version field.
+  - **New `AGENTS.md` "Implementation ↔ Format compatibility table"**: maps every `cafe-rs` release from v1.0 through v1.11 to the CAFE Format version it implements (all of them: 1.0), with a one-line note per release/range distinguishing genuine on-disk additions from pure implementation work — the same classification introduced in the spec's section 13, made scannable at a glance for future contributors deciding whether their own change needs a format-version bump.
+  - **README.md/README.pt.md, docs/DEVELOPER_GUIDE.md**: version headers reworded to show the implementation version and the CAFE Format version as two separate, clearly-labeled lines instead of a single ambiguous "Version" field (which had also drifted stale at "1.7.0" in both READMEs prior to this release, corrected as part of this pass — see "Fixed" below).
+
+### Fixed
+
+- **Stale version/test-count headers in `README.md`/`README.pt.md`**: both files' "Version"/"Versão" header lines had read `1.7.0` since v1.7 despite the crate having advanced to v1.11.0 across seven releases in between (v1.8 through v1.11), and the "Test Coverage" lines still cited a `streaming_encode` count of "30 tests" from the v1.10 release, one release stale relative to v1.11's actual 46. Both now read correctly and are covered by the same "two numbers" reasoning above (there is no longer a single ambiguous "Version" line to drift out of sync unnoticed).
+
+### Notes
+
+- **No on-disk/behavioral change whatsoever** — `FORMAT_VERSION_MAJOR`/`_MINOR` are read-only constants and `-V`/`--version` is a new, additive CLI flag; every existing `EncodeOptions`/`EncoderOptions`/`DecodeResult` field, chunk layout, and byte-for-byte encode/decode behavior is untouched. This release is a documentation-and-tooling clarification, versioned as a `cafe-rs` **minor** bump (new public API surface: the two constants and the CLI flag) rather than a patch, per the same SemVer discipline this release's own section 13 asks future contributors to apply to the *format* number.
+- Validated: `cargo build --lib`, `cargo build --bins`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --lib` (332 tests, unchanged), full workspace `cargo test` (unchanged pass count across all suites) all pass with zero regressions. Manually verified `cafe-encode --version`/`cafe-decode --version` both print `cafe-encode 1.12.0`/`cafe-decode 1.12.0` followed by `CAFE format 1.0`.
+
+---
+
 ## [1.11.0] - 2026-09-04
 
 ### Added

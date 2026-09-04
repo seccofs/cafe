@@ -94,11 +94,37 @@ fn usage() {
     eprintln!("                           for filmic/ACES). Requires --sample-format 1 and");
     eprintln!("                           --chdr-transfer 0 (linear); --color-type must be RGBA");
     eprintln!("                           (or left unspecified, which defaults to RGBA).");
+    eprintln!();
+    eprintln!("  -h, --help               Show this help message");
+    eprintln!("  -V, --version            Show implementation and CAFE format version");
+}
+
+/// Prints the crate (implementation) version alongside the CAFE *format*
+/// version — deliberately two separate numbers (see
+/// `cafe::{FORMAT_VERSION_MAJOR, FORMAT_VERSION_MINOR}`'s doc comment and
+/// docs/CAFE-spec.md's "Versioning" section): the implementation follows
+/// normal SemVer and changes on every release, while the format version
+/// only changes for an actual on-disk compatibility break or normative
+/// extension. A user diagnosing "can this cafe-encode read/write files
+/// another CAFE tool produced" should look at the format version, not the
+/// crate version.
+fn print_version() {
+    println!("cafe-encode {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "CAFE format {}.{}",
+        cafe::FORMAT_VERSION_MAJOR,
+        cafe::FORMAT_VERSION_MINOR
+    );
 }
 
 fn main() -> ExitCode {
     init_logger();
     let args: Vec<String> = env::args().collect();
+
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        print_version();
+        return ExitCode::SUCCESS;
+    }
 
     if args.len() < 3 {
         usage();

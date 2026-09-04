@@ -1,5 +1,8 @@
 # CAFE — Compression Adaptative Filtering Experiment
-## Especificação de Formato de Imagem (v1.2.1)
+## Especificação de Formato de Imagem
+
+**Versão do Formato CAFE: 1.0** (congelada em 2026-09-04 — ver seção 13 para o que isso significa e por que é um número *diferente* do da implementação de referência)
+**Implementação de referência:** `cafe-rs` v1.12.0
 
 **Autor:** Daniel Secco<br/>
 **Copyright** © 2026 Daniel Secco. Licenciado sob [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/) — ver seção 12.
@@ -8,9 +11,9 @@
 
 ## 1. Visão geral
 
-CAFE é um formato de imagem baseado em chunks (inspirado no PNG), usando **ZSTD** como algoritmo de compressão de bloco, com espaço reservado no formato para suporte a algoritmos adicionais no futuro. O encoder aplica fallback automático para dados brutos quando a compressão não é vantajosa. Suporta canal alfa por padrão, paleta indexada com empacotamento real de índices sub-byte, um conjunto amplo de filtros preditivos por bloco (tile), exibição entrelaçada, decodificação em streaming e metadados de aplicação (EXIF, JSON, ICC, XMP). Suporta HDR ao nível de formato (`Sample format` float/half no `IHDR` + chunk `cHDR`, seção 7), com caminho de extensão para pipeline de cores HDR completo sem quebra de compatibilidade.
+CAFE é um formato de imagem baseado em chunks (inspirado no PNG), usando **ZSTD** como algoritmo de compressão de bloco, com espaço reservado no formato para suporte a algoritmos adicionais no futuro. O encoder aplica fallback automático para dados brutos quando a compressão não é vantajosa. Suporta canal alfa por padrão, paleta indexada com empacotamento real de índices sub-byte, um conjunto amplo de filtros preditivos por bloco (tile), exibição entrelaçada (Adam7 e par/ímpar), codificação e decodificação em streaming, tiling 2D, e metadados de aplicação (EXIF, JSON, ICC, XMP). Suporta HDR ao nível de formato (`Sample format` float/half no `IHDR` + chunk `cHDR`, seção 7), com caminho de extensão para pipeline de cores HDR completo sem quebra de compatibilidade.
 
-Esta versão (v1.2.1) continua com aceleração SIMD agressiva para x86_64 (AVX2), adicionando pack/unpack vetorizado para amostras 1/2/4-bit (speedup 8-16x), expansão/redução de amostras 8→16/32 float (4-6x), byte-shuffle com blocking (melhoria de cache 10-20%), e Filter 3 melhorado (speedup 4-6x). Os 16 filtros preditivos da v1.1 permanecem; a implementação de referência agora inclui 252 testes abrangentes (197 unit + 6 integration roundtrip + 49 SIMD-específicos), zero TODOs/FIXMEs, SIMD feature-gated com detecção automática de CPU e fallback escalar, benchmarking Criterion, e despachante de operador tone-mapping para maior flexibilidade HDR.
+**Uma nota sobre números de versão**: este documento descreve o **Formato CAFE 1.0**, não uma release específica da implementação de referência `cafe-rs`. A versão da implementação (atualmente v1.12.0) avança com frequência muito maior do que o formato em si — ver a seção 13 para a justificativa completa de por que esses são rastreados como dois números independentes, e a tabela de compatibilidade do `AGENTS.md` para saber quais releases do `cafe-rs` implementam qual versão do formato. Toda funcionalidade descrita neste documento (os 16 filtros preditivos, byte-shuffle, filtragem por linha, tiling 2D, ambos os métodos de entrelaçamento, todos os tipos de chunk definidos, extensibilidade HDR) faz parte do Formato 1.0 — nenhuma delas exige uma versão de formato mais nova, mesmo tendo sido lançada ao longo de muitas releases diferentes do `cafe-rs`.
 
 ---
 
@@ -630,6 +633,46 @@ Requisitos específicos da auditoria sobre as adições v1.1:
 
 - **Byte-shuffle**: validação rígida de `bpp ∈ {2, 4, 8, 16}` antes de qualquer indexação; overflow-proteção em `largura × altura × bpp`; verificação de tamanho exato do buffer (truncamento → erro tratável, nunca read out-of-bounds); derivação defensiva da altura do tile (`len / bytes_por_linha` com `bytes_por_linha` guardado contra zero).
 - **Tone mapping**: divisões por zero evitadas (EOTF com denominador protegido; `max_luminance.max(1.0)`); NaN/Inf em canais tratados explicitamente via `is_finite()`; overflow em `width × height × 16` via `checked_mul`; validação de tamanho exato do buffer float; valores fora de [0, máx] clamped antes do operador.
+
+---
+
+## 13. Versionamento
+
+Esta seção existe para resolver uma fonte de confusão que cresceu junto com a implementação de referência: **o *formato* CAFE e a *implementação de referência* CAFE (o crate Rust `cafe`, `cafe-rs`) são versionados de forma independente, propositalmente, e seus números de versão não devem necessariamente andar juntos.**
+
+### 13.1 Dois números, dois significados
+
+| | **Versão do Formato CAFE** | **Versão da implementação (`cafe-rs`)** |
+|---|---|---|
+| O que descreve | O layout de bytes em disco: assinatura, conjunto de campos do `IHDR`, tipos de chunk, enums `Filter method`/`Interlace method`/`Compression method`, e tudo mais que um decoder precisa para interpretar corretamente bytes como pixels. | O crate/CLI em Rust: sua API pública Rust, flags de CLI, características de performance, heurísticas, superfície da API de streaming, dependências, CI e documentação. |
+| Onde vive | Documentado aqui (nesta spec) e na tabela de compatibilidade do `AGENTS.md`. **Não** é gravado como byte em nenhum lugar de um arquivo `.cafe` — ver 13.3 para o motivo. | Campo `version` do `Cargo.toml`, seguindo [SemVer](https://semver.org/) normal. |
+| Quando muda | Somente para uma **mudança incompatível** (um arquivo antes válido se torna ilegível por um decoder conformante da nova versão, ou vice-versa) ou uma **extensão normativa** (um novo tipo de chunk, valor de enum, ou significado de campo que um decoder precisa conhecer para interpretar corretamente — mesmo que decoders antigos possam ignorá-lo com segurança). | A cada release que muda o crate de forma visível ao usuário — novas flags de CLI, novas heurísticas, trabalho de performance, correções de bugs, mudanças de CI, documentação — independentemente de um único byte do formato em disco ter sido tocado. |
+| Formato do número | `MAJOR.MINOR` (sem componente patch — um formato não tem "releases de bugfix", apenas extensões compatíveis ou quebras incompatíveis) | `MAJOR.MINOR.PATCH` (SemVer completo) |
+
+**A consequência prática**: o `cafe-rs` pode lançar `1.12`, `1.13`, `2.0`, `3.5`, e assim por diante — impulsionado inteiramente por churn de implementação (novos kernels SIMD, novas APIs de streaming, novos algoritmos de paleta, ergonomia de CLI) — enquanto o **Formato CAFE** permanece em, digamos, `1.0` o tempo todo, porque nada desse trabalho mudou um único byte que um decoder precisaria interpretar diferente. Reciprocamente, um hipotético release de patch `cafe-rs 1.12.1` poderia, em princípio, *exigir* Formato `1.1` caso adicionasse um novo tipo de chunk genuinamente normativo — os dois números se movem de forma independente em ambas as direções.
+
+### 13.2 Status atual
+
+**Formato CAFE: 1.0** (congelado a partir do `cafe-rs` v1.12.0, 2026-09-04). Isso cobre tudo o que está documentado nesta spec até essa data: o conjunto completo de funcionalidades v1.0–v1.11 já lançado na implementação de referência — todos os 16 filtros preditivos (seção 4.3.1), byte-shuffle (4.3.2), filtragem por linha (4.3.1.1), tiling 2D (4.2), entrelaçamento Adam7 e par/ímpar (seção 5), todos os tipos de chunk definidos (seção 4), e extensibilidade HDR (seção 7). Veja a tabela de compatibilidade do `AGENTS.md` para o mapeamento completo de quais releases do `cafe-rs` implementam qual versão de formato.
+
+Tudo que foi lançado entre a release original v1.0 e este congelamento (v1.1 até v1.11 da
+*implementação*, ou seja, tudo antes desta release v1.12 puramente documental) se revelou, após inspeção, ser exatamente uma de duas coisas:
+
+1. **Uma adição genuína ao formato em disco** (ex: filtros 14–15, byte-shuffle, filtragem por linha, tiling 2D, entrelaçamento par/ímpar) — todas essas são retroativamente entendidas como parte do que o Formato 1.0 já define cumulativamente a partir deste congelamento. Elas nunca foram de fato um "Formato 1.1", "Formato 1.2" etc., porque nenhum decoder *lançado* anteriormente jamais precisou interoperar com um decoder que não as tivesse sob um rótulo "1.0" compartilhado — o próprio número de versão da implementação era a única coisa rastreando compatibilidade durante esse período, informalmente.
+2. **Trabalho de implementação puro, sem consequência em disco** — aceleração SIMD, novos algoritmos de quantização de paleta, novas heurísticas de seleção de filtro, as APIs de streaming `Encoder<W>`/`Decoder<R>` (cuja saída é idêntica byte a byte à chamada equivalente de `encode()`/`decode()` de arquivo completo), flags de CLI, workflows de CI e documentação. Nada disso jamais precisou de um bump de versão de formato, e — em retrospecto — misturar isso com compatibilidade de formato em um único número é exatamente a confusão que esta seção existe para encerrar.
+
+A partir deste ponto, a distinção passa a ser aplicada prospectivamente, não apenas documentada em retrospecto: qualquer mudança proposta a esta spec deve ser classificada como uma extensão do Formato 1.x (ou uma quebra Formato 2.0) *antes* de ser mesclada, independentemente de qual número de versão do `cafe-rs` ela acompanhe no lançamento.
+
+### 13.3 Por que não há campo de versão no `IHDR`
+
+O `IHDR` (seção 4.1) não tem um byte `format_version`, e nenhum está planejado. Essa é uma escolha de design deliberada, não uma omissão:
+
+- **O precedente do próprio PNG**: o PNG nunca teve um campo de versão no `IHDR` ao longo de mais de duas décadas de extensões (entrelaçamento, cor indexada, profundidade de 16 bits, `iCCP`, `acTL`/APNG como extensão ancilar posterior, etc.) — a compatibilidade é carregada inteiramente pela convenção de nomeação crítico/ancilar (seção 3.1) e pela validação de enum por campo, exatamente o mecanismo que o CAFE já herdou do PNG e usa em toda a seção 4.
+- **Adicionar um agora seria, por si só, a quebra que pretende evitar**: o `IHDR` é um payload fixo de 14 bytes (seção 4.1) lido posicionalmente por todo decoder existente. Inserir um campo de versão mudaria esse layout, o que é precisamente uma quebra classe Formato-2.0 — e teria que ser introduzido pela própria primeira versão de formato capaz de descrever "este arquivo declara sua própria versão", um problema inevitável de ovo-e-galinha para um campo cujo objetivo inteiro é descrever compatibilidade desde o arquivo 0.
+- **Os mecanismos existentes já cobrem extensibilidade real**: um decoder que não entende um novo tipo de chunk *ancilar* o ignora com segurança (tipos ancilares começando com letra minúscula são definidos como seguramente ignoráveis, seção 3.1); um decoder que não entende um novo valor de enum *crítico* (um novo `Filter method`, `Interlace method`, ou `Color type`) rejeita corretamente o arquivo por completo, que é o comportamento pretendido para funcionalidades genuinamente-necessárias-mas-não-reconhecidas — ver a discussão da seção 5.1 sobre exatamente esse trade-off para `Interlace method` especificamente. Nenhum dos dois casos se beneficia de um número de versão adicional: o decoder já sabe como interpretar o campo em questão, ou não sabe, e a divisão crítico/ancilar já existente já diz a ele em qual situação está.
+- **`compression_method` é o campo que mais se aproxima de uma declaração de "capacidade"** (nota "Semântica precisa" da seção 4.1) — mas ele deliberadamente descreve apenas capacidade de *codec* (uma bitmask que um decoder verifica contra seu próprio conjunto de codecs suportados), não a versão estrutural do próprio formato, e estender esse mesmo mecanismo para cobrir o formato inteiro é uma mudança maior e mais invasiva do que o problema (confusão de documentação entre dois números) realmente exige.
+
+Se um futuro Formato 2.0 genuinamente incompatível algum dia for necessário, o mecanismo recomendado continua sendo o mesmo que o próprio PNG usaria: uma **nova assinatura de arquivo** (seção 2) — a própria assinatura do CAFE já foi desenhada com esse precedente em mente, distinta da do PNG — em vez de um campo de versão dentro de uma estrutura que um decoder 2.0 não pode presumir que encontrará no mesmo lugar.
 
 ---
 

@@ -7,7 +7,8 @@
 
 Um formato de imagem moderno baseado em chunks, inspirado em PNG, com suporte a compressão ZSTD, filtros preditivos avançados (16 tipos), paleta indexada, metadados estruturados (EXIF, JSON, ICC, XMP) e entrelaçamento progressivo.
 
-**Versão**: 1.11.0  
+**Versão da Implementação** (`cafe-rs`, este crate): 1.12.0
+**Versão do Formato CAFE**: 1.0 (congelada em 2026-09-04 — um número separado, versionado de forma independente; veja a seção 13 de `docs/CAFE-spec.md` e a tabela de compatibilidade do `AGENTS.md` para entender por que o crate pode avançar para 1.12, 2.0, etc. sem que o formato em disco mude)  
 **Status**: ✅ Completo, auditado, e com aceleração SIMD  
 **Compatibilidade**: Rust 2021+
 

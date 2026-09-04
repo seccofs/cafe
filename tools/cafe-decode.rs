@@ -52,11 +52,31 @@ fn usage() {
     eprintln!(
         "  --show-stats                 Print per-chunk compression statistics, if available"
     );
+    eprintln!();
+    eprintln!("  -h, --help                   Show this help message");
+    eprintln!("  -V, --version                Show implementation and CAFE format version");
+}
+
+/// See the identical helper in `cafe-encode.rs` for rationale on why the
+/// implementation (crate) version and the CAFE *format* version are two
+/// separate, independently-changing numbers.
+fn print_version() {
+    println!("cafe-decode {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "CAFE format {}.{}",
+        cafe::FORMAT_VERSION_MAJOR,
+        cafe::FORMAT_VERSION_MINOR
+    );
 }
 
 fn main() -> ExitCode {
     init_logger();
     let args: Vec<String> = env::args().collect();
+
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        print_version();
+        return ExitCode::SUCCESS;
+    }
 
     if args.len() < 3 {
         usage();

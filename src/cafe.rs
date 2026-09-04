@@ -41,6 +41,7 @@ mod simd_shuffle;
 mod tonemap;
 
 // Public re-exports for convenience
+pub use constants::{FORMAT_VERSION_MAJOR, FORMAT_VERSION_MINOR};
 pub use error::{CafeError, Result};
 pub use tonemap::ToneMapOperator;
 pub use types::{

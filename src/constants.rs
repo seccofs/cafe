@@ -3,6 +3,32 @@
 /// File signature: \x89CAFE\r\n\x1a\n (section 2 of the spec).
 pub const SIGNATURE: [u8; 9] = [0x89, 0x43, 0x41, 0x46, 0x45, 0x0D, 0x0A, 0x1A, 0x0A];
 
+// --- Format version (docs/CAFE-spec.md "Versioning" section) ---
+//
+// This is deliberately **not** a byte written anywhere in a `.cafe` file —
+// there is no `IHDR` version field, by design (see the spec's "Versioning"
+// section for the full rationale: it would be a breaking change to the very
+// field meant to describe compatibility, and PNG's own decades of stability
+// without one is the closest prior art). `FORMAT_VERSION_MAJOR`/`_MINOR`
+// exist purely so the crate's `--version` output and any future
+// programmatic capability check have a single source of truth to read from,
+// instead of a string hardcoded independently in the CLI, the spec, and
+// `AGENTS.md`.
+//
+// This is a *documentation and tooling* version, independent of
+// `CARGO_PKG_VERSION` (the crate/implementation's own SemVer, which changes
+// on every release regardless of whether the on-disk format changed at
+// all). Bump `FORMAT_VERSION_MINOR` only for a backward-compatible normative
+// extension (e.g. a new ancillary chunk type, a new enum value an old
+// decoder can safely reject); bump `FORMAT_VERSION_MAJOR` (and reset minor
+// to 0) only for a change that makes previously-valid files unreadable by a
+// conformant decoder of the prior major version, or vice versa. Routine
+// implementation work (SIMD, new heuristics, streaming API additions whose
+// on-disk bytes are byte-for-byte identical to the existing whole-file
+// encoder, CI, CLI flags, documentation) never bumps either number.
+pub const FORMAT_VERSION_MAJOR: u32 = 1;
+pub const FORMAT_VERSION_MINOR: u32 = 0;
+
 // --- Enum constants (sections 3.2 and 4.1 of the spec) ---
 pub const FLAG_RAW: u8 = 0x00;
 pub const FLAG_ZSTD: u8 = 0x01;

@@ -1,5 +1,8 @@
 # CAFE — Compression Adaptive Filtering Experiment
-## Image Format Specification (v1.2.1)
+## Image Format Specification
+
+**CAFE Format Version: 1.0** (frozen 2026-09-04 — see section 13 for what this means and why it is a *different* number from the reference implementation's own version)
+**Reference implementation:** `cafe-rs` v1.12.0
 
 **Author:** Daniel Secco<br/>
 **Copyright** © 2026 Daniel Secco. Licensed under [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/) — see section 12.
@@ -8,9 +11,9 @@
 
 ## 1. Overview
 
-CAFE is a chunk-based image format (inspired by PNG), using **ZSTD** as the block compression algorithm, with space reserved in the format for future algorithms. The encoder applies automatic fallback to raw data when compression is not beneficial. Supports alpha channel by default, indexed palette with real sub-byte index packing, a broad set of predictive filters per block (tile), interlaced display, streaming decoding, and application metadata (EXIF, JSON, ICC, XMP). Supports HDR at the format level (`Sample format` float/half in `IHDR` + `cHDR` chunk, section 7), with an extension path for a complete HDR color pipeline without breaking compatibility.
+CAFE is a chunk-based image format (inspired by PNG), using **ZSTD** as the block compression algorithm, with space reserved in the format for future algorithms. The encoder applies automatic fallback to raw data when compression is not beneficial. Supports alpha channel by default, indexed palette with real sub-byte index packing, a broad set of predictive filters per block (tile), interlaced display (Adam7 and even/odd), streaming encode and decode, 2D tiling, and application metadata (EXIF, JSON, ICC, XMP). Supports HDR at the format level (`Sample format` float/half in `IHDR` + `cHDR` chunk, section 7), with an extension path for a complete HDR color pipeline without breaking compatibility.
 
-This version (v1.2.1) continues with aggressive SIMD acceleration for x86_64 (AVX2), adding vectorized pack/unpack for 1/2/4-bit samples (8-16x speedup), sample expansion/reduction 8→16/32 float (4-6x), byte-shuffle blocking (10-20% cache improvement), and improved Filter 3 (4-6x speedup). All 16 predictive filters from v1.1 remain; the reference implementation now includes 252 comprehensive tests (197 unit + 6 integration roundtrip + 49 SIMD-specific), zero TODOs/FIXMEs, feature-gated SIMD with automatic CPU detection and scalar fallback, Criterion benchmarking, and tone-mapping operator dispatcher for enhanced HDR flexibility.
+**A note on version numbers**: this document describes **CAFE Format 1.0**, not any particular release of the `cafe-rs` reference implementation. The implementation's own version (currently v1.12.0) advances far more frequently than the format itself — see section 13 for the full rationale on why these are tracked as two independent numbers, and `AGENTS.md`'s compatibility table for which `cafe-rs` releases implement which format version. Every feature described in this document (all 16 predictive filters, byte-shuffle, per-row filtering, 2D tiling, both interlace methods, all defined chunk types, HDR extensibility) is part of Format 1.0 — none of it requires a newer format version, even though it shipped across many different `cafe-rs` releases.
 
 ---
 
@@ -652,6 +655,45 @@ Specific audit requirements for v1.1 additions:
 
 - **Byte-shuffle**: strict validation of `bpp ∈ {2, 4, 8, 16}` before any indexing; overflow-protection on `width × height × bpp`; exact buffer size check (truncation → handleable error, never read out-of-bounds); defensive tile height derivation (`len / bytes_per_line` with `bytes_per_line` guarded against zero).
 - **Tone mapping**: division by zero avoided (EOTF with protected denominator; `max_luminance.max(1.0)`); NaN/Inf in channels handled explicitly via `is_finite()`; overflow on `width × height × 16` via `checked_mul`; exact float buffer size validation; values outside [0, max] clamped before operator.
+
+---
+
+## 13. Versioning
+
+This section exists to resolve a source of confusion that grew alongside the reference implementation: **the CAFE *format* and the CAFE *reference implementation* (the `cafe` Rust crate, `cafe-rs`) are versioned independently, on purpose, and their version numbers are not expected to move together.**
+
+### 13.1 Two numbers, two meanings
+
+| | **CAFE Format Version** | **Implementation version (`cafe-rs`)** |
+|---|---|---|
+| What it describes | The on-disk byte layout: signature, `IHDR` field set, chunk types, `Filter method`/`Interlace method`/`Compression method` enums, and everything else a decoder needs to correctly parse bytes into pixels. | The Rust crate/CLI: its public Rust API, CLI flags, performance characteristics, heuristics, streaming API surface, dependencies, CI, and documentation. |
+| Where it lives | Documented here (this spec) and in `AGENTS.md`'s compatibility table. **Not** encoded as a byte anywhere in a `.cafe` file — see 13.3 for why. | `Cargo.toml`'s `version` field, following normal [SemVer](https://semver.org/). |
+| When it changes | Only for a **breaking change** (a previously-valid file becomes unreadable by a conformant decoder of the new version, or vice versa) or a **normative extension** (a new chunk type, enum value, or field meaning that a decoder must know about to interpret correctly — even if old decoders can safely ignore it). | On every release that changes the crate in any user-visible way — new CLI flags, new heuristics, performance work, bug fixes, CI changes, documentation — regardless of whether a single byte of the on-disk format was touched. |
+| Format | `MAJOR.MINOR` (no patch component — a format doesn't have "bugfix releases", only compatible extensions or incompatible breaks) | `MAJOR.MINOR.PATCH` (full SemVer) |
+
+**The practical consequence**: `cafe-rs` can release `1.12`, `1.13`, `2.0`, `3.5`, and so on — driven entirely by implementation churn (new SIMD kernels, new streaming APIs, new palette algorithms, CLI ergonomics) — while the **CAFE Format** stays at, say, `1.0` the entire time, because none of that work changed a single byte that a decoder would need to interpret differently. Conversely, a hypothetical `cafe-rs 1.12.1` patch release could in principle *require* Format `1.1` if it happened to add a genuinely new normative chunk type — the two numbers move independently in both directions.
+
+### 13.2 Current status
+
+**CAFE Format: 1.0** (frozen as of `cafe-rs` v1.12.0, 2026-09-04). This covers everything documented in this spec as of that date: the full v1.0–v1.11 feature set already shipped in the reference implementation — all 16 predictive filters (section 4.3.1), byte-shuffle (4.3.2), per-row filtering (4.3.1.1), 2D tiling (4.2), Adam7 and even/odd interlacing (section 5), all defined chunk types (section 4), and HDR extensibility (section 7). See `AGENTS.md`'s compatibility table for the full mapping of which `cafe-rs` releases implement Format 1.0.
+
+Everything shipped between the original v1.0 release and this freeze (v1.1 through v1.11 of the *implementation*, i.e. everything before this documentation-only v1.12 release) turned out, on inspection, to be exactly one of two things:
+
+1. **A genuine on-disk format addition** (e.g. filters 14–15, byte-shuffle, per-row filtering, 2D tiling, even/odd interlacing) — all of these are retroactively understood as part of what Format 1.0 already, cumulatively, defines as of this freeze. They were never actually a "Format 1.1", "Format 1.2", etc., because no prior *released* decoder ever had to interoperate with a decoder lacking them under a shared "1.0" label — the implementation's own version number was the only thing tracking compatibility during that period, informally.
+2. **Pure implementation work with zero on-disk consequence** — SIMD acceleration, new palette quantization algorithms, new filter-selection heuristics, the streaming `Encoder<W>`/`Decoder<R>` APIs (whose output is byte-for-byte identical to the equivalent whole-file `encode()`/`decode()` call), CLI flags, CI workflows, and documentation. None of this ever needed a format version bump, and — with hindsight — conflating it with format compatibility in a single number is exactly the confusion this section exists to end.
+
+From this point forward, the distinction is enforced going forward, not just documented in hindsight: any change proposed to this spec must be classified as either a Format 1.x extension (or a Format 2.0 break) *before* being merged, independent of whatever `cafe-rs` version number it ships in.
+
+### 13.3 Why there is no version field in `IHDR`
+
+`IHDR` (section 4.1) has no `format_version` byte, and none is planned. This is a deliberate design choice, not an oversight:
+
+- **PNG's own precedent**: PNG has never had a version field in `IHDR` across more than two decades of extensions (interlacing, indexed-color, 16-bit depth, `iCCP`, `acTL`/APNG as a later ancillary-chunk extension, etc.) — compatibility is instead carried entirely by the critical/ancillary naming convention (section 3.1) and per-field enum validation, exactly the mechanism CAFE already inherited from PNG and uses throughout section 4.
+- **Adding one now would itself be the breaking change it's meant to prevent**: `IHDR` is a fixed 14-byte payload (section 4.1) read positionally by every existing decoder. Inserting a version field would change that layout, which is precisely a Format-2.0-class break — and it would have to be introduced by the very first format version capable of describing "this file declares its own version," an unavoidable chicken-and-egg problem for a field whose entire point is describing compatibility from file 0.
+- **The existing mechanisms already cover real-world extensibility**: a decoder that doesn't understand a new *ancillary* chunk type safely ignores it (ancillary types starting with a lowercase letter are defined to be safely skippable, section 3.1); a decoder that doesn't understand a new *critical* enum value (a new `Filter method`, `Interlace method`, or `Color type`) correctly rejects the file outright, which is the intended behavior for genuinely-required-but-unrecognized features — see section 5.1's discussion of exactly this trade-off for `Interlace method` specifically. Neither case benefits from an additional version number: the decoder either already knows how to parse the field in question, or it doesn't, and the existing critical/ancillary split already tells it which situation it's in.
+- **`compression_method` is the one field that comes closest to a "capability" declaration** (section 4.1's "Precise semantics" note) — but it deliberately describes only *codec* capability (a bitmask a decoder checks against its own supported codec set), not the format's own structural version, and extending that same mechanism to cover the whole format is a larger, more invasive change than the problem (documentation confusion between two numbers) actually calls for.
+
+If a future, genuinely incompatible Format 2.0 is ever needed, the recommended mechanism remains the same one PNG itself would use: a **new file signature** (section 2) — CAFE's own signature was itself designed with this precedent in mind, distinct from PNG's — rather than a version field inside a structure a 2.0 decoder can't assume it will find in the same place.
 
 ---
 
