@@ -234,6 +234,7 @@ name = "cafe-codec"
 version = "0.1.0"
 dependencies = [
  "cafe-format",
+ "criterion",
  "proptest",
  "zstd",
 ]

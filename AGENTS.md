@@ -1064,6 +1064,152 @@ binaries.
       new test). All workspace tests, `cargo fmt --all --check`, `cargo
       clippy --all-targets -- -D warnings`, and `cargo +nightly check
       --manifest-path fuzz/Cargo.toml` pass cleanly.
+- [x] **SIMD (0.2) for predictors (post-Palette-implementation
+      follow-up).** Phase 10's SIMD no-go verdict was benchmark-driven and
+      always left the door open to revisit; this phase reopens it with a
+      fresh benchmark, per `AGENTS.md`'s "every feature proves itself with
+      a benchmark first" principle. A throwaway benchmark PoC (three
+      successive throwaway `crates/cafe-bench/examples/simd_poc*.rs`
+      files, all deleted after use) measured, on synthetic "photo-like"
+      images up to 4096x4096 at the encoder's default ZSTD level (19):
+      predictor selection alone takes ~1.2s, ZSTD alone (on the raw
+      buffer) ~18.3s, and the full `encode_bytes` pipeline ~46.4s — ZSTD
+      dominates encode time so overwhelmingly (~97%) that vectorizing the
+      predictors alone would save at most ~3% end-to-end at this level. A
+      follow-up PoC sweeping ZSTD levels 1/3/6 on the same 4096x4096 image
+      inverted that finding: at level 1, predictor selection (566ms)
+      dominates ZSTD (145ms) by 4:1, and level 3 is similar — the balance
+      only flips back to ZSTD-dominated around level 6.
+
+      **Scope decision:** SIMD is a real win specifically for callers who
+      choose a fast `EncoderOptions::level` (interactive/preview use), not
+      a general win at the encoder's own default level 19 — this is
+      recorded here as the honest scope, not oversold as an
+      across-the-board speedup. Within that scope, two further boundaries
+      were set from a close reading of `predictor.rs`'s existing
+      structure: `filter_row` (encoder direction) is vectorized for all 6
+      predictor codes, since every one reads only already-known input
+      bytes (`row`/`prev_row`) with zero byte-to-byte output dependency —
+      genuinely embarrassingly parallel; `unfilter_row` (decoder
+      direction) is vectorized only for `None`/`Up`, the two codes whose
+      reconstruction doesn't depend on the just-reconstructed left
+      neighbor within the *output* buffer (`Sub`/`Average`/`Paeth`/
+      `Gradient` decoding is an inherently serial prefix dependency,
+      `out[x]` needs `out[x-bpp]`, not a good SIMD target without a
+      parallel-prefix-scan rewrite nothing in this phase's benchmark data
+      showed a need for — decode is already fast, 244ms for a 67MB image
+      in the same PoC). Both x86_64 (AVX2) and aarch64 (NEON) are
+      implemented together in this phase, per the "scalar-is-reference,
+      SIMD-is-optimization" architecture `AGENTS.md` already committed to
+      from day one — AVX2 is runtime-detected (`is_x86_feature_detected!`,
+      since not every x86_64 CPU has it); NEON needs no runtime check,
+      since every aarch64 target Rust supports mandates it as a baseline
+      ISA feature.
+
+      **Implementation:** a new `cafe-codec::simd` module (private,
+      `mod simd` not `pub mod`, since it's purely an internal optimization
+      with no public API surface of its own) with two architecture-gated
+      submodules, `x86` (`#[cfg(target_arch = "x86_64")]`) and `neon`
+      (`#[cfg(target_arch = "aarch64")]`), plus a shared
+      `filter_row_simd`/`unfilter_row_simd` dispatcher pair that returns
+      `Option<Vec<u8>>` (`None` whenever no SIMD path applies: unsupported
+      code, a row shorter than a new `MIN_SIMD_LEN = 64` tuning threshold
+      below which SIMD setup overhead isn't worth it, or no matching CPU
+      feature/architecture at all). `predictor::filter_row`/
+      `unfilter_row` were split into a thin SIMD-attempting wrapper plus a
+      newly-public `filter_row_scalar`/`unfilter_row_scalar` pair — the
+      former keeps its exact prior name and signature (so
+      `crate::tile`/`crate::encoder`/`crate::decoder` needed zero changes
+      to opt into SIMD transparently), the latter is the
+      format-defining scalar reference this crate's parity tests check
+      every SIMD path against, per `AGENTS.md`'s scalar-is-reference
+      architecture. Every predictor's "left"/"up-left" neighbor is just
+      `row`/`prev_row` read at a `bpp`-byte-earlier offset, so a single
+      **row-shift trick** (unaligned vector loads at both `row[i]` and
+      `row[i - bpp]`) makes every implementation `bpp`-generic — no
+      per-`bpp`-value (1/2/3/4/6/8/12/16) specialization anywhere; the
+      first `bpp` bytes of each row (where `x - bpp` would read
+      out-of-bounds) always fall through to the scalar reference path via
+      each SIMD function's own scalar prologue.
+
+      **Math identities** (see `x86.rs`'s module doc for the full
+      derivations, shared verbatim by `neon.rs`): `Sub`/`Up` need only a
+      single wrapping 8-bit subtract per lane; `Gradient`'s `(a + b - c)
+      mod 256` is already pure wrapping arithmetic (unlike Paeth), so it
+      needs no widening either; `Average`'s `floor((a+b)/2)` uses the
+      classic `(a & b) + ((a ^ b) >> 1)` bit-trick to avoid u16 widening,
+      with the per-byte `>> 1` itself done via a 16-bit-lane shift plus an
+      `0x7F` mask (AVX2) or NEON's direct `vhaddq_u8` half-add instruction
+      (no trick needed — NEON has a native floor-average op AVX2 lacks);
+      `Paeth` is the one predictor with no shortcut around its actual
+      `|p-a|`/`|p-b|`/`|p-c|` comparisons, so it genuinely widens each
+      16-byte (AVX2) or 8-byte (NEON) half-lane to 16-bit, computes the
+      three distances and a branchless select matching
+      `paeth_predictor`'s exact tie-breaking rule (`pa <= pb && pa <= pc`
+      -> left, expressed as negated-greater-than compares so ties resolve
+      identically to the scalar reference), then narrows back to `u8`
+      before the final wrapping subtract.
+
+      **Testing:** a new `crates/cafe-codec/tests/simd_parity.rs` (8
+      tests: 6 exhaustive deterministic sweeps — first-row/with-prev-row
+      x filter/unfilter, an extreme-values 0x00/0xFF sweep specifically
+      targeting Paeth/Average/Gradient's widen-narrow/branchless-select
+      math at saturation boundaries, and a full filter-then-unfilter
+      round-trip through whichever path is actually dispatched — each
+      run across every spec-relevant `bpp` value (1/2/3/4/6/8/12/16) and
+      21 row lengths straddling both SIMD lane widths (16 for NEON, 32
+      for AVX2) and the `MIN_SIMD_LEN` threshold, from empty/short-scalar-
+      only through several-lanes-plus-uneven-tail; plus 2 proptest
+      properties as an unbiased complement to the hand-picked deterministic
+      lengths). All 8 passed against this development machine's real
+      AVX2 hardware. **NEON validation** followed the plan decided for
+      this phase: `neon.rs` was confirmed to compile and type-check
+      correctly for `aarch64-unknown-linux-gnu` via a standalone
+      throwaway `rustc --crate-type lib --target aarch64-unknown-linux-gnu`
+      harness (full `cargo check --target aarch64-unknown-linux-gnu`
+      wasn't possible in this environment — the workspace's `zstd-sys` C
+      dependency needs an `aarch64-linux-gnu-gcc` cross-compiler this
+      Windows machine doesn't have installed — so this narrower
+      rustc-direct check covers exactly the new code's own syntax/types,
+      independent of that unrelated cross-compilation gap); real
+      byte-for-byte NEON execution is deferred to a new CI job (below),
+      never asserted as locally-verified when it wasn't.
+
+      A new Criterion benchmark, `crates/cafe-codec/benches/
+      predictor_simd.rs` (`cafe-codec` gained `criterion` as a
+      dev-dependency and its own `[[bench]]` target, mirroring
+      `cafe-bench`'s existing benchmark setup one crate over), measures
+      scalar vs SIMD-dispatched throughput per predictor on a
+      representative 1024px RGBA row (`bpp=4`, 4096 bytes) — confirmed
+      speedups on this development machine's AVX2 hardware: Sub 29.3x,
+      Up 26.1x, Average 21.2x, Gradient 19.2x, Paeth 8.0x (lower, as
+      expected, since it's the one predictor that couldn't avoid
+      widen/narrow overhead), and decoder-side Up 11.7x.
+
+      **CI:** a new `simd-parity-aarch64` job in
+      `.github/workflows/ci.yml` runs `cargo test -p cafe-codec --test
+      simd_parity --release` natively on GitHub's `ubuntu-24.04-arm`
+      hosted runner (free for public repos) — this is the real NEON
+      hardware validation this phase's local environment couldn't
+      provide, closing the loop the module doc comment above promises
+      rather than leaving it as an unchecked claim; the pre-existing
+      `ci.yml` bottom-of-file comment listing "not yet added" future CI
+      work had its now-obsolete
+      "aarch64-cross-compile / arm64-native-test (deferred to 0.2)" line
+      removed, since this phase is that deferred item, done.
+
+      8 new tests in `crates/cafe-codec/tests/simd_parity.rs` (see the
+      Testing paragraph above for the breakdown), for 269 total workspace
+      tests (up from 261 at the end of the Palette-implementation phase):
+      127 `cafe-codec` (lib, unchanged) + 12 + 3 + 8 (`cafe-codec`
+      integration files, up from 12 + 3 — the new `simd_parity.rs`) + 60
+      `cafe-format` lib (unchanged) + 3 `chunk_proptest` (unchanged) + 16
+      `cafe-cli` (unchanged) + 11 golden (unchanged) + 13 spec-invariants
+      (unchanged) + 17 `cafe-bench` (unchanged) + 2 doc-comment updates
+      (`x86.rs`/`neon.rs`, not counted as tests). All workspace tests,
+      `cargo fmt --all --check`, `cargo clippy --all-targets --
+      -D warnings`, and `cargo +nightly check --manifest-path
+      fuzz/Cargo.toml` pass cleanly.
 
 ## Commands
 

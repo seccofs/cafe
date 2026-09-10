@@ -13,3 +13,8 @@ zstd.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "predictor_simd"
+harness = false

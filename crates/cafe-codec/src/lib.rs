@@ -18,6 +18,7 @@ pub mod error;
 pub mod morton;
 pub mod palette;
 pub mod predictor;
+mod simd;
 pub mod tile;
 pub mod tiling;
 pub mod zstd_codec;

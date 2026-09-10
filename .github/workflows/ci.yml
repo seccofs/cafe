@@ -67,6 +67,23 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  simd-parity-aarch64:
+    name: SIMD parity (native aarch64 / NEON)
+    # Native ARM64 runner (GitHub-hosted, free for public repos) — this is
+    # the real NEON validation the `crates/cafe-codec/src/simd/neon.rs`
+    # module doc promises, since no ARM hardware is available in local
+    # development (AGENTS.md's SIMD v0.2 phase). `dispatch_*`'s NEON path
+    # runs unconditionally on aarch64 (no runtime feature check needed,
+    # unlike AVX2), so simply running the existing parity test suite here
+    # exercises real NEON instructions on real hardware.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run SIMD parity tests natively on aarch64/NEON
+        run: cargo test -p cafe-codec --test simd_parity --release
+
   fuzz:
     name: Fuzz smoke test (${{ matrix.target }})
     runs-on: ubuntu-latest
@@ -103,6 +120,5 @@ jobs:
           if-no-files-found: ignore
 
 # Not yet added, tracked in AGENTS.md's phased roadmap:
-#   - aarch64-cross-compile / arm64-native-test (phase: SIMD, deferred to 0.2)
 #   - compression-regression (needs cafe-bench + corpus, phase 1-2)
 #   - security-audit / cargo-deny (re-add once dependencies stabilize)

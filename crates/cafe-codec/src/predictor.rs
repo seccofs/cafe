@@ -59,7 +59,7 @@ fn gradient_predictor(left: u8, up: u8, up_left: u8) -> u8 {
 /// the single validation point every caller (both `filter_row` and
 /// `unfilter_row`) goes through, so a malformed/hostile predictor byte is
 /// never silently reinterpreted.
-fn predict(code: u8, left: u8, up: u8, up_left: u8) -> Result<u8> {
+pub(crate) fn predict(code: u8, left: u8, up: u8, up_left: u8) -> Result<u8> {
     match code {
         PREDICTOR_NONE => Ok(0),
         PREDICTOR_SUB => Ok(left),
@@ -91,7 +91,30 @@ fn neighbors(row: &[u8], prev_row: Option<&[u8]>, x: usize, bpp: usize) -> (u8, 
 /// computes `residual = original_byte - prediction` (`u8` wrapping,
 /// spec section 4.4.1). `prev_row` is the already-reconstructed previous
 /// row of the same tile, or `None` for the tile's first row.
+///
+/// Tries a SIMD fast path first (`crate::simd::filter_row_simd`, 0.2,
+/// covering all 6 codes) when this row is long enough to be worth it;
+/// [`filter_row_scalar`] is always the format-defining reference and is
+/// what every SIMD path is checked against by this crate's parity tests
+/// (`AGENTS.md`'s "scalar-is-reference, SIMD-is-optimization"
+/// architecture).
 pub fn filter_row(row: &[u8], prev_row: Option<&[u8]>, code: u8, bpp: usize) -> Result<Vec<u8>> {
+    if let Some(simd_result) = crate::simd::filter_row_simd(row, prev_row, code, bpp) {
+        return Ok(simd_result);
+    }
+    filter_row_scalar(row, prev_row, code, bpp)
+}
+
+/// Scalar reference implementation of [`filter_row`] — the format
+/// definition itself, never bypassed for correctness. See
+/// [`crate::simd`]'s module doc for the scalar-is-reference architecture
+/// this split exists for.
+pub fn filter_row_scalar(
+    row: &[u8],
+    prev_row: Option<&[u8]>,
+    code: u8,
+    bpp: usize,
+) -> Result<Vec<u8>> {
     if code == PREDICTOR_NONE {
         return Ok(row.to_vec());
     }
@@ -109,7 +132,26 @@ pub fn filter_row(row: &[u8], prev_row: Option<&[u8]>, code: u8, bpp: usize) -> 
 /// reconstructed strictly left-to-right within the row, since `Sub`/
 /// `Average`/`Paeth`/`Gradient` all depend on the just-reconstructed left
 /// neighbor within the *output* buffer, not the still-filtered input.
+///
+/// Tries a SIMD fast path first (`crate::simd::unfilter_row_simd`, 0.2,
+/// covering only `PREDICTOR_UP` — see that module's doc comment for why
+/// the other serially-dependent codes aren't vectorized here);
+/// [`unfilter_row_scalar`] is always the format-defining reference.
 pub fn unfilter_row(
+    filtered: &[u8],
+    prev_row: Option<&[u8]>,
+    code: u8,
+    bpp: usize,
+) -> Result<Vec<u8>> {
+    if let Some(simd_result) = crate::simd::unfilter_row_simd(filtered, prev_row, code, bpp) {
+        return Ok(simd_result);
+    }
+    unfilter_row_scalar(filtered, prev_row, code, bpp)
+}
+
+/// Scalar reference implementation of [`unfilter_row`] — the format
+/// definition itself, never bypassed for correctness.
+pub fn unfilter_row_scalar(
     filtered: &[u8],
     prev_row: Option<&[u8]>,
     code: u8,
