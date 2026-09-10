@@ -9,8 +9,7 @@
 pub const SIGNATURE: [u8; 9] = [0x89, 0x43, 0x41, 0x46, 0x45, 0x0D, 0x0A, 0x1A, 0x0A];
 
 /// Maximum bytes a single chunk's decompression may produce before the
-/// decoder must reject it (spec section 8.2, CWE-409). 1 GiB, carried
-/// forward unchanged from the frozen v1 lineage (`old/src/constants.rs`).
+/// decoder must reject it (spec section 8.2, CWE-409). 1 GiB.
 pub const MAX_DECOMPRESSED_CHUNK_SIZE: u64 = 1024 * 1024 * 1024;
 
 /// Maximum `tiles_x * tiles_y` an `iDIM` chunk may declare before the

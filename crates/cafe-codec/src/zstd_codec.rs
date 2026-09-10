@@ -1,9 +1,7 @@
 //! ZSTD compression/decompression with raw fallback (spec section 3.2).
 //!
-//! Adapted from the frozen reference lineage's `old/src/codec.rs`, dropped
-//! down to the single `compress_with_fallback`/`decompress_chunk` pair 0.1
-//! needs — no dictionary variant (`zDIC` is deferred to 0.4, per
-//! `AGENTS.md`).
+//! A single `compress_with_fallback`/`decompress_chunk` pair — no
+//! dictionary variant (`zDIC` is deferred to 0.4, per `AGENTS.md`).
 
 use crate::error::{CodecError, Result};
 use cafe_format::constants::MAX_DECOMPRESSED_CHUNK_SIZE;
@@ -77,10 +75,9 @@ pub fn decompress_with_limit(flag: u8, data: &[u8], limit: u64) -> Result<Vec<u8
 /// (`MAX_DECOMPRESSED_CHUNK_SIZE`, spec section 8.2). Prefer
 /// [`decompress_with_limit`] with a tighter, IHDR-derived budget when the
 /// expected output size is known (e.g. one `IDAT`'s worth of pixels) —
-/// this is the coarse per-chunk ceiling alone, without the accumulated
-/// per-image budget refinement the old lineage's `compute_decompress_budget`
-/// added (deferred until this crate actually needs multi-IDAT accumulation
-/// tracking, Phase 7+).
+/// this is the coarse per-chunk ceiling alone, without accumulated
+/// per-image budget tracking across multiple `IDAT`s (deferred until this
+/// crate actually needs it).
 pub fn decompress_chunk(flag: u8, data: &[u8]) -> Result<Vec<u8>> {
     decompress_with_limit(flag, data, MAX_DECOMPRESSED_CHUNK_SIZE)
 }

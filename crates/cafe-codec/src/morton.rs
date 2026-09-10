@@ -3,10 +3,9 @@
 //! also end up nearby in file/decode order — useful for a progressive,
 //! per-region preview while streaming.
 //!
-//! Ported from `old/src/types.rs`'s `morton_code`/`morton_decode` (same
-//! naive bit-interleaving algorithm, unchanged — it's already `O(1)`-ish
-//! per call at 32 iterations and correctness-critical, not a performance
-//! hot path worth optimizing before a benchmark asks for it).
+//! Naive bit-interleaving algorithm — it's already `O(1)`-ish per call at
+//! 32 iterations and correctness-critical, not a performance hot path
+//! worth optimizing before a benchmark asks for it.
 
 /// Interleaves the bits of `x` and `y` into a single Morton (Z-order)
 /// code: `x`'s bits occupy the even positions, `y`'s the odd positions.

@@ -8,9 +8,8 @@
 //! call always produces byte-identical output — this matters for reproducible
 //! benchmarks and, later, for golden files.
 //!
-//! Formulas are adapted from `old/benches/benchmark_image.rs` and
-//! `old/tests/*_test.rs`, which independently arrived at the same
-//! hand-rolled-hash / LCG approach for the same reason: no `rand` dependency.
+//! Formulas use a hand-rolled-hash / LCG approach for the same reason:
+//! no `rand` dependency.
 
 use image::{Rgba, RgbaImage};
 
@@ -31,11 +30,9 @@ pub enum Pattern {
     Noise { seed: u64 },
     /// Smooth sinusoidal bands plus a small multiplicative-hash noise term:
     /// mid-frequency, "textured" content that is neither as trivial as
-    /// `Gradient` nor as adversarial as `Noise`. Formula ported verbatim
-    /// from `old/tests/dictionary_regression.rs`'s `"photo"` pattern (also
-    /// duplicated in `old/tests/tile_rows_benchmark.rs`), renamed here
-    /// since it stands in for procedural texture, not photographic content
-    /// (deferred to the real `corpus/photo/` category, see `AGENTS.md`).
+    /// `Gradient` nor as adversarial as `Noise`. Named for procedural
+    /// texture, not photographic content (the real `corpus/photo/`
+    /// category is separate, see `AGENTS.md`).
     Texture,
 }
 
@@ -84,9 +81,7 @@ fn generate_checkerboard(width: u32, height: u32, square_size: u32) -> RgbaImage
     })
 }
 
-/// 64-bit LCG step using the MMIX/Knuth constants, matching
-/// `old/benches/benchmark_image.rs`'s hand-rolled generator so both
-/// implementations are cross-checkable against the same formula.
+/// 64-bit LCG step using the MMIX/Knuth constants.
 fn lcg_next(state: u64) -> u64 {
     state
         .wrapping_mul(6_364_136_223_846_793_005)
@@ -111,8 +106,7 @@ fn generate_texture(width: u32, height: u32) -> RgbaImage {
         let r = (128.0 + 100.0 * (fx * 6.0).sin()) as u8;
         let g = (128.0 + 100.0 * (fy * 5.0).cos()) as u8;
         let b = (128.0 + 80.0 * ((fx + fy) * 8.0).sin()) as u8;
-        // Knuth multiplicative-hash constants, matching the noise term in
-        // old/tests/dictionary_regression.rs's "photo" pattern.
+        // Knuth multiplicative-hash constants.
         let noise = ((x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40503)) % 17) as u8;
         Rgba([r.wrapping_add(noise), g.wrapping_add(noise / 2), b, 255])
     })

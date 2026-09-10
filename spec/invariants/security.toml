@@ -1,6 +1,4 @@
 # Normative: CAFE-spec.md section 8 (Security Considerations).
-# Values carried forward unchanged from the frozen v1 lineage
-# (old/src/constants.rs), whose reasoning still applies verbatim.
 
 # 8.2: protection against decompression bomb (CWE-409). Maximum bytes a
 # single chunk's decompression may produce before the decoder must reject
@@ -19,7 +17,7 @@ max_tile_count = 1_048_576 # 1024 * 1024
 max_width = false
 max_height = false
 
-# Removed vs. the frozen v1 lineage (old/src/constants.rs): no
-# max_palette_entries ceiling, since indexed color / PLTE does not exist in
-# 0.1 (deferred to 0.3, see spec section 11).
-removed_from_v1 = ["max_palette_entries"]
+# Ceilings deliberately excluded from v0.1: no max_palette_entries
+# ceiling, since indexed color / PLTE does not exist in 0.1 (deferred to
+# 0.3, see spec section 11).
+excluded_from_v0_1 = ["max_palette_entries"]

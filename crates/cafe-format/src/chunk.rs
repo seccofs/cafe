@@ -1,8 +1,7 @@
 //! CAFE chunk structure (spec section 3): Length + Type + Flag + Data +
 //! CRC32.
 //!
-//! Adapted from the frozen reference lineage's `old/src/chunk.rs`. The
-//! streaming (`Read`-based) primitive is deferred until `cafe-codec`'s
+//! The streaming (`Read`-based) primitive is deferred until `cafe-codec`'s
 //! `Decoder<R>` needs it (Phase 5+) — this module only provides the
 //! slice-based path needed to parse a whole in-memory `.cafe` file, which
 //! is enough for Phase 4's golden-file tests.
@@ -104,10 +103,8 @@ pub fn read_chunk(buf: &[u8], offset: usize) -> Result<ReadChunk> {
 
     // SECURITY (CWE-409): reject a declared Length exceeding the
     // decompression ceiling before even attempting to slice/allocate that
-    // much data — mirrors read_chunk_from's streaming-path check in the
-    // frozen reference lineage, applied here to the slice-based path too
-    // since a chunk's raw Data length is itself attacker-controlled even
-    // before any decompression happens.
+    // much data — a chunk's raw Data length is itself attacker-controlled
+    // even before any decompression happens.
     if length as u64 > MAX_DECOMPRESSED_CHUNK_SIZE {
         return Err(CafeError::DecompressionLimitExceeded {
             limit: MAX_DECOMPRESSED_CHUNK_SIZE,

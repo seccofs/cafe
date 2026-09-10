@@ -1,6 +1,6 @@
 # Normative: CAFE-spec.md section 4.3.1 (Predictors).
-# Reduced to 6 from the frozen v1 lineage's 16 (old/src/filter.rs). Chosen
-# per-row, structurally, from day one - there is no per-block mode.
+# 6 predictors total, chosen per-row, structurally, from day one - there
+# is no per-block mode.
 #
 # NOTE: all root-level keys are declared here, at the top of the file,
 # before any `[[array-of-tables]]` section below - in TOML, a bare
@@ -9,11 +9,12 @@
 
 count = 6
 
-# Removed vs. the frozen v1 lineage (old/docs/CAFE-spec.md section 4.3.1,
-# codes 5-15): MED, Simple Median, 2nd Order, 4-way Directional (x4),
-# Context-Based, TR-Directional, Weighted (adaptive). All 10 removed
-# predictors are reference-only in old/src/filter.rs.
-removed_from_v1 = [
+# Predictors deliberately excluded from v0.1's scope: MED, Simple Median,
+# 2nd Order, 4-way Directional (x4), Context-Based, TR-Directional,
+# Weighted (adaptive). Higher-order/adaptive predictors like these add
+# encoder complexity without a benchmark yet justifying them (see
+# AGENTS.md's "every feature proves itself with a benchmark first").
+excluded_from_v0_1 = [
     "MED",
     "SimpleMedian",
     "2ndOrder",

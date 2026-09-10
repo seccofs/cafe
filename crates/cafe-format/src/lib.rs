@@ -6,8 +6,7 @@
 //! chunks per the CAFE format specification. See `cafe-codec` for the
 //! encoder/decoder pipeline built on top of this crate.
 //!
-//! Status: skeleton (workspace reboot, phase 0). See `AGENTS.md` at the
-//! workspace root for the implementation roadmap.
+//! See `AGENTS.md` at the workspace root for the implementation roadmap.
 
 pub mod chunk;
 pub mod constants;

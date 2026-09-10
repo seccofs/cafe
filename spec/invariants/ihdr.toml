@@ -8,11 +8,10 @@
 
 total_payload_bytes = 12
 
-# Removed vs. the frozen v1 lineage (old/docs/CAFE-spec.md section 4.1):
-# no `filter_method` byte (filtering is always per-row, section 4.3.1) and
-# no `interlace_method` byte (interlacing removed entirely). This shrinks
-# IHDR from 14 bytes (v1) to 12 bytes (0.1).
-removed_fields_from_v1 = ["filter_method", "interlace_method"]
+# Fields deliberately excluded from v0.1's IHDR: no `filter_method` byte
+# (filtering is always per-row, section 4.3.1) and no `interlace_method`
+# byte (interlacing removed entirely). This keeps IHDR at 12 bytes.
+excluded_fields_from_v0_1 = ["filter_method", "interlace_method"]
 
 [[field]]
 name = "width"

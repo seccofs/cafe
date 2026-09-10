@@ -1,7 +1,6 @@
 //! CAFE format error types.
 //!
-//! Adapted from the v1 reference implementation (`old/src/error.rs`),
-//! trimmed to the format-level concerns owned by this crate (chunk framing,
+//! Scoped to the format-level concerns owned by this crate (chunk framing,
 //! signature, IHDR). Codec-level error variants (unsupported predictor,
 //! palette limits, etc.) belong in `cafe-codec::error` instead.
 

@@ -109,19 +109,19 @@ fn ihdr_first_and_iend_last_are_critical_and_singular() {
     assert_eq!(order.first(), Some(&"IHDR"));
     assert_eq!(order.last(), Some(&"IEND"));
 
-    // v0.1 removed these three critical/ancillary chunk types from the v1
-    // lineage (indexed palette, HDR metadata, ZSTD dictionary) - assert
-    // none of them accidentally leaked back into the defined chunk list.
-    let removed: Vec<&str> = doc["removed_from_v1"]
+    // v0.1 deliberately excludes these three chunk types (indexed
+    // palette, HDR metadata, ZSTD dictionary) - assert none of them
+    // accidentally leaked back into the defined chunk list.
+    let excluded: Vec<&str> = doc["excluded_from_v0_1"]
         .as_array()
-        .expect("removed_from_v1 array")
+        .expect("excluded_from_v0_1 array")
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    for ty in &removed {
+    for ty in &excluded {
         assert!(
             !chunks.iter().any(|c| c["type"].as_str() == Some(*ty)),
-            "{ty:?} is listed as removed_from_v1 but still appears in [[chunk]]"
+            "{ty:?} is listed as excluded_from_v0_1 but still appears in [[chunk]]"
         );
     }
 }
@@ -130,10 +130,7 @@ fn ihdr_first_and_iend_last_are_critical_and_singular() {
 fn ihdr_field_sizes_sum_to_declared_total() {
     let doc = load("ihdr.toml");
     let total = as_int(&doc["total_payload_bytes"]);
-    assert_eq!(
-        total, 12,
-        "IHDR payload must be 12 bytes in v0.1 (14 in the old v1 lineage)"
-    );
+    assert_eq!(total, 12, "IHDR payload must be 12 bytes in v0.1");
 
     let fields = doc["field"].as_array().expect("field array");
     let sum: i64 = fields.iter().map(|f| as_int(&f["size_bytes"])).sum();
@@ -142,17 +139,17 @@ fn ihdr_field_sizes_sum_to_declared_total() {
         "sum of IHDR field sizes must equal total_payload_bytes"
     );
 
-    // Removed fields vs v1 lineage must not appear as fields here.
-    let removed: Vec<&str> = doc["removed_fields_from_v1"]
+    // Fields deliberately excluded from v0.1 must not appear as fields here.
+    let excluded: Vec<&str> = doc["excluded_fields_from_v0_1"]
         .as_array()
-        .expect("removed_fields_from_v1 array")
+        .expect("excluded_fields_from_v0_1 array")
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    for name in &removed {
+    for name in &excluded {
         assert!(
             !fields.iter().any(|f| f["name"].as_str() == Some(*name)),
-            "{name:?} is listed as removed_fields_from_v1 but still appears in [[field]]"
+            "{name:?} is listed as excluded_fields_from_v0_1 but still appears in [[field]]"
         );
     }
 }
@@ -268,10 +265,7 @@ fn idim_field_sizes_sum_to_declared_total() {
 fn predictors_are_six_contiguous_codes_starting_at_zero() {
     let doc = load("predictors.toml");
     let count = as_int(&doc["count"]);
-    assert_eq!(
-        count, 6,
-        "v0.1 reduces predictors to 6 (from 16 in the old v1 lineage)"
-    );
+    assert_eq!(count, 6, "v0.1 defines exactly 6 predictors");
 
     let predictors = doc["predictor"].as_array().expect("predictor array");
     assert_eq!(predictors.len() as i64, count);
@@ -302,21 +296,20 @@ fn predictors_are_six_contiguous_codes_starting_at_zero() {
         }
     }
 
-    let removed = doc["removed_from_v1"]
+    let excluded = doc["excluded_from_v0_1"]
         .as_array()
-        .expect("removed_from_v1 array");
+        .expect("excluded_from_v0_1 array");
     assert_eq!(
-        removed.len(),
+        excluded.len(),
         10,
-        "6 kept + 10 removed must equal the v1 lineage's 16 total predictors"
+        "10 higher-order/adaptive predictors are documented as excluded from v0.1's scope"
     );
 }
 
 /// Cross-file consistency: `max_tile_count` is referenced both in
 /// `idim.toml` (as a property of the chunk) and `security.toml` (as a
 /// decoder-enforced ceiling) - they must agree, or a future edit to one
-/// without the other would silently reintroduce the CWE-789-class DoS the
-/// frozen v1 lineage already fixed once (old/src/constants.rs).
+/// without the other would silently reintroduce a CWE-789-class DoS.
 #[test]
 fn max_tile_count_agrees_across_idim_and_security_invariants() {
     let idim = load("idim.toml");
@@ -330,12 +323,12 @@ fn max_tile_count_agrees_across_idim_and_security_invariants() {
 }
 
 #[test]
-fn security_decompression_ceiling_matches_v1_lineage_default() {
+fn security_decompression_ceiling_is_one_gib() {
     let doc = load("security.toml");
     assert_eq!(
         as_int(&doc["max_decompressed_chunk_size_bytes"]),
         1_073_741_824,
-        "must stay 1 GiB, matching old/src/constants.rs::MAX_DECOMPRESSED_CHUNK_SIZE"
+        "MAX_DECOMPRESSED_CHUNK_SIZE must stay 1 GiB"
     );
     assert_eq!(doc["max_width"].as_bool(), Some(false));
     assert_eq!(doc["max_height"].as_bool(), Some(false));

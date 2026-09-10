@@ -1,9 +1,7 @@
 //! `iDIM` chunk (spec section 4.2): ancillary, optional — declares tile
 //! partitioning and scan order for streaming.
 //!
-//! Ported from `old/src/types.rs`'s `iDim` struct (renamed `Idim` for
-//! standard Rust casing — the old lineage's `#[allow(non_camel_case_types)]`
-//! is not carried forward), trimmed to what `cafe-format` needs: framing
+//! `Idim` (standard Rust casing) covers what `cafe-format` needs: framing
 //! and structural validation. Tile-order enumeration (row-major vs.
 //! Morton) is `cafe-codec`'s concern (it needs `MAX_TILE_COUNT`-checked
 //! geometry before allocating anything proportional to tile count) — see
@@ -62,8 +60,7 @@ impl Idim {
     /// ceiling-division derivation from `width`/`height`, a known
     /// `scan_order`, and `tile_count() <= MAX_TILE_COUNT` — checked
     /// *before* any caller computes tile order or allocates anything
-    /// proportional to tile count (CWE-789/CWE-409-class, mirrors
-    /// `old/src/cafe.rs::handle_idim_chunk`).
+    /// proportional to tile count (CWE-789/CWE-409-class).
     pub fn validate(&self, width: u32, height: u32) -> Result<()> {
         if self.tile_width == 0 || self.tile_height == 0 {
             return Err(CafeError::InvalidIdim(
@@ -110,8 +107,7 @@ impl Idim {
     /// when `width`/`height` are not exact multiples of the tile size —
     /// spec section 4.2: "no padding"). Saturating arithmetic throughout
     /// so a caller that skipped [`Idim::validate`] gets `0` instead of a
-    /// panic on an inconsistent combination (defense in depth, mirrors
-    /// `old/src/types.rs::iDim::tile_dimensions`'s doc comment).
+    /// panic on an inconsistent combination (defense in depth).
     pub fn tile_dimensions(&self, tile_x: u16, tile_y: u16, width: u32, height: u32) -> (u32, u32) {
         let tile_width = if tile_x == self.tiles_x.saturating_sub(1) {
             width.saturating_sub((tile_x as u32).saturating_mul(self.tile_width as u32))
@@ -253,8 +249,8 @@ mod tests {
     fn test_validate_rejects_excessive_tile_count() {
         // tile_width=tile_height=1, tiles_x=tiles_y=65535: individually
         // valid u16s, consistent with a 65535x65535 image, but their
-        // product (~4.29 billion) is the classic CWE-789 exploit from the
-        // old lineage's MAX_TILE_COUNT doc comment.
+        // product (~4.29 billion) is the classic CWE-789 exploit
+        // MAX_TILE_COUNT's doc comment warns about.
         let idim = Idim {
             tile_width: 1,
             tile_height: 1,

@@ -2,11 +2,9 @@
 //! entropy *before* ZSTD compression by predicting each sample byte from
 //! already-known causal neighbors and storing only the residual.
 //!
-//! Formulas adapted from the frozen reference lineage's `old/src/filter.rs`
-//! (`paeth_predictor`/`gradient_predictor`/dispatcher), narrowed from that
-//! crate's 16 predictors down to the 6 the new spec defines, and dropping
-//! the SIMD fast paths (deferred to 0.2, per `AGENTS.md`) — this module is
-//! the scalar reference the SIMD paths will eventually need to match.
+//! Scalar-only for now (SIMD fast paths deferred to 0.2, per `AGENTS.md`)
+//! — this module is the scalar reference the SIMD paths will eventually
+//! need to match.
 
 use crate::error::{CodecError, Result};
 
@@ -132,9 +130,7 @@ pub fn unfilter_row(
 /// Zero-order entropy (bits/byte) of `data`'s byte histogram — the
 /// per-row predictor selection heuristic (spec section 4.3.1: "how an
 /// encoder chooses which of the 6 predictor codes to use for a given row
-/// is entirely an encoder-side decision"). Adapted from the frozen
-/// reference lineage's `old/src/filter.rs::shannon_entropy` (same formula,
-/// only the candidate predictor set shrank from 16 to 6).
+/// is entirely an encoder-side decision").
 fn shannon_entropy(data: &[u8]) -> f64 {
     if data.is_empty() {
         return 0.0;
@@ -165,10 +161,9 @@ fn shannon_entropy(data: &[u8]) -> f64 {
 /// very first byte, where every predictor's neighbors are zero).
 ///
 /// Only `Entropy`-style scoring is implemented in Phase 6 — real
-/// compression-test or MSAD-based heuristics (see `old/src/filter.rs` for
-/// prior art) are optimization work deferred until `cafe-bench` shows they
-/// justify the extra encode cost (`AGENTS.md`'s "every feature proves
-/// itself with a benchmark first").
+/// compression-test or MSAD-based heuristics are optimization work
+/// deferred until `cafe-bench` shows they justify the extra encode cost
+/// (`AGENTS.md`'s "every feature proves itself with a benchmark first").
 pub fn choose_best_row_predictor(row: &[u8], prev_row: Option<&[u8]>, bpp: usize) -> (u8, Vec<u8>) {
     let mut best_code = PREDICTOR_NONE;
     let mut best_score = f64::INFINITY;

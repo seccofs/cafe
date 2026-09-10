@@ -8,8 +8,7 @@
 //! naive floor CAFE's predictors + tiling must beat, not as a CAFE stand-in
 //! anymore.
 //!
-//! Uses `zstd::encode_all` (the same API `old/src/codec.rs` wraps as
-//! `compress_with_fallback`) with the same default level, 19, matching
+//! Uses `zstd::encode_all` with the same default level, 19, matching
 //! `cafe_codec::encoder::EncoderOptions::default().level`.
 
 use cafe_codec::{encode_bytes, EncoderOptions};
@@ -17,10 +16,9 @@ use cafe_format::constants::{COLOR_TYPE_RGBA, SAMPLE_FORMAT_UINT};
 use image::RgbaImage;
 use std::io;
 
-/// ZSTD compression level used for the raw-buffer placeholder measurement.
-///
-/// Matches `old/src/constants.rs::ZSTD_LEVEL`, so numbers stay comparable
-/// once `cafe-codec` grows a real encoder at the same level.
+/// ZSTD compression level used for the raw-buffer placeholder measurement,
+/// matching `cafe_codec::encoder::EncoderOptions::default().level` so
+/// numbers stay comparable.
 pub const ZSTD_LEVEL: i32 = 19;
 
 /// Compressed-size measurements for a single generated image.

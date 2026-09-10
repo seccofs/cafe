@@ -4,16 +4,6 @@
 **CAFE Format Version: 0.1** (in development — see section 10 for versioning
 policy)
 
-**Relationship to the frozen reference lineage:** this document describes a
-**new, non-wire-compatible redesign** of CAFE. The original implementation
-(`cafe-rs` v1.12.0, format version 1.0, documented in
-[`old/docs/CAFE-spec.md`](../old/docs/CAFE-spec.md)) is frozen and kept only
-as a reference implementation under `old/` — it is not extended or
-maintained going forward, and files it produces are **not** readable by a
-decoder built against this spec, despite reusing the same signature bytes
-(section 2) and PNG-inspired chunk framing (section 3). See `AGENTS.md` at
-the repository root for the full rationale behind the reboot.
-
 **Author:** Daniel Secco<br/>
 **Copyright** © 2026 Daniel Secco. Licensed under
 [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/) — see section 9.
@@ -31,10 +21,9 @@ Format 0.1 is deliberately minimal. It supports uint8/uint16 and float32
 samples, gray/RGB/gray+alpha/RGBA color types, a single unified tiling
 mechanism (`iDIM`), row-major or Z-order (Morton) scan, per-row predictive
 filtering with 6 predictors, automatic raw-vs-compressed fallback per chunk,
-and ancillary application metadata (EXIF, JSON, ICC, XMP). Everything else
-that existed in the old reference lineage — 16 predictors, Adam7 and
-even/odd interlacing, indexed palettes, ZSTD dictionaries, byte-shuffle,
-advanced HDR tone-mapping — is either removed permanently or deferred to a
+and ancillary application metadata (EXIF, JSON, ICC, XMP). Interlacing
+(Adam7, even/odd), indexed palettes, ZSTD dictionaries, byte-shuffle, and
+advanced HDR tone-mapping are either removed permanently or deferred to a
 later, evidence-driven version (see section 11).
 
 **Guiding principle:** the decoder defines what the format *is*, and stays
@@ -153,15 +142,14 @@ R,G,B,A; RGB stores R,G,B; gray+alpha stores Gray,Alpha; gray stores only
 the gray channel. There is no indexed color type in 0.1 (deferred, section
 11).
 
-**Compared to the frozen reference lineage (`old/docs/CAFE-spec.md`
-section 4.1):** `IHDR` here has **no `Filter method` field** and **no
+**Design note:** `IHDR` has **no `Filter method` field** and **no
 `Interlace method` field**. Filtering is always per-row and always active
 structurally (section 4.3.1 — a row can still opt out individually via
 predictor code `0`, "None"), so there is nothing left for a separate
 "filter method" enum to select between. Interlacing (Adam7, even/odd) is
 removed entirely (not deferred — see `AGENTS.md`'s rationale: not
-streamable / high complexity / low benefit vs. tiles). This shrinks `IHDR`
-from 14 bytes to 12.
+streamable / high complexity / low benefit vs. tiles). This keeps `IHDR`
+at 12 bytes.
 
 **`Compression method` semantics (normative):** this bitmask is a
 **capability declaration** — a required lower bound on which codecs a
@@ -395,8 +383,7 @@ Requirements for incremental decoding:
 - **Per-row predictor selection** trades 1 extra header byte per row for
   finer-grained adaptation to local content changes within a tile than a
   single per-tile predictor choice would allow — chosen as the *only* mode
-  from day one, rather than being bolted on as an alternative later (as
-  happened in the frozen reference lineage's v1.5).
+  from day one, rather than a per-block mode needing reconciliation later.
 - Tile size is a trade-off between streaming granularity, per-chunk
   framing/CRC overhead, and predictor efficiency (each tile restarts
   prediction on its first row). See `cafe-bench` for empirical
@@ -460,20 +447,19 @@ handled at the chunk-parser level, not the content-parser level.
 ## 10. Versioning
 
 Format version is tracked as `MAJOR.MINOR`, independent of any crate's own
-SemVer (mirrors the frozen reference lineage's own section 13 rationale —
-see `old/docs/CAFE-spec.md`). During the `0.x` line, **breaking changes may
-occur between minor versions** — the format is not yet stabilized, and
-`spec/test-vectors/`/`golden/` exist precisely to catch unintentional
-breakage as the format solidifies. Once declared `1.0`, the discipline
-reverts to the frozen lineage's rule: `MAJOR` bumps only for breaking
-changes, `MINOR` bumps only for backward-compatible normative extensions.
+SemVer. During the `0.x` line, **breaking changes may occur between minor
+versions** — the format is not yet stabilized, and `spec/test-vectors/`/
+`golden/` exist precisely to catch unintentional breakage as the format
+solidifies. Once declared `1.0`, the discipline becomes: `MAJOR` bumps
+only for breaking changes, `MINOR` bumps only for backward-compatible
+normative extensions.
 
-There is no version field inside `IHDR`, by the same reasoning as the
-frozen lineage's section 13.3: PNG's own decades of stability without one,
-and the chicken-and-egg problem of a version field describing
-compatibility for a decoder that doesn't yet know to look for it. The
-critical/ancillary naming convention (section 3.1) and per-field enum
-validation already carry format evolution, as they do in PNG.
+There is no version field inside `IHDR`, for the same reason PNG has
+none: decades of stability without one, and the chicken-and-egg problem
+of a version field describing compatibility for a decoder that doesn't
+yet know to look for it. The critical/ancillary naming convention
+(section 3.1) and per-field enum validation already carry format
+evolution, as they do in PNG.
 
 ---
 
@@ -491,7 +477,7 @@ rationale per item.
 | Indexed palette (`PLTE`) | 0.3 | Encoder-side transform, not a new decoder color type |
 | Palette quantization algorithms | 0.3 | Median-cut / k-means / redmean, encoder-only |
 | ZSTD dictionary (external, then embedded) | 0.4 | Conflicts with single-pass streaming until designed carefully |
-| HDR (fp16, PQ/HLG/tonemap) | Unscheduled | `old/src/tonemap.rs` kept as reference only |
+| HDR (fp16, PQ/HLG/tonemap) | Unscheduled | No design work started |
 
 **Permanently removed** (not deferred — see `AGENTS.md`): Adam7 interlace,
 even/odd interlace, byte-shuffle, per-block (as opposed to per-row) filter

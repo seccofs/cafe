@@ -1,12 +1,12 @@
 //! `cafe-bench` — comparative benchmark harness: CAFE vs PNG over the
 //! `corpus/` dataset.
 //!
-//! Per the reboot philosophy ("cafe-bench before cafe-codec"), this binary
-//! exists from the first commit, even before the codec had anything
-//! meaningful to measure. v1 scope is intentionally limited to PNG (via the
-//! `image` crate) vs CAFE — WebP/JPEG XL/AVIF are deferred to avoid pulling
-//! in C-library bindings before there is a real need to compare against
-//! them (see AGENTS.md).
+//! Per `AGENTS.md`'s "every feature proves itself with a benchmark first"
+//! philosophy, this binary exists from the first commit, even before the
+//! codec had anything meaningful to measure. Scope is intentionally
+//! limited to PNG (via the `image` crate) vs CAFE — WebP/JPEG XL/AVIF are
+//! deferred to avoid pulling in C-library bindings before there is a real
+//! need to compare against them (see AGENTS.md).
 //!
 //! Status: phase 6 (`AGENTS.md`) — `cafe_codec::encode_bytes` now exists,
 //! so `measure()` reports real CAFE sizes alongside PNG and the naive

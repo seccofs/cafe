@@ -2,10 +2,8 @@
 //!
 //! Complements `fuzz/fuzz_targets/decode_fuzz.rs` (real libFuzzer coverage
 //! guided by code-coverage feedback, Linux/nightly-only) with proptest
-//! properties runnable anywhere, including local Windows development
-//! (`old/AGENTS.md`'s documented workaround for libFuzzer's Windows MSVC
-//! linking limitation). Adapted from the frozen `old/` lineage's
-//! `tests/roundtrip_proptest.rs`.
+//! properties runnable anywhere, including local Windows development,
+//! where libFuzzer's coverage instrumentation doesn't link under MSVC.
 
 use cafe_codec::{decode_bytes, encode_bytes, EncoderOptions};
 use cafe_format::constants::{

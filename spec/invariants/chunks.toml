@@ -23,10 +23,10 @@ mandatory_order = [
     "IEND",
 ]
 
-# Removed vs. the frozen v1 lineage (old/docs/CAFE-spec.md section 4):
+# Chunk types deliberately excluded from v0.1's defined chunk set:
 # PLTE (indexed palette, deferred to 0.3 as encoder-side transform),
 # cHDR (HDR metadata, unscheduled), zDIC (ZSTD dictionary, deferred to 0.4).
-removed_from_v1 = ["PLTE", "cHDR", "zDIC"]
+excluded_from_v0_1 = ["PLTE", "cHDR", "zDIC"]
 
 [framing]
 length_field_bytes = 4

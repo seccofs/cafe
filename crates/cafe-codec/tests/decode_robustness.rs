@@ -3,9 +3,7 @@
 //! These tests exercise `decode_bytes()` with various malformed inputs to
 //! confirm it never panics, only ever returns `Err` — the same contract
 //! `fuzz/fuzz_targets/decode_fuzz.rs` checks continuously against
-//! arbitrary bytes (spec section 8.1). Adapted from the frozen `old/`
-//! lineage's `tests/decode_robustness.rs`, updated for `cafe-codec`'s
-//! `Result<DecodedImage>` return type.
+//! arbitrary bytes (spec section 8.1).
 
 use cafe_codec::decode_bytes;
 
