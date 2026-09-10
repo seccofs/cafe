@@ -8,15 +8,21 @@
 //! is the one place in the workspace that bridges the two, for the
 //! `cafe-encode`/`cafe-decode`/`cafe inspect` binaries.
 //!
-//! Scope: PNG only, 8 bits per sample only (gray / gray+alpha / RGB /
-//! RGBA - `sample_format = SAMPLE_FORMAT_UINT`). An input PNG with a
-//! different bit depth (16-bit) or color model (indexed, 32-bit float) is
-//! coerced down to the nearest 8-bit CAFE color type by the `image` crate's
-//! own conversion (`to_luma8`/`to_rgb8`/...), preserving whether the image
-//! has color and/or alpha but not its original bit depth - 16-bit/float32
-//! CLI I/O is deferred to a later pass (`cafe-codec` itself already
-//! supports those bit depths, see its `encoder`/`decoder` tests; only this
-//! bridge is narrower for now).
+//! Scope: 8 bits per sample only (gray / gray+alpha / RGB / RGBA -
+//! `sample_format = SAMPLE_FORMAT_UINT`). An input PNG with a different
+//! bit depth (16-bit) is coerced down to 8-bit by the `image` crate's own
+//! conversion (`to_luma8`/`to_rgb8`/...), preserving whether the image has
+//! color and/or alpha but not its original bit depth - 16-bit uint CLI I/O
+//! is deferred to a later pass (`cafe-codec` itself already supports it,
+//! see its `encoder`/`decoder` tests; only this bridge is narrower for
+//! now). Float32/HDR sources (`.exr`) are this module's one hard
+//! exclusion, not merely a narrowing: `image` decodes those into
+//! `DynamicImage::ImageRgb32F`/`ImageRgba32F`, which `has_color()`/
+//! `has_alpha()`-based dispatch below would otherwise silently truncate to
+//! 8-bit uint, discarding the entire point of HDR content - callers must
+//! route those through `hdr_io::dynamic_image_to_cafe_pixels_hdr` instead
+//! (`cafe-encode` does this by checking `img.color()` before calling
+//! either bridge).
 
 use cafe_format::constants::{
     COLOR_TYPE_GRAY, COLOR_TYPE_GRAY_ALPHA, COLOR_TYPE_RGB, COLOR_TYPE_RGBA, SAMPLE_FORMAT_UINT,
@@ -48,6 +54,12 @@ pub enum PngIoError {
     /// returns), kept as a defensive `Result` rather than a panic for
     /// direct callers of this bridge.
     UnsupportedCafeColorType(u8),
+    /// The decoded `image::DynamicImage` is float32 (`Rgb32F`/`Rgba32F`,
+    /// in practice always an `.exr` source) — refused rather than silently
+    /// truncated to 8-bit uint, since that would discard the entire point
+    /// of HDR content. Callers should route these through
+    /// `hdr_io::dynamic_image_to_cafe_pixels_hdr` instead.
+    Float32NotSupportedHere(image::ColorType),
 }
 
 impl fmt::Display for PngIoError {
@@ -64,6 +76,11 @@ impl fmt::Display for PngIoError {
             PngIoError::UnsupportedCafeColorType(color_type) => {
                 write!(f, "unsupported CAFE color_type={color_type}")
             }
+            PngIoError::Float32NotSupportedHere(color_type) => write!(
+                f,
+                "image color type {color_type:?} is float32 (HDR) — use hdr_io instead of \
+                 png_io for this input"
+            ),
         }
     }
 }
@@ -80,6 +97,10 @@ pub fn dynamic_image_to_cafe_pixels(img: &DynamicImage) -> Result<CafePixels, Pn
     let width = img.width();
     let height = img.height();
     let color = img.color();
+
+    if matches!(color, image::ColorType::Rgb32F | image::ColorType::Rgba32F) {
+        return Err(PngIoError::Float32NotSupportedHere(color));
+    }
 
     let (color_type, raw_pixels) = if color.has_alpha() {
         if color.has_color() {
@@ -210,6 +231,19 @@ mod tests {
         assert_eq!(pixels.bit_depth, 8);
         assert_eq!(pixels.color_type, COLOR_TYPE_GRAY);
         assert_eq!(pixels.raw_pixels.len(), 4);
+    }
+
+    #[test]
+    fn test_float32_source_is_rejected_not_downconverted() {
+        let img = image::Rgb32FImage::from_raw(1, 1, vec![1.0, 2.0, 3.0]).unwrap();
+        let dynimg = DynamicImage::ImageRgb32F(img);
+        let result = dynamic_image_to_cafe_pixels(&dynimg);
+        assert!(matches!(
+            result,
+            Err(PngIoError::Float32NotSupportedHere(
+                image::ColorType::Rgb32F
+            ))
+        ));
     }
 
     #[test]

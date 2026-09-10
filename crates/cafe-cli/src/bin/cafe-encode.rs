@@ -1,19 +1,25 @@
 //! `cafe-encode` — encoder CLI, legacy-compatible binary name.
 //!
-//! v0.1 scope (`AGENTS.md` Phase 9): reads an 8-bit PNG via the `image`
-//! crate, writes a `.cafe` file via `cafe_codec::encode_bytes`. Tiling and
-//! ZSTD level are exposed as flags; predictor selection is not (it's
+//! v0.1 scope (`AGENTS.md` Phase 9, extended by the HDR-CLI-support
+//! follow-up): reads an 8-bit PNG (via `png_io`) or a float32 HDR image
+//! such as `.exr` (via `hdr_io`) through the `image` crate, writes a
+//! `.cafe` file via `cafe_codec::encode_bytes`. Which bridge applies is
+//! decided by the *decoded* color type (`Rgb32F`/`Rgba32F` -> `hdr_io`,
+//! anything else -> `png_io`), not by file extension - this matches how
+//! `image::ImageReader::decode()` already dispatches internally. Tiling
+//! and ZSTD level are exposed as flags; predictor selection is not (it's
 //! always the per-row entropy heuristic, an encoder-internal decision the
 //! spec never surfaces to callers).
 
-use cafe_cli::dynamic_image_to_cafe_pixels;
+use cafe_cli::{dynamic_image_to_cafe_pixels, dynamic_image_to_cafe_pixels_hdr, CafePixels};
 use cafe_codec::{encode_bytes, EncoderOptions};
 use cafe_format::constants::{SCAN_ORDER_ROW_MAJOR, SCAN_ORDER_Z_ORDER};
+use image::ColorType;
 use std::env;
 use std::process::ExitCode;
 
 fn usage() {
-    eprintln!("Usage: cafe-encode <input.png> <output.cafe> [options]");
+    eprintln!("Usage: cafe-encode <input> <output.cafe> [options]");
     eprintln!();
     eprintln!("Options:");
     eprintln!(
@@ -23,7 +29,22 @@ fn usage() {
     eprintln!("  --level <N>         ZSTD level, 1-22 (default: 19)");
     eprintln!("  --no-zstd           Never use ZSTD; every IDAT is written raw");
     eprintln!();
-    eprintln!("v0.1 supports 8-bit PNG input only (gray/gray+alpha/RGB/RGBA).");
+    eprintln!(
+        "v0.1 supports 8-bit PNG input (gray/gray+alpha/RGB/RGBA) and float32 HDR input \
+         such as .exr (RGB/RGBA)."
+    );
+}
+
+/// Picks the PNG or HDR bridge based on the *decoded* color type, not the
+/// input file's extension — mirrors how `image::ImageReader::decode()`
+/// already dispatches to its OpenEXR codec internally for `.exr` sources.
+fn image_to_cafe_pixels(img: &image::DynamicImage) -> Result<CafePixels, String> {
+    match img.color() {
+        ColorType::Rgb32F | ColorType::Rgba32F => {
+            dynamic_image_to_cafe_pixels_hdr(img).map_err(|e| e.to_string())
+        }
+        _ => dynamic_image_to_cafe_pixels(img).map_err(|e| e.to_string()),
+    }
 }
 
 struct Args {
@@ -94,7 +115,7 @@ fn run(args: &Args) -> Result<(), String> {
         .decode()
         .map_err(|e| format!("failed to decode {:?}: {e}", args.input))?;
 
-    let pixels = dynamic_image_to_cafe_pixels(&img).map_err(|e| e.to_string())?;
+    let pixels = image_to_cafe_pixels(&img)?;
 
     let buf = encode_bytes(
         pixels.width,

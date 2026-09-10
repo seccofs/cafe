@@ -796,6 +796,93 @@ binaries.
       test-relevant code changed), `cargo fmt --all --check`, and
       `cargo clippy --all-targets -- -D warnings` continue to pass
       cleanly.
+- [x] **HDR CLI support (post-HDR-regression-investigation follow-up).**
+      `cafe-codec`/`cafe-format` have supported float32 (HDR) data
+      end-to-end since Phase 6/7 — the only gap was `cafe-cli`'s
+      `png_io.rs` bridge, hardcoded to `bit_depth = 8`/
+      `SAMPLE_FORMAT_UINT`, and the `cafe-encode`/`cafe-decode` binaries
+      built on it. This follow-up closes that gap without touching
+      `png_io.rs`'s existing scope: a new sibling module, `hdr_io.rs`
+      (`dynamic_image_to_cafe_pixels_hdr`/`cafe_pixels_to_dynamic_image_hdr`,
+      the same `CafePixels` shape `png_io` already returns), handles
+      `bit_depth = 32`/`SAMPLE_FORMAT_FLOAT` RGB/RGBA — the only two
+      channel layouts `image` 0.25's own OpenEXR codec round-trips (no
+      gray/gray+alpha EXR layout exists to support). Byte order is
+      big-endian, per spec section 4.1's rule for any sample wider than 8
+      bits, matching the convention `cafe_bench::measure::measure_hdr`
+      already established.
+
+      Directly applying the HDR regression investigation's finding:
+      `hdr_io` dispatches on the *decoded* `image::ColorType`
+      (`Rgb32F` -> `COLOR_TYPE_RGB`, `Rgba32F` -> `COLOR_TYPE_RGBA`) rather
+      than unconditionally calling `.to_rgba32f()` the way the deleted PoC
+      did — `image::ImageReader::decode()` already inspects the source
+      file's real channel list and reports `Rgb32F` for an alpha-less EXR
+      (confirmed by reading `image`'s `codecs/openexr.rs` directly), so
+      this avoids synthesizing a fake alpha channel for `Cannon.exr`-shaped
+      sources without needing any `.exr`-specific code in `cafe-cli` at
+      all — the same `img.color()`-driven dispatch pattern `png_io`
+      already uses for PNG. `png_io.rs` itself gained one new guard rather
+      than staying silently wrong: `dynamic_image_to_cafe_pixels` now
+      rejects `Rgb32F`/`Rgba32F` input (`PngIoError::
+      Float32NotSupportedHere`) instead of silently truncating HDR content
+      to 8-bit uint via `to_rgb8()`/`to_rgba8()`, which is what it would
+      have done before this phase — a real behavior change, not just a
+      new code path alongside the old one; the module doc was reworded to
+      state this exclusion as a hard boundary rather than a narrowing.
+
+      `cafe-encode`/`cafe-decode` gained a small dispatcher instead of a
+      new flag: `cafe-encode` picks `hdr_io` vs `png_io` from the decoded
+      `image::ColorType` (`Rgb32F`/`Rgba32F` -> `hdr_io`, everything else
+      -> `png_io`) — the same rule `image::ImageReader::decode()` already
+      uses internally to pick its OpenEXR vs. other codecs, so no
+      `--format` flag or file-extension sniffing was needed; `cafe-decode`
+      picks the same way from the decoded `.cafe` file's own `Ihdr.
+      sample_format` (`SAMPLE_FORMAT_FLOAT` -> `hdr_io`, `SAMPLE_FORMAT_
+      UINT` -> `png_io`) — the output *container* format is still
+      whatever `image` infers from the output path's extension (`.exr`
+      for `Rgb32F`/`Rgba32F`, via `image`'s existing `OpenExrEncoder`, no
+      new write-path code needed in this crate at all). Both binaries'
+      usage strings/module docs were updated to describe both paths
+      instead of asserting "PNG only, 8-bit only", since that description
+      is no longer accurate for the whole crate (only for `png_io`'s own
+      narrower scope, whose doc comment was reworded to match).
+
+      Manually verified end-to-end (not just unit-tested) against both
+      `corpus/hdr/` fixtures via a throwaway
+      `crates/cafe-bench/examples/verify_hdr_cli_roundtrip.rs` (since
+      deleted): `cafe-encode corpus/hdr/Blobbies.exr blobbies.cafe` then
+      `cafe-decode blobbies.cafe blobbies_out.exr` reproduces the exact
+      original RGBA32F sample values (4,000,000 samples, byte-for-byte via
+      `image`'s own re-decode); the same round-trip for `Cannon.exr`
+      reproduces the exact original RGB32F sample values (1,324,440
+      samples) — confirming both the pixel round-trip *and* that Cannon's
+      alpha-less shape survives the CLI path unchanged (5,297,760 raw
+      bytes at encode time, RGB not RGBA — down from the 7,063,680 bytes
+      the old `.to_rgba32f()`-based PoC would have produced for the same
+      file, per the regression investigation above). The pre-existing PNG
+      path (`gradient_64x64.png` round-tripped through both binaries) was
+      re-verified unaffected by the same manual pass.
+
+      9 new tests (6 in `hdr_io`'s own module: RGB32F round-trip, RGBA32F
+      round-trip, big-endian byte order assertion, unsupported-image-
+      color-type rejection, unsupported-CAFE-bit-depth rejection,
+      unsupported-CAFE-color-type rejection; 1 new in `png_io`:
+      float32-source-is-rejected-not-downconverted, replacing the silent
+      truncation the old code would have done), for 214 total workspace
+      tests (up from 207): 105 `cafe-codec` (lib) + 12 + 3 (`cafe-codec`
+      integration files) + 42 `cafe-format` lib + 3 `chunk_proptest` + 16
+      `cafe-cli` (up from 9) + 8 golden + 9 spec-invariants + 8
+      `cafe-bench`. This does not change any of the HDR benchmark
+      numbers reported in the two phases above (`cafe_bench::measure::
+      measure_hdr` is untouched — it already used `.to_rgba32f()`
+      deliberately for a different reason, matching the synthetic/real
+      PNG corpus's uniform RGBA shape for its own comparison table, not
+      because it was unaware of the alpha-synthesis issue); this phase's
+      alpha-avoidance improvement is specific to the new interactive CLI
+      path, not the benchmark path. All workspace tests, `cargo fmt --all
+      --check`, `cargo clippy --all-targets -- -D warnings`, and
+      `cargo +nightly check --manifest-path fuzz/Cargo.toml` pass cleanly.
 
 ## Commands
 

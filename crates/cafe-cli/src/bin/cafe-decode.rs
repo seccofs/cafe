@@ -1,32 +1,54 @@
 //! `cafe-decode` — decoder CLI, legacy-compatible binary name.
 //!
-//! v0.1 scope (`AGENTS.md` Phase 9): reads a `.cafe` file via
-//! `cafe_codec::decode_bytes`, writes an 8-bit PNG via the `image` crate.
+//! v0.1 scope (`AGENTS.md` Phase 9, extended by the HDR-CLI-support
+//! follow-up): reads a `.cafe` file via `cafe_codec::decode_bytes`, writes
+//! an 8-bit PNG (via `png_io`) or a float32 HDR image such as `.exr` (via
+//! `hdr_io`) through the `image` crate. Which bridge applies is decided by
+//! the decoded `Ihdr`'s `sample_format` (`SAMPLE_FORMAT_FLOAT` -> `hdr_io`,
+//! `SAMPLE_FORMAT_UINT` -> `png_io`) — the output *file* format is still
+//! whatever `image` infers from `<output>`'s extension (`.exr` for
+//! `Rgb32F`/`Rgba32F`, per `image`'s `OpenExrEncoder`).
 
-use cafe_cli::cafe_pixels_to_dynamic_image;
+use cafe_cli::{cafe_pixels_to_dynamic_image, cafe_pixels_to_dynamic_image_hdr};
 use cafe_codec::decode_bytes;
+use cafe_format::constants::SAMPLE_FORMAT_FLOAT;
 use std::env;
 use std::process::ExitCode;
 
 fn usage() {
-    eprintln!("Usage: cafe-decode <input.cafe> <output.png>");
+    eprintln!("Usage: cafe-decode <input.cafe> <output>");
     eprintln!();
-    eprintln!("v0.1 supports 8-bit CAFE images only (gray/gray+alpha/RGB/RGBA); writes PNG.");
+    eprintln!(
+        "v0.1 supports 8-bit CAFE images (gray/gray+alpha/RGB/RGBA, writes PNG) and \
+         float32 HDR CAFE images (RGB/RGBA, writes .exr)."
+    );
 }
 
 fn run(input: &str, output: &str) -> Result<(), String> {
     let buf = std::fs::read(input).map_err(|e| format!("failed to read {input:?}: {e}"))?;
     let img = decode_bytes(&buf).map_err(|e| format!("decode failed: {e}"))?;
 
-    let dynimg = cafe_pixels_to_dynamic_image(
-        img.ihdr.width,
-        img.ihdr.height,
-        img.ihdr.bit_depth,
-        img.ihdr.sample_format,
-        img.ihdr.color_type,
-        &img.pixels,
-    )
-    .map_err(|e| e.to_string())?;
+    let dynimg = if img.ihdr.sample_format == SAMPLE_FORMAT_FLOAT {
+        cafe_pixels_to_dynamic_image_hdr(
+            img.ihdr.width,
+            img.ihdr.height,
+            img.ihdr.bit_depth,
+            img.ihdr.sample_format,
+            img.ihdr.color_type,
+            &img.pixels,
+        )
+        .map_err(|e| e.to_string())?
+    } else {
+        cafe_pixels_to_dynamic_image(
+            img.ihdr.width,
+            img.ihdr.height,
+            img.ihdr.bit_depth,
+            img.ihdr.sample_format,
+            img.ihdr.color_type,
+            &img.pixels,
+        )
+        .map_err(|e| e.to_string())?
+    };
 
     dynimg
         .save(output)
