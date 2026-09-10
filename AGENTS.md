@@ -1286,6 +1286,87 @@ binaries.
       tests, `cargo fmt --all --check`, and
       `cargo clippy --all-targets -- -D warnings` continue to pass
       cleanly.
+- [x] **16-bit uint CLI support (post-HDR-corpus-expansion follow-up).**
+      `cafe-codec`/`cafe-format` have supported `bit_depth = 16` end-to-end
+      since Phase 5/6 — the only gap, called out explicitly in `png_io.rs`'s
+      own module doc since Phase 9, was that `cafe-cli`'s `png_io` bridge
+      always coerced any input down to 8-bit uint via `image`'s
+      `to_luma8()`/`to_rgb8()`-family conversions, discarding a 16-bit
+      source's real bit depth. This follow-up closes that gap, mirroring
+      the HDR-CLI-support follow-up's approach one bit depth down: dispatch
+      on the *decoded* `image::ColorType` rather than adding a CLI flag.
+
+      **Design decision:** unlike HDR (a distinct `sample_format`, split
+      into its own `hdr_io` module), 8-bit and 16-bit uint share
+      `sample_format = SAMPLE_FORMAT_UINT` and the same four `color_type`
+      values (spec section 4.1) — so 16-bit support was added directly
+      inside the existing `png_io.rs` rather than a new sibling module,
+      keeping one bridge per `sample_format` rather than one per
+      `bit_depth`. `dynamic_image_to_cafe_pixels` now inspects the decoded
+      `image::ColorType` (`L16`/`La16`/`Rgb16`/`Rgba16` -> `bit_depth = 16`,
+      everything else -> `bit_depth = 8`, `Rgb32F`/`Rgba32F` still rejected
+      exactly as before) instead of unconditionally calling the 8-bit
+      `to_*8()` conversions — a real behavior change: a 16-bit source PNG
+      now round-trips at its original bit depth rather than being silently
+      downconverted, the same kind of hard-boundary correction the
+      HDR-CLI-support follow-up made for float32 input. 16-bit samples are
+      big-endian on the wire, per spec section 4.1's rule for any sample
+      wider than 8 bits — the same convention `hdr_io` already established
+      for float32 — via two small new private helpers,
+      `u16_samples_to_be_bytes`/`be_bytes_to_u16_samples`, shared by every
+      16-bit `color_type` branch in both conversion directions.
+      `cafe_pixels_to_dynamic_image`'s guard changed from "reject anything
+      but `bit_depth = 8`" to "reject anything but `bit_depth = 8` or `16`
+      (still only for `SAMPLE_FORMAT_UINT`)", dispatching to
+      `image::ImageBuffer::<Luma/LumaA/Rgb/Rgba<u16>, _>::from_raw` for the
+      16-bit case.
+
+      No changes were needed in `hdr_io.rs`, `cafe.rs` (`inspect`/`verify`/
+      `explain` already work in terms of `Ihdr.bit_depth` generically, never
+      assuming 8), or `cafe_bench::measure` (still deliberately RGBA8-only
+      for its own PNG-corpus comparison table, unrelated to this CLI-only
+      gap). `cafe-encode`/`cafe-decode` needed no dispatcher changes either
+      — both already call `png_io` for any non-float32 decoded color type,
+      so 16-bit PNGs simply flow through the same call path with no new
+      branching; `cafe-encode`'s existing palette race
+      (`palette_channels`) already correctly excludes 16-bit input via its
+      pre-existing `bit_depth != 8` check (PLTE is undefined above 8-bit
+      per spec section 4.3), so no changes were needed there either.
+
+      Manually verified end-to-end (not just unit-tested), per this
+      project's established practice, via two throwaway
+      `crates/cafe-bench/examples/{gen_16bit_png,verify_16bit_roundtrip}.rs`
+      files (since deleted): a synthetic 8x8 16-bit RGBA PNG encoded via
+      `cafe-encode` (512 raw bytes, 147-byte `.cafe` output — confirmed via
+      `cafe inspect` reporting `bit_depth: 16`, `color_type: 6 (RGBA)`, no
+      `PLTE`/`iDIM`), decoded back via `cafe-decode`, and the two PNGs'
+      `to_rgba16()` sample buffers confirmed byte-for-byte identical (256
+      samples).
+
+      2 net new tests in `png_io.rs` (the pre-existing
+      `test_16bit_source_is_downconverted_to_8bit` was renamed to
+      `test_16bit_gray_roundtrip_preserves_bit_depth` and rewritten to
+      assert big-endian round-trip preservation instead of downconversion,
+      since that's a real behavior change, not merely an addition, so it
+      isn't counted as a new test; `test_unsupported_cafe_bit_depth_is_
+      rejected` was updated to use `bit_depth = 32` with
+      `SAMPLE_FORMAT_UINT` as its rejected case, since `bit_depth = 16` is
+      no longer unsupported; two genuinely new round-trip tests,
+      `test_16bit_rgba_roundtrip_through_dynamic_image` and
+      `test_16bit_byte_order_is_big_endian`, added following the same
+      pattern `hdr_io`'s own tests already use), for 18 total `cafe-cli`
+      lib tests (up from 16) and 272 total workspace tests (up from 270 at
+      the end of the HDR-corpus-expansion phase). Manually verified
+      end-to-end (not just unit-tested), per this project's established
+      practice, via two throwaway `crates/cafe-bench/examples/
+      {gen_16bit_png,verify_16bit_roundtrip}.rs` files (since deleted): a
+      synthetic 8x8 16-bit RGBA PNG encoded via `cafe-encode` (512 raw
+      bytes, 147-byte `.cafe` output — confirmed via `cafe inspect`
+      reporting `bit_depth: 16`, `color_type: 6 (RGBA)`, no `PLTE`/`iDIM`),
+      decoded back via `cafe-decode`, and the two PNGs' `to_rgba16()`
+      sample buffers confirmed byte-for-byte identical (256 samples). All
+      workspace tests, `cargo fmt --all --check`, and `cargo clippy
+      --all-targets -- -D warnings` pass cleanly.
 
 ## Commands
 

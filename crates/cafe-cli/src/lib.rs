@@ -4,13 +4,13 @@
 //! belong in `cafe-format`/`cafe-codec`'s own public APIs (those crates
 //! stay decoder/encoder-focused; presentation is this crate's job).
 //!
-//! v0.1 CLI scope (see `AGENTS.md`'s Phase 9 entry): PNG (8-bit uint,
+//! CLI scope (see `AGENTS.md`'s Phase 9 entry, extended by the
+//! HDR-CLI-support and 16-bit-CLI-support follow-ups): PNG (uint8/uint16,
 //! gray/gray+alpha/RGB/RGBA, via `png_io`) plus HDR (32-bit float,
-//! RGB/RGBA, via `hdr_io`, added in the HDR-CLI-support follow-up) —
-//! matches the current `corpus/`'s content and `cafe-codec`'s most-tested
-//! paths. 16-bit uint image I/O is still deferred to a later CLI pass;
-//! `cafe-codec` itself already supports it (see its `encoder`/`decoder`
-//! tests), only this crate's bridges are narrower for now.
+//! RGB/RGBA, via `hdr_io`) — every `sample_format`/`bit_depth`/
+//! `color_type` combination spec section 4.1 allows now round-trips
+//! through this crate's bridges, matching `cafe-codec`'s own scope
+//! exactly.
 
 pub mod chunks;
 pub mod hdr_io;

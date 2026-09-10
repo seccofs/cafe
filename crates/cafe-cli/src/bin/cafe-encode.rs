@@ -1,15 +1,17 @@
 //! `cafe-encode` — encoder CLI, legacy-compatible binary name.
 //!
-//! v0.1 scope (`AGENTS.md` Phase 9, extended by the HDR-CLI-support
-//! follow-up): reads an 8-bit PNG (via `png_io`) or a float32 HDR image
-//! such as `.exr` (via `hdr_io`) through the `image` crate, writes a
-//! `.cafe` file via `cafe_codec::encode_bytes`. Which bridge applies is
-//! decided by the *decoded* color type (`Rgb32F`/`Rgba32F` -> `hdr_io`,
-//! anything else -> `png_io`), not by file extension - this matches how
-//! `image::ImageReader::decode()` already dispatches internally. Tiling
-//! and ZSTD level are exposed as flags; predictor selection is not (it's
-//! always the per-row entropy heuristic, an encoder-internal decision the
-//! spec never surfaces to callers).
+//! Scope (`AGENTS.md` Phase 9, extended by the HDR-CLI-support and
+//! 16-bit-CLI-support follow-ups): reads a uint8/uint16 PNG (via
+//! `png_io`) or a float32 HDR image such as `.exr` (via `hdr_io`) through
+//! the `image` crate, writes a `.cafe` file via `cafe_codec::
+//! encode_bytes`. Which bridge applies is decided by the *decoded* color
+//! type (`Rgb32F`/`Rgba32F` -> `hdr_io`, anything else -> `png_io`), not
+//! by file extension - this matches how `image::ImageReader::decode()`
+//! already dispatches internally; `png_io` itself further dispatches
+//! uint8 vs uint16 the same way. Tiling and ZSTD level are exposed as
+//! flags; predictor selection is not (it's always the per-row entropy
+//! heuristic, an encoder-internal decision the spec never surfaces to
+//! callers).
 
 use cafe_cli::{dynamic_image_to_cafe_pixels, dynamic_image_to_cafe_pixels_hdr, CafePixels};
 use cafe_codec::palette::build_palette;
@@ -34,14 +36,15 @@ fn usage() {
     eprintln!("  --no-palette        Never emit a PLTE chunk; always encode direct pixels");
     eprintln!();
     eprintln!(
-        "v0.1 supports 8-bit PNG input (gray/gray+alpha/RGB/RGBA) and float32 HDR input \
-         such as .exr (RGB/RGBA)."
+        "Supports 8-bit and 16-bit PNG input (gray/gray+alpha/RGB/RGBA) and float32 HDR \
+         input such as .exr (RGB/RGBA)."
     );
     eprintln!(
         "For 8-bit RGB/RGBA input, an indexed-color (PLTE) encode is tried automatically \
          alongside the direct encode whenever the image has at most 256 distinct exact \
          colors, and whichever produces the smaller file is kept (see AGENTS.md's Palette \
-         (0.3) phase)."
+         (0.3) phase). PLTE is undefined for 16-bit/float input (spec section 4.3), so this \
+         race is skipped for those."
     );
 }
 
