@@ -1,0 +1,6 @@
+# Normative: CAFE-spec.md section 2 (File Signature).
+# The 9-byte magic every .cafe file must start with.
+
+bytes = [0x89, 0x43, 0x41, 0x46, 0x45, 0x0D, 0x0A, 0x1A, 0x0A]
+ascii_marker = "CAFE"
+length = 9

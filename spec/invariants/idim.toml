@@ -1,0 +1,41 @@
+# Normative: CAFE-spec.md section 4.2 (iDIM).
+#
+# NOTE: all root-level keys are declared here, at the top of the file,
+# before any `[[array-of-tables]]` section below - in TOML, a bare
+# `key = value` appearing *after* a `[[table]]` header attaches to that
+# table (the last array element), not back to the document root.
+
+total_payload_bytes = 9
+recommended_tile_sizes = [32, 64, 128]
+default_tile_size = 64
+
+# Security ceiling (spec section 8.2): tiles_x * tiles_y must be bounded
+# before computing tile order or allocating anything proportional to it.
+max_tile_count = 1_048_576 # 1024 * 1024
+
+[[field]]
+name = "tile_width"
+size_bytes = 2
+type = "uint16_be"
+
+[[field]]
+name = "tile_height"
+size_bytes = 2
+type = "uint16_be"
+
+[[field]]
+name = "tiles_x"
+size_bytes = 2
+type = "uint16_be"
+
+[[field]]
+name = "tiles_y"
+size_bytes = 2
+type = "uint16_be"
+
+[[field]]
+name = "scan_order"
+size_bytes = 1
+type = "uint8"
+allowed_values = [0, 1]
+# 0 = row-major, 1 = Z-order (Morton).

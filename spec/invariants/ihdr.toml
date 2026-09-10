@@ -1,0 +1,85 @@
+# Normative: CAFE-spec.md section 4.1 (IHDR).
+# Total payload size in bytes; byte offsets are cumulative in this order.
+#
+# NOTE: all root-level keys/arrays are declared here, at the top of the
+# file, before any `[[array-of-tables]]` section below - in TOML, a bare
+# `key = value` appearing *after* a `[[table]]` header attaches to that
+# table (the last array element), not back to the document root.
+
+total_payload_bytes = 12
+
+# Removed vs. the frozen v1 lineage (old/docs/CAFE-spec.md section 4.1):
+# no `filter_method` byte (filtering is always per-row, section 4.3.1) and
+# no `interlace_method` byte (interlacing removed entirely). This shrinks
+# IHDR from 14 bytes (v1) to 12 bytes (0.1).
+removed_fields_from_v1 = ["filter_method", "interlace_method"]
+
+[[field]]
+name = "width"
+size_bytes = 4
+type = "uint32_be"
+constraint = "> 0"
+
+[[field]]
+name = "height"
+size_bytes = 4
+type = "uint32_be"
+constraint = "> 0"
+
+[[field]]
+name = "bit_depth"
+size_bytes = 1
+type = "uint8"
+allowed_values = [8, 16, 32]
+
+[[field]]
+name = "sample_format"
+size_bytes = 1
+type = "uint8"
+allowed_values = [0, 1]
+# 0 = uint, 1 = float32. No half-float (2) in 0.1 - deferred, see spec section 11.
+
+[[field]]
+name = "color_type"
+size_bytes = 1
+type = "uint8"
+allowed_values = [0, 2, 4, 6]
+# 0=gray, 2=RGB, 4=gray+alpha, 6=RGBA (default). No indexed (3) in 0.1.
+
+[[field]]
+name = "compression_method"
+size_bytes = 1
+type = "uint8"
+# Bitmask; bit0 = ZSTD capability required. Reserved bits must be 0.
+zstd_bit = 0b0000_0001
+reserved_mask = 0b1111_1110
+
+# Valid sample_format x bit_depth combinations (section 4.1).
+[[sample_format_bit_depth]]
+sample_format = 0
+allowed_bit_depths = [8, 16]
+
+[[sample_format_bit_depth]]
+sample_format = 1
+allowed_bit_depths = [32]
+
+# Channels per color_type (section 4.1).
+[[channels]]
+color_type = 0
+channels = 1
+name = "gray"
+
+[[channels]]
+color_type = 2
+channels = 3
+name = "rgb"
+
+[[channels]]
+color_type = 4
+channels = 2
+name = "gray_alpha"
+
+[[channels]]
+color_type = 6
+channels = 4
+name = "rgba"

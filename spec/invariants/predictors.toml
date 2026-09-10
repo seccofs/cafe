@@ -1,0 +1,67 @@
+# Normative: CAFE-spec.md section 4.3.1 (Predictors).
+# Reduced to 6 from the frozen v1 lineage's 16 (old/src/filter.rs). Chosen
+# per-row, structurally, from day one - there is no per-block mode.
+#
+# NOTE: all root-level keys are declared here, at the top of the file,
+# before any `[[array-of-tables]]` section below - in TOML, a bare
+# `key = value` appearing *after* a `[[table]]` header attaches to that
+# table (the last array element), not back to the document root.
+
+count = 6
+
+# Removed vs. the frozen v1 lineage (old/docs/CAFE-spec.md section 4.3.1,
+# codes 5-15): MED, Simple Median, 2nd Order, 4-way Directional (x4),
+# Context-Based, TR-Directional, Weighted (adaptive). All 10 removed
+# predictors are reference-only in old/src/filter.rs.
+removed_from_v1 = [
+    "MED",
+    "SimpleMedian",
+    "2ndOrder",
+    "4wayHorizontal",
+    "4wayVertical",
+    "4wayDiagonal1",
+    "4wayDiagonal2",
+    "ContextBased",
+    "TRDirectional",
+    "Weighted",
+]
+
+# Residual arithmetic: modulo-256 wraparound (u8 wrapping), identical
+# between encode (residual = original - prediction) and decode
+# (original = residual + prediction).
+residual_arithmetic = "wrapping_u8"
+
+# Tile-edge convention: missing neighbors (L, U, UL falling outside the
+# tile) are treated as zero - same convention PNG uses for the first line
+# of the whole image, applied per-tile here for streaming independence.
+missing_neighbor_value = 0
+
+[[predictor]]
+code = 0
+name = "None"
+neighbors = []
+
+[[predictor]]
+code = 1
+name = "Sub"
+neighbors = ["L"]
+
+[[predictor]]
+code = 2
+name = "Up"
+neighbors = ["U"]
+
+[[predictor]]
+code = 3
+name = "Average"
+neighbors = ["L", "U"]
+
+[[predictor]]
+code = 4
+name = "Paeth"
+neighbors = ["L", "U", "UL"]
+
+[[predictor]]
+code = 5
+name = "Gradient"
+neighbors = ["L", "U", "UL"]

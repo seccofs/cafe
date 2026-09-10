@@ -1,0 +1,25 @@
+# Normative: CAFE-spec.md section 8 (Security Considerations).
+# Values carried forward unchanged from the frozen v1 lineage
+# (old/src/constants.rs), whose reasoning still applies verbatim.
+
+# 8.2: protection against decompression bomb (CWE-409). Maximum bytes a
+# single chunk's decompression may produce before the decoder must reject
+# it, without materializing content beyond the limit first.
+max_decompressed_chunk_size_bytes = 1_073_741_824 # 1 GiB
+
+# 8.2: iDIM tile-count ceiling (tiles_x * tiles_y), checked before
+# computing tile order or allocating anything proportional to it. A
+# ~15-byte crafted iDIM chunk alone (no IDAT needed) can otherwise trigger
+# a multi-gigabyte allocation attempt.
+max_tile_count = 1_048_576 # 1024 * 1024
+
+# 8.3: no maximum for width/height (intentional). Decoders must reconstruct
+# incrementally from actual IDAT data, never pre-allocate
+# width * height * bytes_per_pixel before validation.
+max_width = false
+max_height = false
+
+# Removed vs. the frozen v1 lineage (old/src/constants.rs): no
+# max_palette_entries ceiling, since indexed color / PLTE does not exist in
+# 0.1 (deferred to 0.3, see spec section 11).
+removed_from_v1 = ["max_palette_entries"]

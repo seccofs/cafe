@@ -1,0 +1,92 @@
+# Normative: CAFE-spec.md sections 3.1, 3.2, 4, 5 (Chunk Structure, Defined
+# Chunks, Mandatory Chunk Order).
+#
+# `critical = true` chunk types have an uppercase first letter (decoder must
+# understand or reject the file); `critical = false` types have a lowercase
+# first letter (decoder may safely ignore/discard if malformed).
+#
+# NOTE: all root-level keys/arrays are declared here, at the top of the
+# file, before any `[[array-of-tables]]` section below - in TOML, a bare
+# `key = value` appearing *after* a `[[table]]` header attaches to that
+# table (the last array element), not back to the document root.
+
+# Mandatory order (section 5): chunk types not listed here (e.g. multiple
+# jSON instances) may repeat at their listed position.
+mandatory_order = [
+    "IHDR",
+    "iDIM",
+    "eXIF",
+    "jSON",
+    "iCCP",
+    "xMPd",
+    "IDAT",
+    "IEND",
+]
+
+# Removed vs. the frozen v1 lineage (old/docs/CAFE-spec.md section 4):
+# PLTE (indexed palette, deferred to 0.3 as encoder-side transform),
+# cHDR (HDR metadata, unscheduled), zDIC (ZSTD dictionary, deferred to 0.4).
+removed_from_v1 = ["PLTE", "cHDR", "zDIC"]
+
+[framing]
+length_field_bytes = 4
+type_field_bytes = 4
+flag_field_bytes = 1
+crc_field_bytes = 4
+crc_covers = "type+flag+data"
+
+[flag]
+raw = 0x00
+zstd = 0x01
+# 0x02-0xFF reserved for future compression algorithms.
+
+[[chunk]]
+type = "IHDR"
+critical = true
+single_instance = true
+first = true
+compressible = false
+
+[[chunk]]
+type = "iDIM"
+critical = false
+single_instance = true
+mandatory = false
+
+[[chunk]]
+type = "IDAT"
+critical = true
+single_instance = false
+mandatory = true
+
+[[chunk]]
+type = "eXIF"
+critical = false
+single_instance = true
+mandatory = false
+
+[[chunk]]
+type = "jSON"
+critical = false
+single_instance = false
+mandatory = false
+
+[[chunk]]
+type = "iCCP"
+critical = false
+single_instance = true
+mandatory = false
+
+[[chunk]]
+type = "xMPd"
+critical = false
+single_instance = true
+mandatory = false
+
+[[chunk]]
+type = "IEND"
+critical = true
+single_instance = true
+last = true
+mandatory = true
+data_length = 0
