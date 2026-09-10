@@ -65,8 +65,20 @@ const EXPECTED_SOURCES: &[(&str, &str, &str)] = &[
 
 /// `(file name relative to corpus_dir/hdr/, slug)`, checked against
 /// `corpus_dir` (not `staging-dir` — see module docs).
-const EXPECTED_HDR_SOURCES: &[(&str, &str)] =
-    &[("Blobbies.exr", "blobbies"), ("Cannon.exr", "cannon")];
+const EXPECTED_HDR_SOURCES: &[(&str, &str)] = &[
+    ("Blobbies.exr", "blobbies"),
+    ("Cannon.exr", "cannon"),
+    ("CandleGlass.exr", "candleglass"),
+    ("Carrots.exr", "carrots"),
+    ("Desk.exr", "desk"),
+    ("MtTamWest.exr", "mttamwest"),
+    ("PrismsLenses.exr", "prismslenses"),
+    ("StillLife.exr", "stilllife"),
+    ("Tree.exr", "tree"),
+    ("SquaresSwirls.exr", "squaresswirls"),
+    ("RgbRampsDiagonal.exr", "rgbrampsdiagonal"),
+    ("Rec709.exr", "rec709"),
+];
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);

@@ -288,6 +288,126 @@
       "sha256": "1ac7ae21c22fe1b006f18e3b6b53d52330fb7314ba4b1e0c68016967182d0fa9",
       "file_size": 1163637,
       "format": "exr"
+    },
+    {
+      "path": "hdr/CandleGlass.exr",
+      "category": "hdr",
+      "pattern": "candleglass",
+      "width": 1000,
+      "height": 810,
+      "color_type": "rgba",
+      "bit_depth": 32,
+      "sha256": "d84ec54c56a9f3a04cc35ef35097086f3531a511c750b2f78ad5501fb5cca4bf",
+      "file_size": 2629900,
+      "format": "exr"
+    },
+    {
+      "path": "hdr/Carrots.exr",
+      "category": "hdr",
+      "pattern": "carrots",
+      "width": 600,
+      "height": 400,
+      "color_type": "rgba",
+      "bit_depth": 32,
+      "sha256": "892d9eb1d2b22a3c7c57d22fa60c33aaa4a49ba3ead5304ec594b274aa39e4e1",
+      "file_size": 914825,
+      "format": "exr"
+    },
+    {
+      "path": "hdr/Desk.exr",
+      "category": "hdr",
+      "pattern": "desk",
+      "width": 644,
+      "height": 874,
+      "color_type": "rgba",
+      "bit_depth": 32,
+      "sha256": "2734d15e1ce157f73feaae5033b148bdabc98acb3084e9d892c6b01f23c24854",
+      "file_size": 2424523,
+      "format": "exr"
+    },
+    {
+      "path": "hdr/MtTamWest.exr",
+      "category": "hdr",
+      "pattern": "mttamwest",
+      "width": 1214,
+      "height": 732,
+      "color_type": "rgba",
+      "bit_depth": 32,
+      "sha256": "95731ce474982e74e154e96a6d74afb1ba0da851b673bff592fa977f87adaae5",
+      "file_size": 3323365,
+      "format": "exr"
+    },
+    {
+      "path": "hdr/PrismsLenses.exr",
+      "category": "hdr",
+      "pattern": "prismslenses",
+      "width": 1200,
+      "height": 865,
+      "color_type": "rgba",
+      "bit_depth": 32,
+      "sha256": "481f9e83a9671ae3452355d8116ee202f69e539cd6cbf45d114faee47e634f18",
+      "file_size": 4380714,
+      "format": "exr"
+    },
+    {
+      "path": "hdr/StillLife.exr",
+      "category": "hdr",
+      "pattern": "stilllife",
+      "width": 1240,
+      "height": 846,
+      "color_type": "rgba",
+      "bit_depth": 32,
+      "sha256": "86a04a36ec10983780d47ae33b2fba0dde269dd687bf53decf5ec0a726e50756",
+      "file_size": 3783165,
+      "format": "exr"
+    },
+    {
+      "path": "hdr/Tree.exr",
+      "category": "hdr",
+      "pattern": "tree",
+      "width": 928,
+      "height": 906,
+      "color_type": "rgba",
+      "bit_depth": 32,
+      "sha256": "8397741de996ab16ab94005fd0f0327bd29ab448163160a608c0b26e26864712",
+      "file_size": 3716423,
+      "format": "exr"
+    },
+    {
+      "path": "hdr/SquaresSwirls.exr",
+      "category": "hdr",
+      "pattern": "squaresswirls",
+      "width": 1000,
+      "height": 1000,
+      "color_type": "rgba",
+      "bit_depth": 32,
+      "sha256": "6c9f67f3cd47aaa24cc57d30198305c81c286087bc2d1f2ea53c2bf77943858f",
+      "file_size": 437763,
+      "format": "exr"
+    },
+    {
+      "path": "hdr/RgbRampsDiagonal.exr",
+      "category": "hdr",
+      "pattern": "rgbrampsdiagonal",
+      "width": 800,
+      "height": 800,
+      "color_type": "rgba",
+      "bit_depth": 32,
+      "sha256": "6037f9e122431eeaa084843c56255bf85d044a859e98df856cb69b24b2d49b4b",
+      "file_size": 133681,
+      "format": "exr"
+    },
+    {
+      "path": "hdr/Rec709.exr",
+      "category": "hdr",
+      "pattern": "rec709",
+      "width": 610,
+      "height": 406,
+      "color_type": "rgba",
+      "bit_depth": 32,
+      "sha256": "15028cbf7bf0efa43738890af715ec550d26ae9e32a1020d0f4e7c785d3a370e",
+      "file_size": 908168,
+      "format": "exr"
     }
   ]
 }

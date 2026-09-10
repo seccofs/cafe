@@ -73,15 +73,32 @@ licensed the same as the rest of this repository (BSD-3-Clause, see root
 Source: [`openexr-images`](https://github.com/AcademySoftwareFoundation/openexr-images),
 the official OpenEXR sample image set maintained by the Academy Software
 Foundation (formerly Industrial Light & Magic / Lucasfilm). License:
-BSD-3-Clause-style, per the repository's own `LICENSE` file (Copyright
-Contributors to the OpenEXR Project). These files are staged for a future
-CLI pass (see `AGENTS.md`'s HDR deferral) and are **not** referenced by
-`corpus/manifest.json`, since `cafe-cli`/`cafe-bench` only support 8-bit
-PNG I/O today.
+BSD-3-Clause, per every source subdirectory's own `README.rst`
+(`SPDX-License-Identifier: BSD-3-Clause`, Copyright Contributors to the
+OpenEXR Project) and the repository's root `LICENSE` file. Registered
+into `corpus/manifest.json` via `cafe-bench --bin import-corpus -`
+(see `AGENTS.md`'s HDR benchmark wiring follow-up). Selection criterion:
+only files whose channel layout is real (non-deep) RGB or RGBA —
+`image` 0.25's OpenEXR decoder rejects luminance/chroma- and
+single-channel-only files (`GrayRampsDiagonal.exr`/`Garden.exr` were
+tried and rejected for this reason before settling on the files below).
 
 | File | Original path in `openexr-images` |
 |---|---|
 | `hdr/Blobbies.exr` | `ScanLines/Blobbies.exr` |
 | `hdr/Cannon.exr` | `ScanLines/Cannon.exr` |
+| `hdr/CandleGlass.exr` | `ScanLines/CandleGlass.exr` |
+| `hdr/Carrots.exr` | `ScanLines/Carrots.exr` |
+| `hdr/Desk.exr` | `ScanLines/Desk.exr` |
+| `hdr/MtTamWest.exr` | `ScanLines/MtTamWest.exr` |
+| `hdr/PrismsLenses.exr` | `ScanLines/PrismsLenses.exr` |
+| `hdr/StillLife.exr` | `ScanLines/StillLife.exr` |
+| `hdr/Tree.exr` | `ScanLines/Tree.exr` |
+| `hdr/SquaresSwirls.exr` | `TestImages/SquaresSwirls.exr` |
+| `hdr/RgbRampsDiagonal.exr` | `TestImages/RgbRampsDiagonal.exr` |
+| `hdr/Rec709.exr` | `Chromaticities/Rec709.exr` |
 
-Source URL: <https://github.com/AcademySoftwareFoundation/openexr-images/tree/main/ScanLines>
+Source URLs:
+<https://github.com/AcademySoftwareFoundation/openexr-images/tree/main/ScanLines>,
+<https://github.com/AcademySoftwareFoundation/openexr-images/tree/main/TestImages>,
+<https://github.com/AcademySoftwareFoundation/openexr-images/tree/main/Chromaticities>

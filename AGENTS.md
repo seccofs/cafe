@@ -1210,6 +1210,82 @@ binaries.
       `cargo fmt --all --check`, `cargo clippy --all-targets --
       -D warnings`, and `cargo +nightly check --manifest-path
       fuzz/Cargo.toml` pass cleanly.
+- [x] **HDR corpus expansion (post-SIMD follow-up).** The HDR benchmark
+      wiring and regression investigation phases above drew conclusions
+      from only two `.exr` fixtures (`Blobbies.exr`/`Cannon.exr`) — this
+      follow-up grows `corpus/hdr/` to 12 files, all sourced from the same
+      already-documented, already-license-checked
+      [`openexr-images`](https://github.com/AcademySoftwareFoundation/openexr-images)
+      repository (BSD-3-Clause, per every source subdirectory's own
+      `README.rst`), to get a broader read on how consistently CAFE's
+      predictor set performs against OpenEXR's own compression.
+
+      Ten new files were added: seven more from `ScanLines/`
+      (`CandleGlass`, `Carrots`, `Desk`, `MtTamWest`, `PrismsLenses`,
+      `StillLife`, `Tree` — the same directory `Blobbies`/`Cannon` already
+      came from) plus three from different subdirectories for content
+      diversity beyond still-life photography: `TestImages/SquaresSwirls.exr`
+      (synthetic squares/swirls pattern), `TestImages/RgbRampsDiagonal.exr`
+      (a smooth diagonal gradient ramp), and `Chromaticities/Rec709.exr`
+      (a real-world outdoor photo, included specifically for its
+      Rec.709-chromaticities RGB channel layout). Two other candidates —
+      `TestImages/GrayRampsDiagonal.exr` and `LuminanceChroma/Garden.exr`
+      — were tried first and rejected: both store luminance/chroma or
+      single-channel data rather than real RGB, which `image` 0.25's
+      OpenEXR decoder (`image does not contain non-deep rgb channels`)
+      cannot decode at all — a hard constraint discovered empirically
+      during this phase, not a preference, so every file actually chosen
+      was verified importable before being kept. `EXPECTED_HDR_SOURCES` in
+      `crates/cafe-bench/src/bin/import-corpus.rs` grew to list all 12
+      files; re-running `cafe-bench --bin import-corpus -` (the `-`
+      sentinel added in the HDR benchmark wiring phase, since HDR sources
+      are registered directly from `corpus/hdr/`, never staged) merged all
+      10 new entries into `corpus/manifest.json` via the pre-existing
+      `register_hdr_sources`/`merge_and_write` path with no code changes
+      needed there. `corpus/ATTRIBUTION.md`'s HDR section was rewritten to
+      list all 12 files (with their source subdirectory) and to record the
+      two-rejected-candidates constraint above, so a future contributor
+      doesn't repeat the same failed attempt; `.gitignore`'s `corpus/hdr/`
+      comment was reworded from "staged for a future CLI pass (not yet
+      referenced by manifest.json)" to reflect that it's been wired into
+      the benchmark path since the HDR benchmark wiring phase, not still
+      pending.
+
+      Re-running `cafe benchmark`: the PNG-entries table's `TOTAL` line is
+      byte-for-byte unchanged (`raw=3760128 png=1324113 (35.2%)
+      cafe=751155 (20.0%)`), confirming this phase touched nothing on that
+      path. The expanded HDR table **reinforces, rather than overturns**,
+      the regression investigation's finding that `Cannon.exr`-style
+      lossy-fixed-ratio-compressed sources aren't a fair lossless-vs-lossy
+      baseline: 9 of the 10 new files land between 123-160% of their
+      source `.exr`'s size (worse than the original two-fixture sample's
+      worst case), with only `RgbRampsDiagonal.exr` (51.2%, a smooth
+      gradient — exactly the content type CAFE's predictors already excel
+      at throughout every other benchmark in this project) and the
+      pre-existing `Blobbies.exr` (61.5%) beating their source file.
+      Manually cross-checking a few of the worst performers' compression
+      methods against their file headers (via the same `exr` crate
+      inspection technique the regression investigation phase used)
+      confirms the same root cause generalizes: OpenEXR's own PIZ/B44/ZIP
+      wavelet- and Huffman-based schemes are simply well-tuned for HDR
+      float/half data in ways CAFE's six spec predictors — designed around
+      uint8/16 integer neighbor-delta locality — don't replicate. **This
+      does not change the SIMD/palette/dictionary no-go verdicts, nor does
+      it retroactively invalidate CAFE's v0.1 scope decisions** — HDR
+      support has always been framed in this project as "the format can
+      correctly represent float32 HDR data end-to-end" (true, and
+      unaffected by this phase), never as "CAFE's generic predictors beat
+      specialized HDR codecs" (evidently often false, now confirmed on a
+      6x larger sample than before). Adding an HDR-tuned predictor or
+      transform remains unscheduled speculative work, per this project's
+      "benchmark before feature" principle — this phase's contribution is
+      a materially larger, honestly-reported evidence base for that future
+      decision, not a fix. No new tests were added (no test-relevant code
+      changed — `register_hdr_sources`/`merge_and_write`/the benchmark
+      path are all pre-existing and already covered); all 269 workspace
+      tests, `cargo fmt --all --check`, and
+      `cargo clippy --all-targets -- -D warnings` continue to pass
+      cleanly.
 
 ## Commands
 
