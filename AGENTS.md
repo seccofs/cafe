@@ -883,6 +883,187 @@ binaries.
       path, not the benchmark path. All workspace tests, `cargo fmt --all
       --check`, `cargo clippy --all-targets -- -D warnings`, and
       `cargo +nightly check --manifest-path fuzz/Cargo.toml` pass cleanly.
+- [x] **Palette (0.3) implementation (post-HDR-CLI-support follow-up).**
+      Phase 10's no-go verdict on palette explicitly left the door open:
+      "a palette-favorable case ... is exactly the category still missing
+      real content ... re-evaluate once that content exists". The
+      corpus-population follow-up later added real lineart/illustration
+      content; this phase re-runs that evaluation and reopens palette
+      based on it. A throwaway proof-of-concept (since deleted) encoding
+      `corpus/lineart/abacus-psf.png` (256 exact colors) both directly and
+      via a hand-rolled indexed transform confirmed a 1.4-1.5x size
+      reduction before any permanent code was written, per `AGENTS.md`'s
+      "every feature proves itself with a benchmark first" principle.
+
+      **Design, decided up front:** `PLTE` is an *encoder-side transform*
+      of `IDAT`'s content, not a new structural `IHDR.color_type` (unlike
+      PNG's indexed-color mode) — `IHDR.color_type` always names the
+      palette *entries'* real format (RGB=2 or RGBA=6; gray/gray+alpha are
+      not palette-eligible), and `PLTE`'s presence alone is what tells the
+      decoder `IDAT` holds one index byte per pixel instead of direct
+      channel bytes. This keeps `IHDR` untouched and avoids ever inventing
+      a fifth `color_type` value. `PLTE` is critical (per spec section
+      3.3's naming convention: an unrecognized-but-mandatory chunk must
+      abort decoding, and a decoder that doesn't understand `PLTE` cannot
+      possibly reconstruct correct pixels), single-instance, and ordered
+      after `xMPd` and before the first `IDAT` (spec section 5). Palette
+      entries mirror `color_type`'s real channel count (3 bytes for RGB,
+      4 for RGBA), always at `bit_depth=8` — `PLTE` is undefined for any
+      other bit depth or for gray/gray+alpha, and rejected there. No
+      separate `tRNS`-style alpha-only chunk: RGBA entries carry their own
+      alpha byte directly. `entry_count` is capped at 256 (new
+      `MAX_PALETTE_ENTRIES` security ceiling, CWE-409-class, mirroring
+      `MAX_TILE_COUNT`'s treatment) — chosen specifically so indices always
+      fit in one byte; no bit-packed 1/2/4-bit index encoding was added,
+      since it would only matter for palettes small enough that the 1
+      extra bit/pixel is already negligible after ZSTD. No spec version
+      bump (stays 0.1) — `AGENTS.md`'s existing "no umbrella library
+      crate" and "single API struct" principles already assumed
+      backward-compatible ancillary/optional-chunk growth like this.
+
+      **API decision:** mirroring `EncoderOptions::tile_size`, a new
+      `EncoderOptions::palette: Option<Vec<u8>>` field declares "the pixel
+      bytes I'm about to hand `add_tile`/`encode_bytes` are already
+      palette *indices*, one byte per pixel" — `Encoder<W>` itself never
+      quantizes colors or scans for exact-color repeats; that's the
+      caller's job via a new, independent helper,
+      `cafe_codec::palette::build_palette(pixels, channels) ->
+      Option<Palette>` (`Palette { entries, indices }`), keeping
+      `Encoder<W>` a pure streaming sink exactly as it already was for
+      tiling. `build_palette` returns `None` (not an error) once a real
+      direct-color image has more than 256 distinct exact colors — an
+      ordinary, expected outcome for photographic content, not a
+      malformed-input condition. Real color quantization (K-means/
+      MedianCut for images with too many distinct colors to index
+      directly) remains deferred exactly as `AGENTS.md`'s Core v0.1
+      design-decisions table already said: `build_palette` only ever maps
+      *exact* pixel values to indices, first-seen order — it is not a
+      quantizer.
+
+      Implemented following this project's mandated order for a new
+      normative feature: **spec -> invariants -> `cafe-format` ->
+      `cafe-codec` -> golden files -> `cafe-cli` -> benchmark -> this
+      changelog entry.** `spec/CAFE-spec.md` gained a new normative
+      section 4.3 (`PLTE`), with every subsequent chunk section
+      renumbered (4.3->4.4 `IDAT`/predictors, 4.4->4.5 `eXIF`, ... 4.8->4.9
+      `IEND`), section 5's mandatory chunk order updated, and section 11's
+      roadmap entry updated to record this as done rather than deferred.
+      Three invariant files changed/were added:
+      `spec/invariants/chunks.toml` (`PLTE` added to `mandatory_order`
+      plus its own `[[chunk]]` entry), `spec/invariants/security.toml`
+      (`max_palette_entries = 256`), and a new
+      `spec/invariants/plte.toml` (entry-size-per-color-type table,
+      `bit_depth` restriction, `max_entries`) — 4 new tests in
+      `crates/cafe-format/tests/spec_invariants.rs` cross-check `plte.toml`
+      against `ihdr.toml`'s channel-count table and `security.toml`'s
+      ceiling, the same self-consistency pattern every prior invariant
+      file already follows.
+
+      `cafe-format` gained: `constants::plte_bytes_per_entry(color_type)
+      -> Option<u8>` (`3` for RGB, `4` for RGBA, `None` otherwise),
+      `constants::{PLTE_ENTRY_COUNT_LEN, MAX_PALETTE_ENTRIES}`, a new
+      `CafeError::InvalidPlte(String)` variant, and a new `plte` module
+      (`Plte` struct: `from_colors`/`validate`/`to_payload`/
+      `from_payload`/`to_chunk_bytes`, mirroring `idim.rs`'s shape almost
+      exactly) — 19 new unit tests. `cafe-codec` gained: a new
+      `CodecError::InvalidPaletteIndex(u8)` variant, a new `palette`
+      module (`build_palette`/`expand_indices`, 10 new unit tests),
+      `decoder::decode_bytes` support (parses an optional `PLTE` before
+      the first `IDAT`, exactly like `iDIM`'s existing "before first IDAT,
+      single instance" enforcement; computes `IDAT`'s effective `bpp` as
+      `1` instead of the direct channel count whenever `PLTE` is present;
+      expands indices back to full pixel bytes via `expand_indices` at the
+      end of decoding, so `DecodedImage::pixels` is always direct pixels
+      regardless of whether the source file was palette-encoded — 6 new
+      tests), and `encoder::Encoder::new` support (parses+validates
+      `EncoderOptions::palette` via `Plte::from_colors`/`validate`, uses
+      effective `bpp=1` for the whole encode when set, writes the `PLTE`
+      chunk immediately after `iDIM` and before any `IDAT` — 6 new tests,
+      including a combined palette+tiling round-trip). `EncoderOptions`
+      lost its `derive(Copy)` (now `Debug, Clone, PartialEq` only) due to
+      the new `Vec<u8>` field; the one caller that relied on `Copy`
+      (`cafe-encode`) was updated to `.clone()`. Two new hand-built golden
+      fixtures were generated via the existing `#[ignore]`d
+      `generate_golden_fixtures` test (never a real encoder, per Phase 4's
+      precedent): `golden/minimal_2x2_indexed_rgb.cafe` (a valid 2x2 RGB
+      image, 2-color palette, confirmed via a new decoder-level test to
+      expand back to the exact expected direct pixels) and
+      `golden/malformed/plte_entry_count_zero.cafe` (a `PLTE` chunk
+      declaring zero entries, confirmed rejected with
+      `CafeError::InvalidPlte`) — 3 new golden tests across
+      `cafe-format`'s `golden_files.rs` and `cafe-codec`'s `decoder.rs`.
+
+      `cafe-cli` gained palette support across all the places a direct
+      pixel buffer already flows: `cafe inspect` now parses and prints any
+      `PLTE` chunk's entry count/bytes-per-entry (or "absent" when there
+      is none); `cafe explain` now accounts for `PLTE`'s effective `bpp=1`
+      when extracting predictor codes per tile (previously always used
+      `Ihdr::bytes_per_pixel()` directly, which would have read the wrong
+      byte offsets for a palette-encoded file) and prints whether a
+      palette is present; `cafe-encode` now races a palette encode against
+      the direct encode automatically whenever the *decoded* image is
+      8-bit uint RGB/RGBA (`palette_channels` helper) and `build_palette`
+      succeeds (at most 256 distinct exact colors), keeping whichever
+      output is smaller — mirroring the existing raw-vs-ZSTD-per-tile
+      fallback race one layer up — with a new `--no-palette` flag to skip
+      the attempt entirely; `cafe-decode` needed no changes at all, since
+      `decode_bytes` already always returns expanded direct pixels
+      regardless of how the file was encoded. `cafe_bench::measure` gained
+      the identical direct-vs-palette race (new `Measurement::
+      used_palette: bool` field), so `cafe benchmark`'s existing
+      corpus-wide table now reports real palette wins inline (a `plte`
+      column) rather than requiring a separate benchmark pass.
+
+      Re-running `cafe benchmark` against the full corpus (unchanged
+      manifest from the corpus-population phase) with this palette race
+      enabled:
+
+      ```
+      TOTAL: raw=3760128 png=1324113 (35.2%) cafe=751155 (20.0%)
+      ```
+
+      down from the HDR-CLI-support phase's `cafe=795462 (21.2%)` — a
+      workspace-wide improvement even though only 6 of the corpus's 22
+      PNG entries actually have few enough exact colors to benefit
+      (`pixelart/checkerboard4_256x256`, all four `lineart/` entries
+      except `aardvark2-psf-colourised` which has too many distinct
+      colors, and both `illustration/` entries). The gains on those 6
+      entries are substantial where they apply — e.g.
+      `lineart/abdomen-psf.png` drops from 23,395 to 15,212 bytes (a
+      further ~35% on top of CAFE's already-direct-encode win over PNG),
+      `illustration/abstract-art-psf.png` from 38,394 to 26,561 (~31%
+      further) — confirming the original PoC's 1.4-1.5x hypothesis held
+      up in the real, fully-implemented, benchmark-verified path, not
+      just the throwaway estimate. Every other corpus entry (photos,
+      screenshots, gradients, textures, synthetic noise) is unaffected,
+      as expected: `build_palette` either returns `None` for them (too
+      many distinct colors) or the race correctly keeps the direct
+      encode when indexing doesn't help (e.g. `pixelart/
+      checkerboard4_64x64` and `gradient/*`, whose already-near-zero
+      direct-encode sizes leave no room for an indexed encode to beat,
+      confirmed by a dedicated `cafe-bench` test measuring a real
+      256-entry corpus file rather than asserting palette always wins).
+      HDR's `cafe vs exr` numbers are unchanged (palette is irrelevant to
+      float32 content; `measure_hdr` was not touched).
+
+      44 new tests in this phase (4 spec-invariants + 18 `cafe-format`
+      `plte` unit tests + 10 `cafe-codec` `palette` unit tests + 6
+      `decoder` PLTE tests + 6 `encoder` PLTE tests + 2 golden-file
+      [`cafe-format`'s 2 new fixture tests, `cafe-codec`'s 1 new golden
+      decode test already counted in `decoder`'s 6 above] + 1 `cafe-bench`
+      measure test — see each module's own test list above for exact
+      breakdowns), for 261 total workspace tests (up from 214 at the end
+      of the HDR-CLI-support phase): 127 `cafe-codec` (lib, up from 105)
+      + 12 + 3 (`cafe-codec` integration files, unchanged) + 60
+      `cafe-format` lib (up from 42) + 3 `chunk_proptest` (unchanged) +
+      16 `cafe-cli` (unchanged) + 11 golden (up from 8: 2 new
+      `cafe-format`-side fixture tests plus the pre-existing ignored
+      generator) + 13 spec-invariants (up from 9) + 17 `cafe-bench` (up
+      from 8 — includes tests added by the corpus-population and
+      HDR-benchmark-wiring follow-ups in between, not just this phase's 1
+      new test). All workspace tests, `cargo fmt --all --check`, `cargo
+      clippy --all-targets -- -D warnings`, and `cargo +nightly check
+      --manifest-path fuzz/Cargo.toml` pass cleanly.
 
 ## Commands
 

@@ -17,11 +17,13 @@
 
 use cafe_format::chunk::{read_chunk, write_chunk};
 use cafe_format::constants::{
-    COLOR_TYPE_GRAY, COLOR_TYPE_RGBA, COMPRESSION_METHOD_ZSTD_BIT, SAMPLE_FORMAT_UINT, SIGNATURE,
+    COLOR_TYPE_GRAY, COLOR_TYPE_RGB, COLOR_TYPE_RGBA, COMPRESSION_METHOD_ZSTD_BIT,
+    SAMPLE_FORMAT_UINT, SIGNATURE,
 };
 use cafe_format::error::CafeError;
 use cafe_format::ihdr::{read_ihdr, Ihdr};
 use cafe_format::validate_signature;
+use cafe_format::Plte;
 use std::path::{Path, PathBuf};
 
 fn golden_dir() -> PathBuf {
@@ -83,6 +85,17 @@ fn test_minimal_2x2_rgba_parses_and_validates() {
     assert_eq!(types, vec!["IDAT", "IEND"]);
 }
 
+#[test]
+fn test_minimal_2x2_indexed_rgb_parses_and_validates() {
+    let buf = read_golden("minimal_2x2_indexed_rgb.cafe");
+    let (ihdr, types) = parse_minimal(&buf).expect("golden file should parse cleanly");
+    assert_eq!(ihdr.width, 2);
+    assert_eq!(ihdr.height, 2);
+    assert_eq!(ihdr.bit_depth, 8);
+    assert_eq!(ihdr.color_type, COLOR_TYPE_RGB);
+    assert_eq!(types, vec!["PLTE", "IDAT", "IEND"]);
+}
+
 // --- Malformed fixtures ---
 
 #[test]
@@ -139,6 +152,28 @@ fn test_malformed_wrong_first_chunk_type_is_rejected() {
     ));
 }
 
+/// Unlike the other malformed fixtures above, `parse_minimal`'s raw
+/// `read_chunk` walk can't detect this fixture's problem on its own — it
+/// never interprets `PLTE`'s payload (that's `Plte::from_payload`/
+/// `validate`, this crate's own concern, exercised directly here rather
+/// than through the walk `parse_minimal` performs for every other
+/// fixture).
+#[test]
+fn test_malformed_plte_entry_count_zero_is_rejected() {
+    let buf = read_malformed("plte_entry_count_zero.cafe");
+    let (ihdr, _) = parse_minimal(&buf).expect("framing/CRC/IHDR alone should still parse");
+    let mut offset = validate_signature(&buf).unwrap();
+    let (_, next) = read_ihdr(&buf, offset).unwrap();
+    offset = next;
+    let chunk = read_chunk(&buf, offset).unwrap();
+    assert_eq!(&chunk.chunk_type, b"PLTE");
+    let plte = Plte::from_payload(&chunk.data, ihdr.color_type).unwrap();
+    assert!(matches!(
+        plte.validate(ihdr.color_type, ihdr.bit_depth),
+        Err(CafeError::InvalidPlte(_))
+    ));
+}
+
 // --- Fixture generator (not run by default - see module doc comment) ---
 
 #[test]
@@ -188,6 +223,31 @@ fn generate_golden_fixtures() {
     buf.extend(write_chunk(b"IEND", 0x00, b""));
     std::fs::write(dir.join("minimal_2x2_rgba.cafe"), &buf).unwrap();
 
+    // --- minimal_2x2_indexed_rgb.cafe: exercises PLTE (spec section 4.3)
+    // - a 2x2 RGB image with 2 distinct colors (red, green), IDAT holding
+    // palette indices (bpp=1) instead of direct RGB samples. ---
+    let indexed_ihdr = Ihdr {
+        width: 2,
+        height: 2,
+        bit_depth: 8,
+        sample_format: SAMPLE_FORMAT_UINT,
+        color_type: COLOR_TYPE_RGB,
+        compression_method: 0,
+    };
+    let plte = Plte::from_colors(COLOR_TYPE_RGB, &[0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00]).unwrap();
+    let mut buf = SIGNATURE.to_vec();
+    buf.extend(indexed_ihdr.to_chunk_bytes());
+    buf.extend(plte.to_chunk_bytes());
+    // Two rows of 2 indices each: row0=[0,1] (red,green), row1=[1,0].
+    let mut idat_payload = Vec::new();
+    idat_payload.push(0x00); // row 0 predictor: None
+    idat_payload.extend_from_slice(&[0x00, 0x01]);
+    idat_payload.push(0x00); // row 1 predictor: None
+    idat_payload.extend_from_slice(&[0x01, 0x00]);
+    buf.extend(write_chunk(b"IDAT", 0x00, &idat_payload));
+    buf.extend(write_chunk(b"IEND", 0x00, b""));
+    std::fs::write(dir.join("minimal_2x2_indexed_rgb.cafe"), &buf).unwrap();
+
     // --- malformed/bad_signature.cafe: wrong magic bytes ---
     let mut buf = vec![0u8; 9];
     buf[0] = 0x89; // keep the high-bit-detection byte, corrupt the rest
@@ -231,4 +291,12 @@ fn generate_golden_fixtures() {
     let mut buf = SIGNATURE.to_vec();
     buf.extend(write_chunk(b"IDAT", 0x00, b"pixels before a header"));
     std::fs::write(malformed_dir.join("wrong_first_chunk.cafe"), &buf).unwrap();
+
+    // --- malformed/plte_entry_count_zero.cafe: framing/CRC valid, PLTE's
+    // own entry_count field declares zero entries (spec section 4.3:
+    // "entry_count must be >= 1") ---
+    let mut buf = SIGNATURE.to_vec();
+    buf.extend(indexed_ihdr.to_chunk_bytes());
+    buf.extend(write_chunk(b"PLTE", 0x00, &0u16.to_be_bytes()));
+    std::fs::write(malformed_dir.join("plte_entry_count_zero.cafe"), &buf).unwrap();
 }

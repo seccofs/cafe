@@ -1,4 +1,4 @@
-//! One-tile pixel <-> `IDAT` payload conversion (spec section 4.3): reverses
+//! One-tile pixel <-> `IDAT` payload conversion (spec section 4.4): reverses
 //! the per-row predictor prefix to reconstruct raw pixel bytes, or applies
 //! it to produce an `IDAT` payload (encoder direction, Phase 6+).
 //!
@@ -14,7 +14,7 @@ use crate::predictor::{choose_best_row_predictor, filter_row, unfilter_row};
 /// 4.3: `for each row: [predictor code: 1 byte][filtered row: bytes_per_row
 /// bytes]`), reconstructing `tile_height * bytes_per_row` raw pixel bytes.
 ///
-/// `bpp` is spec section 4.3.1's bytes-per-pixel (`bytes_per_sample *
+/// `bpp` is spec section 4.4.1's bytes-per-pixel (`bytes_per_sample *
 /// channels`), used only to locate each byte's left/up-left neighbors —
 /// prediction always operates on raw bytes, regardless of sample width.
 pub fn decode_tile_rows(
@@ -119,7 +119,7 @@ pub fn encode_tile_rows(
 
 /// Encoder-direction counterpart to [`decode_tile_rows`], choosing a
 /// predictor code independently for each row via
-/// [`choose_best_row_predictor`] (spec section 4.3.1: predictor selection
+/// [`choose_best_row_predictor`] (spec section 4.4.1: predictor selection
 /// is a per-row, encoder-only decision) instead of applying one fixed code
 /// to the whole tile. This is what [`crate::encoder`] uses; the
 /// fixed-code [`encode_tile_rows`] remains for tests and callers that want

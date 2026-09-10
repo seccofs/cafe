@@ -24,6 +24,15 @@ pub const IHDR_PAYLOAD_LEN: usize = 12;
 /// `iDIM` payload size in bytes (spec section 4.2).
 pub const IDIM_PAYLOAD_LEN: usize = 9;
 
+/// `PLTE` entry-count field size in bytes (spec section 4.3): a uint16 BE
+/// preceding the entries themselves.
+pub const PLTE_ENTRY_COUNT_LEN: usize = 2;
+
+/// Maximum number of `PLTE` entries (spec section 4.3 / section 8.2): a
+/// one-byte-per-pixel index can only ever select among 256 distinct
+/// colors, so `entry_count` above this is rejected outright.
+pub const MAX_PALETTE_ENTRIES: u32 = 256;
+
 // --- Color types (spec section 4.1) ---
 pub const COLOR_TYPE_GRAY: u8 = 0;
 pub const COLOR_TYPE_RGB: u8 = 2;
@@ -61,5 +70,18 @@ pub fn is_valid_sample_format_bit_depth(sample_format: u8, bit_depth: u8) -> boo
         SAMPLE_FORMAT_UINT => matches!(bit_depth, 8 | 16),
         SAMPLE_FORMAT_FLOAT => bit_depth == 32,
         _ => false,
+    }
+}
+
+/// Returns the size in bytes of one `PLTE` entry for a given
+/// `color_type` (spec section 4.3): `3` (R,G,B) for `COLOR_TYPE_RGB`, `4`
+/// (R,G,B,A) for `COLOR_TYPE_RGBA`, or `None` for any other `color_type`
+/// — `PLTE` is undefined for gray/gray+alpha (spec section 4.3's
+/// validation rules).
+pub fn plte_bytes_per_entry(color_type: u8) -> Option<u8> {
+    match color_type {
+        COLOR_TYPE_RGB => Some(3),
+        COLOR_TYPE_RGBA => Some(4),
+        _ => None,
     }
 }

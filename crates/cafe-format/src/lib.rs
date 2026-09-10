@@ -13,10 +13,12 @@ pub mod constants;
 pub mod error;
 pub mod idim;
 pub mod ihdr;
+pub mod plte;
 pub mod signature;
 
 pub use chunk::{read_chunk, write_chunk, ReadChunk};
 pub use error::{CafeError, Result};
 pub use idim::Idim;
 pub use ihdr::{read_ihdr, Ihdr};
+pub use plte::Plte;
 pub use signature::validate_signature;

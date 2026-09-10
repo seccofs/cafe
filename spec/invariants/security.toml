@@ -17,7 +17,7 @@ max_tile_count = 1_048_576 # 1024 * 1024
 max_width = false
 max_height = false
 
-# Ceilings deliberately excluded from v0.1: no max_palette_entries
-# ceiling, since indexed color / PLTE does not exist in 0.1 (deferred to
-# 0.3, see spec section 11).
-excluded_from_v0_1 = ["max_palette_entries"]
+# 4.3: PLTE entry count ceiling. A one-byte-per-pixel index can only ever
+# select among 256 distinct colors, so entry_count above this is rejected
+# outright rather than silently truncated or wrapped.
+max_palette_entries = 256

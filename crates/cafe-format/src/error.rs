@@ -42,6 +42,13 @@ pub enum CafeError {
     /// `scan_order`, or `tiles_x * tiles_y` exceeding `MAX_TILE_COUNT`
     /// (spec section 8.2).
     InvalidIdim(String),
+    /// A `PLTE` field (or the payload length itself) violates spec
+    /// section 4.3 — e.g. `entry_count = 0`, `entry_count >
+    /// MAX_PALETTE_ENTRIES`, `IHDR.color_type` not RGB/RGBA, or
+    /// `IHDR.bit_depth != 8`. Out-of-range palette *indices* inside an
+    /// `IDAT` are a separate, `cafe-codec`-level concern (this crate
+    /// never inspects `IDAT` payloads).
+    InvalidPlte(String),
     /// A chunk was expected to be a specific type (e.g. `IHDR` must be
     /// first) but a different type was found.
     UnexpectedChunkType { expected: String, found: String },
@@ -71,6 +78,7 @@ impl fmt::Display for CafeError {
             ),
             Self::InvalidIhdr(msg) => write!(f, "Invalid IHDR: {msg}"),
             Self::InvalidIdim(msg) => write!(f, "Invalid iDIM: {msg}"),
+            Self::InvalidPlte(msg) => write!(f, "Invalid PLTE: {msg}"),
             Self::UnexpectedChunkType { expected, found } => write!(
                 f,
                 "Expected chunk type {expected:?}, found {found:?}"

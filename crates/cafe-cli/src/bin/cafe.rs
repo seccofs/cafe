@@ -7,7 +7,7 @@ use cafe_codec::predictor::{
 };
 use cafe_codec::zstd_codec::{decompress_chunk, FLAG_RAW, FLAG_ZSTD};
 use cafe_format::ihdr::Ihdr;
-use cafe_format::Idim;
+use cafe_format::{Idim, Plte};
 use std::env;
 use std::process::ExitCode;
 
@@ -138,6 +138,25 @@ fn cmd_inspect(args: &[String]) -> Result<(), String> {
         println!("iDIM: absent (single implicit whole-image tile)");
     }
 
+    if let Some(plte_chunk) = chunks.iter().find(|c| &c.chunk_type == b"PLTE") {
+        let ihdr_for_plte = chunks
+            .iter()
+            .find(|c| &c.chunk_type == b"IHDR")
+            .and_then(|c| Ihdr::from_payload(&c.data).ok());
+        println!();
+        println!("PLTE:");
+        match ihdr_for_plte.and_then(|h| Plte::from_payload(&plte_chunk.data, h.color_type).ok()) {
+            Some(plte) => {
+                println!("  entries: {}", plte.entry_count());
+                println!("  bytes_per_entry: {}", plte.bytes_per_entry);
+            }
+            None => println!("  failed to parse payload against this file's IHDR"),
+        }
+    } else {
+        println!();
+        println!("PLTE: absent (direct, non-indexed pixels)");
+    }
+
     let idat_count = chunks.iter().filter(|c| &c.chunk_type == b"IDAT").count();
     println!();
     println!("IDAT chunk count: {idat_count}");
@@ -238,7 +257,7 @@ fn cmd_explain(args: &[String]) -> Result<(), String> {
         .find(|c| &c.chunk_type == b"IHDR")
         .ok_or("file has no IHDR chunk")?;
     let ihdr = Ihdr::from_payload(&ihdr_chunk.data).map_err(|e| format!("IHDR payload: {e}"))?;
-    let bpp = ihdr
+    let direct_bpp = ihdr
         .bytes_per_pixel()
         .ok_or_else(|| format!("unsupported color_type={}", ihdr.color_type))?;
 
@@ -248,6 +267,16 @@ fn cmd_explain(args: &[String]) -> Result<(), String> {
         .map(|c| Idim::from_payload(&c.data))
         .transpose()
         .map_err(|e| format!("iDIM payload: {e}"))?;
+
+    let plte = chunks
+        .iter()
+        .find(|c| &c.chunk_type == b"PLTE")
+        .map(|c| Plte::from_payload(&c.data, ihdr.color_type))
+        .transpose()
+        .map_err(|e| format!("PLTE payload: {e}"))?;
+    // PLTE (spec section 4.3) changes IDAT's effective bpp to 1 (one
+    // palette index per pixel), same rule `cafe_codec::decode_bytes` uses.
+    let bpp = if plte.is_some() { 1 } else { direct_bpp };
 
     println!("{path}");
     println!(
@@ -268,6 +297,14 @@ fn cmd_explain(args: &[String]) -> Result<(), String> {
             scan_order_name(idim.scan_order)
         ),
         None => println!("  tiling: single whole-image tile (no iDIM)"),
+    }
+    match &plte {
+        Some(plte) => println!(
+            "  palette: {} entries ({} bytes/entry) — indexed pixels",
+            plte.entry_count(),
+            plte.bytes_per_entry
+        ),
+        None => println!("  palette: none (direct pixels)"),
     }
     println!();
 
@@ -348,7 +385,7 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("invalid manifest.json: {e}"))?;
 
     println!(
-        "{:<40} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "{:<40} {:>10} {:>10} {:>10} {:>10} {:>10}  plte",
         "image", "raw", "png", "cafe", "png %", "cafe %"
     );
 
@@ -377,13 +414,14 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
         let m = cafe_bench::measure(&img).map_err(|e| format!("{}: {e}", entry.path))?;
 
         println!(
-            "{:<40} {:>10} {:>10} {:>10} {:>9.1}% {:>9.1}%",
+            "{:<40} {:>10} {:>10} {:>10} {:>9.1}% {:>9.1}%  {}",
             entry.path,
             m.raw_bytes,
             m.png_bytes,
             m.cafe_bytes,
             m.png_ratio() * 100.0,
-            m.cafe_ratio() * 100.0
+            m.cafe_ratio() * 100.0,
+            if m.used_palette { "yes" } else { "" }
         );
 
         total_raw += m.raw_bytes as u64;

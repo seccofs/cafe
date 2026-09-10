@@ -32,7 +32,7 @@ impl Ihdr {
         self.bit_depth as u32 / 8
     }
 
-    /// `bpp` (bytes per pixel, spec section 4.3.1): `bytes_per_sample *
+    /// `bpp` (bytes per pixel, spec section 4.4.1): `bytes_per_sample *
     /// channels`. Returns `None` if `color_type` is invalid.
     pub fn bytes_per_pixel(&self) -> Option<u32> {
         Some(self.bytes_per_sample() * self.channels()? as u32)

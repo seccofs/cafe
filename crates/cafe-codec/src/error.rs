@@ -17,10 +17,17 @@ pub enum CodecError {
     /// signature, CRC mismatch, invalid `IHDR`, truncated file, ...).
     Format(cafe_format::CafeError),
     /// A row's predictor code byte is outside `0..NUM_PREDICTORS` (spec
-    /// section 4.3.1 defines exactly 6 predictor codes, `0`-`5`). Since
+    /// section 4.4.1 defines exactly 6 predictor codes, `0`-`5`). Since
     /// this byte comes straight from an untrusted file, it must be
     /// validated before ever being used to select a predictor.
     InvalidPredictorCode(u8),
+    /// A decoded `IDAT` (or reconstructed tile) contains a palette index
+    /// byte with no corresponding `PLTE` entry (spec section 4.3's
+    /// validation rule: "decoders must reject any index >= entry_count").
+    /// Distinct from [`CodecError::Format`]'s `InvalidPlte` (which covers
+    /// `PLTE`'s own fields being self-inconsistent, checked independently
+    /// of what indices any `IDAT` actually contains).
+    InvalidPaletteIndex(u8),
     /// The number (or order) of `IDAT` chunks in the file doesn't match
     /// what `iDIM` (or its absence) requires — e.g. fewer/more `IDAT`s
     /// than `iDIM`'s tile count, more than one `IDAT` when no `iDIM` is
@@ -48,9 +55,13 @@ impl fmt::Display for CodecError {
             Self::Format(e) => write!(f, "{e}"),
             Self::InvalidPredictorCode(code) => write!(
                 f,
-                "invalid predictor code: {code} (spec section 4.3.1 defines codes 0-5)"
+                "invalid predictor code: {code} (spec section 4.4.1 defines codes 0-5)"
             ),
             Self::TilingMismatch(msg) => write!(f, "tiling mismatch: {msg}"),
+            Self::InvalidPaletteIndex(idx) => write!(
+                f,
+                "palette index {idx} has no corresponding PLTE entry (spec section 4.3)"
+            ),
             Self::EncoderMisuse(msg) => write!(f, "encoder misuse: {msg}"),
         }
     }

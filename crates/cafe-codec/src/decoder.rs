@@ -7,13 +7,14 @@
 //! any number of tiles up to `MAX_TILE_COUNT`) via [`crate::tiling::TileLayout`].
 
 use crate::error::{CodecError, Result};
+use crate::palette::expand_indices;
 use crate::tile::decode_tile_rows;
 use crate::tiling::TileLayout;
 use crate::zstd_codec::decompress_with_limit;
 use cafe_format::chunk::{is_critical, read_chunk};
 use cafe_format::ihdr::{read_ihdr, Ihdr};
 use cafe_format::validate_signature;
-use cafe_format::Idim;
+use cafe_format::{Idim, Plte};
 
 /// A fully decoded CAFE image: the validated header plus raw, unpredicted
 /// pixel bytes in row-major order (top-to-bottom), each sample stored per
@@ -43,17 +44,22 @@ pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
             ihdr.color_type
         )))
     })?;
-    let bytes_per_row = ihdr.width.checked_mul(bpp).ok_or_else(|| {
-        CodecError::Format(cafe_format::CafeError::TruncatedFile(
-            "overflow computing bytes_per_row (width * bpp)".into(),
-        ))
-    })?;
 
     let mut idim: Option<Idim> = None;
+    let mut plte: Option<Plte> = None;
     let mut layout: Option<TileLayout> = None;
     let mut pixels: Option<Vec<u8>> = None;
     let mut tiles_seen = 0usize;
     let mut saw_iend = false;
+
+    // `PLTE` (spec section 4.3) changes IDAT's effective bpp to 1 (one
+    // palette index per pixel) — this must be resolved before any IDAT is
+    // decoded, but PLTE itself can only be parsed once we've seen its
+    // bytes, so `effective_bpp`/`bytes_per_row` are computed lazily, right
+    // before the first IDAT (mirroring `layout`'s own lazy construction
+    // below), once we know whether a PLTE chunk preceded it.
+    let mut effective_bpp: Option<u32> = None;
+    let mut bytes_per_row: Option<u32> = None;
 
     while offset < buf.len() {
         let chunk = read_chunk(buf, offset)?;
@@ -78,8 +84,34 @@ pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
                 parsed.validate(ihdr.width, ihdr.height)?;
                 idim = Some(parsed);
             }
+            b"PLTE" => {
+                if plte.is_some() {
+                    return Err(CodecError::TilingMismatch(
+                        "duplicate PLTE chunk (spec section 4.3: single instance per file)".into(),
+                    ));
+                }
+                if tiles_seen > 0 {
+                    return Err(CodecError::TilingMismatch(
+                        "PLTE chunk must appear before the first IDAT (spec section 5's \
+                         mandatory chunk order)"
+                            .into(),
+                    ));
+                }
+                let payload = crate::zstd_codec::decompress_chunk(chunk.flag, &chunk.data)?;
+                let parsed = Plte::from_payload(&payload, ihdr.color_type)?;
+                parsed.validate(ihdr.color_type, ihdr.bit_depth)?;
+                plte = Some(parsed);
+            }
             b"IDAT" => {
                 if layout.is_none() {
+                    let this_bpp = if plte.is_some() { 1 } else { bpp };
+                    let this_bytes_per_row = ihdr.width.checked_mul(this_bpp).ok_or_else(|| {
+                        CodecError::Format(cafe_format::CafeError::TruncatedFile(
+                            "overflow computing bytes_per_row (width * bpp)".into(),
+                        ))
+                    })?;
+                    effective_bpp = Some(this_bpp);
+                    bytes_per_row = Some(this_bytes_per_row);
                     let built = TileLayout::new(idim, ihdr.width, ihdr.height)?;
                     // Allocate the full assembled pixel buffer once, sized
                     // exactly to IHDR's declared dimensions — each tile's
@@ -88,7 +120,7 @@ pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
                     // is never larger than the sum of legitimately-bounded
                     // per-tile work the file's chunks actually justify.
                     let total_pixel_bytes = (ihdr.height as u64)
-                        .checked_mul(bytes_per_row as u64)
+                        .checked_mul(this_bytes_per_row as u64)
                         .ok_or_else(|| {
                             CodecError::Format(cafe_format::CafeError::TruncatedFile(
                                 "overflow computing total pixel buffer size".into(),
@@ -97,6 +129,8 @@ pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
                     pixels = Some(vec![0u8; total_pixel_bytes as usize]);
                     layout = Some(built);
                 }
+                let this_bpp = effective_bpp.unwrap();
+                let this_bytes_per_row = bytes_per_row.unwrap();
                 let layout_ref = layout.as_ref().unwrap();
                 if tiles_seen >= layout_ref.tile_count() {
                     return Err(CodecError::TilingMismatch(format!(
@@ -105,7 +139,7 @@ pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
                     )));
                 }
                 let (origin_x, origin_y, tile_w, tile_h) = layout_ref.tile_rect(tiles_seen);
-                let tile_bytes_per_row = tile_w.checked_mul(bpp).ok_or_else(|| {
+                let tile_bytes_per_row = tile_w.checked_mul(this_bpp).ok_or_else(|| {
                     CodecError::Format(cafe_format::CafeError::TruncatedFile(
                         "overflow computing tile bytes_per_row".into(),
                     ))
@@ -119,13 +153,13 @@ pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
                     })?;
 
                 let raw = decompress_with_limit(chunk.flag, &chunk.data, expected_tile_payload)?;
-                let tile_pixels = decode_tile_rows(&raw, tile_h, tile_bytes_per_row, bpp)?;
+                let tile_pixels = decode_tile_rows(&raw, tile_h, tile_bytes_per_row, this_bpp)?;
 
                 let pixels_buf = pixels.as_mut().unwrap();
-                let row_bytes = (tile_w * bpp) as usize;
+                let row_bytes = (tile_w * this_bpp) as usize;
                 for row in 0..tile_h {
-                    let dst_start = (origin_y + row) as usize * bytes_per_row as usize
-                        + origin_x as usize * bpp as usize;
+                    let dst_start = (origin_y + row) as usize * this_bytes_per_row as usize
+                        + origin_x as usize * this_bpp as usize;
                     let src_start = row as usize * tile_bytes_per_row as usize;
                     pixels_buf[dst_start..dst_start + row_bytes]
                         .copy_from_slice(&tile_pixels[src_start..src_start + row_bytes]);
@@ -175,6 +209,17 @@ pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
             "file contains no IDAT chunk".into(),
         ))
     })?;
+
+    // When PLTE is present, everything decoded above is palette indices
+    // (one byte per pixel), not final channel bytes — expand them into
+    // real pixels here so DecodedImage::pixels always holds direct
+    // channel data, matching every non-palette decode's shape (spec
+    // section 4.3: expansion is purely a decoder-side concern).
+    let pixels = if let Some(plte) = &plte {
+        expand_indices(&pixels, &plte.entries, plte.bytes_per_entry)?
+    } else {
+        pixels
+    };
 
     Ok(DecodedImage { ihdr, pixels })
 }
@@ -230,6 +275,21 @@ mod tests {
                 0x10, 0x20, 0x30, 0xFF, 0x11, 0x21, 0x31, 0xFF, // row 0
                 0x12, 0x22, 0x32, 0xFF, 0x13, 0x23, 0x33, 0xFF, // row 1
             ]
+        );
+    }
+
+    #[test]
+    fn test_decode_golden_minimal_2x2_indexed_rgb() {
+        use cafe_format::constants::COLOR_TYPE_RGB;
+        let buf = read_golden("minimal_2x2_indexed_rgb.cafe");
+        let img = decode_bytes(&buf).expect("golden file should decode");
+        assert_eq!(img.ihdr.width, 2);
+        assert_eq!(img.ihdr.height, 2);
+        assert_eq!(img.ihdr.color_type, COLOR_TYPE_RGB);
+        // row0=[red,green], row1=[green,red], expanded from indices.
+        assert_eq!(
+            img.pixels,
+            vec![0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0x00]
         );
     }
 
@@ -712,5 +772,143 @@ mod tests {
         let buf = build_file(&ihdr, 0x00, &idat_payload, None, true);
         let img = decode_bytes(&buf).unwrap();
         assert_eq!(img.pixels, raw);
+    }
+
+    #[test]
+    fn test_decode_plte_roundtrip() {
+        use crate::predictor::PREDICTOR_NONE;
+        use crate::tile::encode_tile_rows;
+        use cafe_format::constants::COLOR_TYPE_RGB;
+        use cafe_format::Plte;
+
+        // 2x2 RGB image, 2 distinct colors: red, green, red, green.
+        let ihdr = Ihdr {
+            width: 2,
+            height: 2,
+            bit_depth: 8,
+            sample_format: SAMPLE_FORMAT_UINT,
+            color_type: COLOR_TYPE_RGB,
+            compression_method: 0,
+        };
+        let plte = Plte::from_colors(COLOR_TYPE_RGB, &[255, 0, 0, 0, 255, 0]).unwrap();
+        // Indices: row0=[0,1], row1=[0,1], bpp=1 (one index byte/pixel).
+        let indices = vec![0u8, 1, 0, 1];
+        let idat_payload = encode_tile_rows(&indices, 2, 2, 1, PREDICTOR_NONE).unwrap();
+
+        let mut buf = SIGNATURE.to_vec();
+        buf.extend(ihdr.to_chunk_bytes());
+        buf.extend(plte.to_chunk_bytes());
+        buf.extend(write_chunk(b"IDAT", 0x00, &idat_payload));
+        buf.extend(write_chunk(b"IEND", 0x00, b""));
+
+        let img = decode_bytes(&buf).unwrap();
+        assert_eq!(img.pixels, vec![255, 0, 0, 0, 255, 0, 255, 0, 0, 0, 255, 0]);
+    }
+
+    #[test]
+    fn test_decode_rejects_duplicate_plte_chunk() {
+        use cafe_format::constants::COLOR_TYPE_RGB;
+        use cafe_format::Plte;
+
+        let ihdr = Ihdr {
+            width: 1,
+            height: 1,
+            bit_depth: 8,
+            sample_format: SAMPLE_FORMAT_UINT,
+            color_type: COLOR_TYPE_RGB,
+            compression_method: 0,
+        };
+        let plte = Plte::from_colors(COLOR_TYPE_RGB, &[255, 0, 0]).unwrap();
+        let mut buf = SIGNATURE.to_vec();
+        buf.extend(ihdr.to_chunk_bytes());
+        buf.extend(plte.to_chunk_bytes());
+        buf.extend(plte.to_chunk_bytes());
+        buf.extend(write_chunk(b"IDAT", 0x00, &[0u8, 0]));
+        buf.extend(write_chunk(b"IEND", 0x00, b""));
+        assert!(matches!(
+            decode_bytes(&buf),
+            Err(CodecError::TilingMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn test_decode_rejects_plte_appearing_after_first_idat() {
+        use cafe_format::constants::COLOR_TYPE_RGB;
+        use cafe_format::Plte;
+
+        let ihdr = Ihdr {
+            width: 1,
+            height: 1,
+            bit_depth: 8,
+            sample_format: SAMPLE_FORMAT_UINT,
+            color_type: COLOR_TYPE_RGB,
+            compression_method: 0,
+        };
+        let plte = Plte::from_colors(COLOR_TYPE_RGB, &[255, 0, 0]).unwrap();
+        // Without PLTE parsed yet, the decoder treats bpp as 3 (RGB direct)
+        // for this first IDAT: one predictor byte + 3 sample bytes.
+        let mut buf = SIGNATURE.to_vec();
+        buf.extend(ihdr.to_chunk_bytes());
+        buf.extend(write_chunk(b"IDAT", 0x00, &[0u8, 0, 0, 0]));
+        buf.extend(plte.to_chunk_bytes());
+        buf.extend(write_chunk(b"IEND", 0x00, b""));
+        assert!(matches!(
+            decode_bytes(&buf),
+            Err(CodecError::TilingMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn test_decode_rejects_out_of_range_palette_index() {
+        use crate::predictor::PREDICTOR_NONE;
+        use crate::tile::encode_tile_rows;
+        use cafe_format::constants::COLOR_TYPE_RGB;
+        use cafe_format::Plte;
+
+        let ihdr = Ihdr {
+            width: 1,
+            height: 1,
+            bit_depth: 8,
+            sample_format: SAMPLE_FORMAT_UINT,
+            color_type: COLOR_TYPE_RGB,
+            compression_method: 0,
+        };
+        // Only 1 entry (index 0 valid), but the IDAT references index 5.
+        let plte = Plte::from_colors(COLOR_TYPE_RGB, &[255, 0, 0]).unwrap();
+        let idat_payload = encode_tile_rows(&[5u8], 1, 1, 1, PREDICTOR_NONE).unwrap();
+        let mut buf = SIGNATURE.to_vec();
+        buf.extend(ihdr.to_chunk_bytes());
+        buf.extend(plte.to_chunk_bytes());
+        buf.extend(write_chunk(b"IDAT", 0x00, &idat_payload));
+        buf.extend(write_chunk(b"IEND", 0x00, b""));
+        assert!(matches!(
+            decode_bytes(&buf),
+            Err(CodecError::InvalidPaletteIndex(5))
+        ));
+    }
+
+    #[test]
+    fn test_decode_rejects_plte_with_inconsistent_bit_depth() {
+        use cafe_format::constants::COLOR_TYPE_RGB;
+        use cafe_format::Plte;
+
+        let ihdr = Ihdr {
+            width: 1,
+            height: 1,
+            bit_depth: 16, // PLTE requires bit_depth=8
+            sample_format: SAMPLE_FORMAT_UINT,
+            color_type: COLOR_TYPE_RGB,
+            compression_method: 0,
+        };
+        let plte = Plte::from_colors(COLOR_TYPE_RGB, &[255, 0, 0]).unwrap();
+        let mut buf = SIGNATURE.to_vec();
+        buf.extend(ihdr.to_chunk_bytes());
+        buf.extend(plte.to_chunk_bytes());
+        buf.extend(write_chunk(b"IDAT", 0x00, &[0u8, 0]));
+        buf.extend(write_chunk(b"IEND", 0x00, b""));
+        assert!(matches!(
+            decode_bytes(&buf),
+            Err(CodecError::Format(cafe_format::CafeError::InvalidPlte(_)))
+        ));
     }
 }

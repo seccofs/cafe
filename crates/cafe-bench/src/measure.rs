@@ -11,6 +11,7 @@
 //! Uses `zstd::encode_all` with the same default level, 19, matching
 //! `cafe_codec::encoder::EncoderOptions::default().level`.
 
+use cafe_codec::palette::build_palette;
 use cafe_codec::{encode_bytes, EncoderOptions};
 use cafe_format::constants::{COLOR_TYPE_RGBA, SAMPLE_FORMAT_FLOAT, SAMPLE_FORMAT_UINT};
 use image::RgbaImage;
@@ -40,6 +41,12 @@ pub struct Measurement {
     /// with no predictor or tiling — the naive floor CAFE's predictors +
     /// tiling must beat.
     pub zstd_raw_bytes: usize,
+    /// Whether `cafe_bytes` came from an indexed-color (`PLTE`) encode
+    /// rather than a direct one — `cafe_codec::palette::build_palette`
+    /// found at most 256 distinct exact colors *and* the resulting
+    /// indexed encode was smaller than the direct one, mirroring the same
+    /// race `cafe-encode` runs (see `AGENTS.md`'s Palette (0.3) phase).
+    pub used_palette: bool,
 }
 
 impl Measurement {
@@ -206,7 +213,7 @@ pub fn measure(img: &RgbaImage) -> Result<Measurement, MeasureError> {
     let mut png_bytes = Vec::new();
     img.write_with_encoder(image::codecs::png::PngEncoder::new(&mut png_bytes))?;
 
-    let cafe_bytes = encode_bytes(
+    let direct_bytes = encode_bytes(
         width,
         height,
         8,
@@ -215,6 +222,32 @@ pub fn measure(img: &RgbaImage) -> Result<Measurement, MeasureError> {
         raw,
         EncoderOptions::default(),
     )?;
+
+    // Race an indexed (PLTE) encode against the direct one whenever the
+    // image has few enough distinct exact colors, keeping whichever is
+    // smaller — the same race `cafe-encode` runs (see `AGENTS.md`'s
+    // Palette (0.3) phase); `build_palette` returning `None` (too many
+    // distinct colors) is an ordinary outcome, not an error.
+    let mut cafe_bytes = direct_bytes;
+    let mut used_palette = false;
+    if let Some(built) = build_palette(raw, 4) {
+        let palette_bytes = encode_bytes(
+            width,
+            height,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_RGBA,
+            &built.indices,
+            EncoderOptions {
+                palette: Some(built.entries),
+                ..Default::default()
+            },
+        )?;
+        if palette_bytes.len() < cafe_bytes.len() {
+            cafe_bytes = palette_bytes;
+            used_palette = true;
+        }
+    }
 
     let zstd_raw = zstd::encode_all(raw.as_slice(), ZSTD_LEVEL)?;
 
@@ -225,6 +258,7 @@ pub fn measure(img: &RgbaImage) -> Result<Measurement, MeasureError> {
         png_bytes: png_bytes.len(),
         cafe_bytes: cafe_bytes.len(),
         zstd_raw_bytes: zstd_raw.len(),
+        used_palette,
     })
 }
 
@@ -268,6 +302,23 @@ mod tests {
         // treat this pattern's "noise" label as "LCG output", not "entropy
         // upper bound".
         assert!(m.cafe_ratio() < 0.5);
+    }
+
+    #[test]
+    fn measure_palette_friendly_corpus_image_uses_palette() {
+        // Real line-art content (256-color, irregular byte patterns) is
+        // where PLTE's benefit was originally validated (see AGENTS.md's
+        // Palette (0.3) phase) -- skipped gracefully if the corpus
+        // checkout is incomplete, mirroring measure_hdr's test above.
+        let path = crate::manifest::default_corpus_dir()
+            .join("lineart")
+            .join("abacus-psf.png");
+        if !path.is_file() {
+            return;
+        }
+        let img = image::open(&path).unwrap().to_rgba8();
+        let m = measure(&img).expect("measurement should succeed");
+        assert!(m.used_palette);
     }
 
     #[test]

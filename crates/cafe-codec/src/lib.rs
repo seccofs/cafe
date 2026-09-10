@@ -16,6 +16,7 @@ pub mod decoder;
 pub mod encoder;
 pub mod error;
 pub mod morton;
+pub mod palette;
 pub mod predictor;
 pub mod tile;
 pub mod tiling;

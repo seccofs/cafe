@@ -18,11 +18,12 @@ compressor — adaptively transform pixels (via a small set of predictors) so
 that ZSTD compresses them better.
 
 Format 0.1 is deliberately minimal. It supports uint8/uint16 and float32
-samples, gray/RGB/gray+alpha/RGBA color types, a single unified tiling
-mechanism (`iDIM`), row-major or Z-order (Morton) scan, per-row predictive
-filtering with 6 predictors, automatic raw-vs-compressed fallback per chunk,
-and ancillary application metadata (EXIF, JSON, ICC, XMP). Interlacing
-(Adam7, even/odd), indexed palettes, ZSTD dictionaries, byte-shuffle, and
+samples, gray/RGB/gray+alpha/RGBA color types, an optional encoder-side
+indexed-palette transform (`PLTE`) for 8-bit RGB/RGBA content, a single
+unified tiling mechanism (`iDIM`), row-major or Z-order (Morton) scan,
+per-row predictive filtering with 6 predictors, automatic raw-vs-compressed
+fallback per chunk, and ancillary application metadata (EXIF, JSON, ICC,
+XMP). Interlacing (Adam7, even/odd), ZSTD dictionaries, byte-shuffle, and
 advanced HDR tone-mapping are either removed permanently or deferred to a
 later, evidence-driven version (see section 11).
 
@@ -139,12 +140,15 @@ section 11).
 **Channels per color type:** `0`=1 (gray), `2`=3 (RGB), `4`=2
 (gray+alpha), `6`=4 (RGBA). Channel order within a pixel: RGBA stores
 R,G,B,A; RGB stores R,G,B; gray+alpha stores Gray,Alpha; gray stores only
-the gray channel. There is no indexed color type in 0.1 (deferred, section
-11).
+the gray channel. Value `3` is reserved and unused in 0.1 — there is no
+separate *indexed color type*; indexed color is instead an optional
+encoder-side transform of `IDAT`'s payload shape, described in the `PLTE`
+chunk (section 4.3) below, that leaves `color_type` itself always set to
+the image's real, final color model (`2`=RGB or `6`=RGBA).
 
 **Design note:** `IHDR` has **no `Filter method` field** and **no
 `Interlace method` field**. Filtering is always per-row and always active
-structurally (section 4.3.1 — a row can still opt out individually via
+structurally (section 4.4.1 — a row can still opt out individually via
 predictor code `0`, "None"), so there is nothing left for a separate
 "filter method" enum to select between. Interlacing (Adam7, even/odd) is
 removed entirely (not deferred — see `AGENTS.md`'s rationale: not
@@ -211,7 +215,70 @@ enforce a finite upper bound on this product (`MAX_TILE_COUNT`, see
 section 8.2 and `spec/invariants/idim.toml`) and reject the file before
 computing tile order or allocating anything proportional to tile count.
 
-### 4.3 `IDAT` (critical, one or more per file)
+### 4.3 `PLTE` (critical, optional, single instance — indexed-color transform)
+
+An optional lookup table of colors, only meaningful together with a
+matching change to how `IDAT` payloads are shaped (section 4.4 below).
+Unlike PNG's `PLTE`, this chunk never introduces a new `color_type` value:
+`IHDR.color_type` always stays the image's real, final color model (`2`
+RGB or `6` RGBA — `PLTE` is undefined for `color_type` `0`/`4`, and a
+decoder must reject a file combining them). `PLTE` is critical (uppercase)
+because, when present, it is not optional context a decoder can safely
+ignore: without it, the sample bytes in every `IDAT` cannot be correctly
+interpreted at all (they are palette indices, not color channels) — this
+differs from PNG, where `PLTE` is only critical for `color_type = 3`
+specifically.
+
+| Field | Size | Description |
+|---|---|---|
+| Entry count | 2 bytes | uint16 BE, number of palette entries, `1..=256` |
+| Entries | `entry_count × bytes_per_entry` | One entry per palette index, `0`-based |
+
+Each entry is `channels_for_color_type(IHDR.color_type)` bytes: 3 bytes
+(R,G,B) when `IHDR.color_type = 2`, or 4 bytes (R,G,B,A) when
+`IHDR.color_type = 6` — always `bit_depth = 8` per entry regardless of
+`IHDR.bit_depth` (section 8.2's rationale: an index only ever needs to
+select among at most 256 final colors, so paletted content is restricted
+to `IHDR.bit_depth = 8`; 16-bit/float32 paletted images are not supported
+in 0.1). There is no separate transparency (`tRNS`-equivalent) chunk —
+per-entry alpha is already covered by using `color_type = 6` entries
+directly, keeping this a single chunk rather than PNG's two-chunk
+`PLTE`+`tRNS` split.
+
+**Effect on `IDAT` (normative, see section 4.4):** when `PLTE` is present,
+every `IDAT`'s per-pixel payload is exactly one byte (a palette index,
+`0..entry_count`) instead of `bpp` bytes of direct color channels —
+`bpp` for predictor/tiling purposes becomes `1`, regardless of
+`IHDR.color_type`'s real channel count. A decoder reconstructs the final
+`channels_for_color_type(IHDR.color_type)`-channel pixel buffer by
+looking up each decoded index in the table. This is the *only* structural
+effect `PLTE` has: the predictor, tiling, and chunk-framing machinery
+never change shape or gain a palette-specific branch — they operate on
+whatever `bpp` currently is (`1`, when `PLTE` is present; the direct
+per-color-type value otherwise), the same way they already adapt `bpp`
+per `bit_depth`/`color_type` combination.
+
+**Order:** `PLTE` must appear after `IHDR`/`iDIM` (if present) and before
+the first `IDAT` (section 5). A file may contain at most one `PLTE`; a
+decoder finding a second instance must reject the file.
+
+**Validation (normative):** a decoder must reject the file if any of the
+following hold: `entry_count = 0`; `IHDR.color_type` is `0` or `4`
+(`PLTE` is undefined for gray/gray+alpha); `IHDR.bit_depth != 8`; any
+`IDAT` byte, once split into indices, is `>= entry_count` (an
+out-of-range index, section 8.1's "decoders must never panic on untrusted
+input" — indexing the palette table with it must be bounds-checked, not
+assumed valid).
+
+**Choosing to use `PLTE` is entirely an encoder-side decision** (spec
+section 4.4.1's predictor-selection precedent applies equally here): an
+encoder may inspect an image's distinct-color count and only emit `PLTE`
+when it helps (`cafe-bench` empirically found 256-or-fewer-distinct-color
+RGB/RGBA content compresses 1.4-1.5x smaller this way — see `AGENTS.md`).
+The decoder's only obligation is correctly reversing whichever choice the
+encoder made, per section 1's "decoder is fixed" principle.
+
+### 4.4 `IDAT` (critical, one or more per file)
 
 Contains the pixels of one tile. Each `IDAT` is independent — it can be
 compressed or not (fallback rule, section 3.2), and decoded as soon as it
@@ -227,9 +294,11 @@ for each row of the tile, in order:
 
 `bytes_per_row = tile_width × bpp`, where `bpp = bytes_per_sample ×
 channels` (`bytes_per_sample` is `1` for `bit_depth = 8`, `2` for
-`bit_depth = 16`, `4` for `bit_depth = 32`).
+`bit_depth = 16`, `4` for `bit_depth = 32`) — except when a `PLTE` chunk
+(section 4.3) is present, in which case `bpp = 1` (one index byte per
+pixel) regardless of `IHDR.color_type`'s real channel count.
 
-#### 4.3.1 Predictors
+#### 4.4.1 Predictors
 
 Reduces data entropy **before** compression by predicting each sample byte
 from already-known causal neighbors and storing only the residual. This is
@@ -274,7 +343,8 @@ This is the same zero-neighbor convention PNG uses for the first line of
 the whole image, applied per tile here for streaming independence.
 
 **Bytes per pixel (`bpp`)**, used to locate the left neighbor:
-`bpp = bytes_per_sample × channels` (section 4.3). Minimum `bpp = 1`.
+`bpp = bytes_per_sample × channels` (section 4.4), or `bpp = 1` when a
+`PLTE` chunk is present (section 4.3). Minimum `bpp = 1`.
 
 **Selection heuristic is not part of the decoding contract:** how an
 encoder chooses which of the 6 predictor codes to use for a given row is
@@ -282,7 +352,7 @@ entirely an encoder-side decision (e.g. sum of absolute residuals, Shannon
 entropy, or a real compression test) — the decoder only ever reverses
 whichever code is actually written.
 
-### 4.4 `eXIF` (ancillary, optional, single instance)
+### 4.5 `eXIF` (ancillary, optional, single instance)
 
 Stores EXIF metadata (camera, capture date, geolocation, orientation,
 etc.) in complete TIFF format, exactly as the Exif specification defines.
@@ -296,7 +366,7 @@ opaque blob. Single instance per file (a decoder finding more than one
 must consider only the first). Recommended position: before the first
 `IDAT`.
 
-### 4.5 `jSON` (ancillary, optional, multiple instances allowed)
+### 4.6 `jSON` (ancillary, optional, multiple instances allowed)
 
 Stores arbitrary application/user metadata in JSON format, namespaced to
 avoid collisions between sources.
@@ -312,7 +382,7 @@ A malformed `jSON` chunk (inconsistent namespace length, or invalid JSON)
 must not invalidate the file — the decoder discards only that chunk
 (section 8.4).
 
-### 4.6 `iCCP` (ancillary, optional, single instance)
+### 4.7 `iCCP` (ancillary, optional, single instance)
 
 Stores an ICC color management profile.
 
@@ -324,7 +394,7 @@ Stores an ICC color management profile.
 be interpreted as **sRGB (IEC 61966-2-1)**. A decoder not implementing
 `iCCP` is always correct treating colors as sRGB.
 
-### 4.7 `xMPd` (ancillary, optional, single instance)
+### 4.8 `xMPd` (ancillary, optional, single instance)
 
 Stores metadata in XMP format (Adobe/ISO 16684-1).
 
@@ -336,7 +406,7 @@ Applications are expected to choose one metadata mechanism per data type
 (EXIF for capture data, XMP for editorial flow, JSON for
 application-proprietary data) — CAFE does not mandate which.
 
-### 4.8 `IEND` (critical, marks end of file)
+### 4.9 `IEND` (critical, marks end of file)
 
 `Length = 0`. No `Data`.
 
@@ -352,6 +422,7 @@ eXIF                  (optional, single instance)
 jSON (zero or more)   (optional, one per namespace)
 iCCP                  (optional, single instance)
 xMPd                  (optional, single instance)
+PLTE                  (optional, single instance — section 4.3)
 IDAT (one or more)    (mandatory, in scan order — section 4.2)
 IEND                  (mandatory, last)
 ```
@@ -474,8 +545,7 @@ rationale per item.
 | Feature | Target version | Notes |
 |---|---|---|
 | SIMD (AVX2/NEON) | 0.2 | Scalar-is-reference/SIMD-is-optimization; zero on-disk effect when it lands |
-| Indexed palette (`PLTE`) | 0.3 | Encoder-side transform, not a new decoder color type |
-| Palette quantization algorithms | 0.3 | Median-cut / k-means / redmean, encoder-only |
+| Palette quantization algorithms | 0.3+ | Median-cut / k-means / redmean, encoder-only — `PLTE` itself (section 4.3) is implemented; only picking a palette for images with *more* than 256 distinct colors (quantization) remains deferred |
 | ZSTD dictionary (external, then embedded) | 0.4 | Conflicts with single-pass streaming until designed carefully |
 | HDR (fp16, PQ/HLG/tonemap) | Unscheduled | No design work started |
 

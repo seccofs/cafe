@@ -1,0 +1,39 @@
+# Normative: CAFE-spec.md section 4.3 (PLTE).
+#
+# NOTE: all root-level keys are declared here, at the top of the file,
+# before any `[[array-of-tables]]` section below - in TOML, a bare
+# `key = value` appearing *after* a `[[table]]` header attaches to that
+# table (the last array element), not back to the document root.
+
+# Entry count field itself is 2 bytes (uint16 BE); the *value* it may hold
+# is further bounded to max_entries (spec/invariants/security.toml's
+# max_palette_entries must agree with this).
+entry_count_field_bytes = 2
+min_entries = 1
+max_entries = 256
+
+# PLTE is only valid for these two color types (RGB, RGBA) - it is
+# undefined for gray (0) and gray+alpha (4).
+valid_color_types = [2, 6]
+
+# PLTE restricts IHDR.bit_depth to exactly this value - an index only
+# ever selects among at most 256 final colors, so wider direct sample
+# widths are meaningless once PLTE is present.
+plte_only_valid_at_bit_depth = 8
+
+# Effect on IDAT (section 4.4): when PLTE is present, bpp for
+# predictor/tiling purposes is always this value (one index byte per
+# pixel), regardless of IHDR.color_type's real channel count.
+idat_bpp_with_plte = 1
+
+# Bytes per palette entry, keyed by IHDR.color_type - always 8-bit samples
+# regardless of IHDR.bit_depth (see plte_only_valid_at_bit_depth above).
+[[entry_size]]
+color_type = 2
+bytes_per_entry = 3
+name = "rgb"
+
+[[entry_size]]
+color_type = 6
+bytes_per_entry = 4
+name = "rgba"

@@ -19,14 +19,15 @@ mandatory_order = [
     "jSON",
     "iCCP",
     "xMPd",
+    "PLTE",
     "IDAT",
     "IEND",
 ]
 
 # Chunk types deliberately excluded from v0.1's defined chunk set:
-# PLTE (indexed palette, deferred to 0.3 as encoder-side transform),
 # cHDR (HDR metadata, unscheduled), zDIC (ZSTD dictionary, deferred to 0.4).
-excluded_from_v0_1 = ["PLTE", "cHDR", "zDIC"]
+# PLTE (indexed-color transform, section 4.3) is implemented in v0.1.
+excluded_from_v0_1 = ["cHDR", "zDIC"]
 
 [framing]
 length_field_bytes = 4
@@ -80,6 +81,12 @@ mandatory = false
 [[chunk]]
 type = "xMPd"
 critical = false
+single_instance = true
+mandatory = false
+
+[[chunk]]
+type = "PLTE"
+critical = true
 single_instance = true
 mandatory = false
 

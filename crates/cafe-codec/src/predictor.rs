@@ -1,4 +1,4 @@
-//! Predictors (spec section 4.3.1): 6 codes, chosen per row, reducing
+//! Predictors (spec section 4.4.1): 6 codes, chosen per row, reducing
 //! entropy *before* ZSTD compression by predicting each sample byte from
 //! already-known causal neighbors and storing only the residual.
 //!
@@ -8,7 +8,7 @@
 
 use crate::error::{CodecError, Result};
 
-/// Predictor code `0` (spec section 4.3.1): original byte kept, no
+/// Predictor code `0` (spec section 4.4.1): original byte kept, no
 /// prediction.
 pub const PREDICTOR_NONE: u8 = 0;
 /// Predictor code `1`: predicts from the left neighbor (`L`), same row.
@@ -24,11 +24,11 @@ pub const PREDICTOR_PAETH: u8 = 4;
 /// Predictor code `5`: `(L + U - UL) mod 256`, no clamping.
 pub const PREDICTOR_GRADIENT: u8 = 5;
 
-/// Number of predictor codes defined by spec section 4.3.1 — the highest
+/// Number of predictor codes defined by spec section 4.4.1 — the highest
 /// valid code is `NUM_PREDICTORS - 1`.
 pub const NUM_PREDICTORS: u8 = 6;
 
-/// Paeth predictor (spec section 4.3.1), identical to PNG's: predicts
+/// Paeth predictor (spec section 4.4.1), identical to PNG's: predicts
 /// whichever of `left`/`up`/`up_left` is numerically closest to
 /// `left + up - up_left`.
 fn paeth_predictor(left: u8, up: u8, up_left: u8) -> u8 {
@@ -46,14 +46,14 @@ fn paeth_predictor(left: u8, up: u8, up_left: u8) -> u8 {
     }
 }
 
-/// Gradient predictor (spec section 4.3.1): `(L + U - UL) mod 256`. Uses
+/// Gradient predictor (spec section 4.4.1): `(L + U - UL) mod 256`. Uses
 /// wrapping arithmetic throughout — no clamping, unlike Paeth.
 fn gradient_predictor(left: u8, up: u8, up_left: u8) -> u8 {
     left.wrapping_add(up).wrapping_sub(up_left)
 }
 
 /// Dispatches to the predictor named by `code`, given the three causal
-/// neighbors (`left`, `up`, `up_left` — spec section 4.3.1's `L`/`U`/`UL`,
+/// neighbors (`left`, `up`, `up_left` — spec section 4.4.1's `L`/`U`/`UL`,
 /// each `0` at a tile edge per the zero-neighbor convention). Returns
 /// `Err(InvalidPredictorCode)` for any `code >= NUM_PREDICTORS` — this is
 /// the single validation point every caller (both `filter_row` and
@@ -89,7 +89,7 @@ fn neighbors(row: &[u8], prev_row: Option<&[u8]>, x: usize, bpp: usize) -> (u8, 
 
 /// Applies predictor `code` to `row` (encoder direction): for each byte,
 /// computes `residual = original_byte - prediction` (`u8` wrapping,
-/// spec section 4.3.1). `prev_row` is the already-reconstructed previous
+/// spec section 4.4.1). `prev_row` is the already-reconstructed previous
 /// row of the same tile, or `None` for the tile's first row.
 pub fn filter_row(row: &[u8], prev_row: Option<&[u8]>, code: u8, bpp: usize) -> Result<Vec<u8>> {
     if code == PREDICTOR_NONE {
@@ -128,7 +128,7 @@ pub fn unfilter_row(
 }
 
 /// Zero-order entropy (bits/byte) of `data`'s byte histogram — the
-/// per-row predictor selection heuristic (spec section 4.3.1: "how an
+/// per-row predictor selection heuristic (spec section 4.4.1: "how an
 /// encoder chooses which of the 6 predictor codes to use for a given row
 /// is entirely an encoder-side decision").
 fn shannon_entropy(data: &[u8]) -> f64 {
@@ -151,7 +151,7 @@ fn shannon_entropy(data: &[u8]) -> f64 {
 }
 
 /// Chooses the lowest-Shannon-entropy predictor for one row, independent
-/// of every other row (spec section 4.3.1: predictor selection is chosen
+/// of every other row (spec section 4.4.1: predictor selection is chosen
 /// per row, not part of the decoding contract). Tests all
 /// [`NUM_PREDICTORS`] candidates and returns the winning code plus its
 /// already-filtered row; ties favor the numerically smaller code, since

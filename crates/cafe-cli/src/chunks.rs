@@ -58,7 +58,7 @@ pub fn walk_chunks(buf: &[u8]) -> cafe_format::Result<Vec<ChunkInfo>> {
 }
 
 /// Extracts just the predictor code byte prefixing each row of a
-/// (already decompressed) `IDAT` payload (spec section 4.3: `for each
+/// (already decompressed) `IDAT` payload (spec section 4.4: `for each
 /// row: [predictor code: 1 byte][filtered row: bytes_per_row bytes]`),
 /// without reversing the prediction — `cafe explain` only needs the codes
 /// themselves (for a histogram), not reconstructed pixels.

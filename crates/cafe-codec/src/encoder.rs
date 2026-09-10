@@ -25,7 +25,7 @@ use crate::zstd_codec::{compress_with_fallback, FLAG_RAW};
 use cafe_format::chunk::write_chunk;
 use cafe_format::constants::{COMPRESSION_METHOD_ZSTD_BIT, SCAN_ORDER_ROW_MAJOR, SIGNATURE};
 use cafe_format::ihdr::Ihdr;
-use cafe_format::Idim;
+use cafe_format::{Idim, Plte};
 use std::io::Write;
 
 /// Encoder-side knobs (spec section 3.2's fallback rule, section 4.1's
@@ -33,7 +33,7 @@ use std::io::Write;
 /// order are the things an encoder gets to decide — predictor choice is
 /// already fixed to the per-row entropy heuristic in
 /// [`crate::predictor::choose_best_row_predictor`]).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EncoderOptions {
     /// ZSTD compression level passed to [`compress_with_fallback`]. Higher
     /// is slower but usually smaller; `19` matches the level `cafe-bench`
@@ -59,6 +59,19 @@ pub struct EncoderOptions {
     /// (spec section 4.2: `0`=row-major, `1`=Z-order). Ignored when
     /// `tile_size` is `None`.
     pub scan_order: u8,
+    /// Indexed-color palette entries (spec section 4.3), flat bytes
+    /// (`bytes_per_entry` per entry, matching `color_type`: `3` for RGB,
+    /// `4` for RGBA). `None` (default) means no `PLTE` chunk is emitted
+    /// and `add_tile`/`encode_bytes` expect direct pixel bytes as usual.
+    ///
+    /// `Some(entries)` is the caller's declaration "the pixels I'm about
+    /// to hand this encoder are already palette *indices*, one byte per
+    /// pixel, not direct channel bytes" (per `AGENTS.md`'s API decision:
+    /// this encoder never quantizes colors itself — see
+    /// [`crate::palette::build_palette`] for the helper that computes both
+    /// `entries` and the index buffer to pass as `add_tile`/`encode_bytes`'
+    /// pixel data from a real direct-color image).
+    pub palette: Option<Vec<u8>>,
 }
 
 impl Default for EncoderOptions {
@@ -68,6 +81,7 @@ impl Default for EncoderOptions {
             allow_zstd: true,
             tile_size: None,
             scan_order: SCAN_ORDER_ROW_MAJOR,
+            palette: None,
         }
     }
 }
@@ -116,12 +130,26 @@ impl<W: Write> Encoder<W> {
         };
         ihdr.validate()?;
 
-        let bpp = ihdr.bytes_per_pixel().ok_or_else(|| {
+        let direct_bpp = ihdr.bytes_per_pixel().ok_or_else(|| {
             CodecError::Format(cafe_format::CafeError::InvalidIhdr(format!(
                 "no channel count for color_type={}",
                 ihdr.color_type
             )))
         })?;
+
+        // When a palette is configured, IDAT holds one index byte per
+        // pixel (spec section 4.3), regardless of color_type's real
+        // channel count — `direct_bpp` is still needed above/below for
+        // PLTE's own entry-size validation.
+        let plte = match &options.palette {
+            None => None,
+            Some(entries) => {
+                let parsed = Plte::from_colors(color_type, entries)?;
+                parsed.validate(color_type, bit_depth)?;
+                Some(parsed)
+            }
+        };
+        let bpp = if plte.is_some() { 1 } else { direct_bpp };
 
         let idim = match options.tile_size {
             None => None,
@@ -143,6 +171,9 @@ impl<W: Write> Encoder<W> {
         writer.write_all(&ihdr.to_chunk_bytes())?;
         if let Some(idim) = &idim {
             writer.write_all(&idim.to_chunk_bytes())?;
+        }
+        if let Some(plte) = &plte {
+            writer.write_all(&plte.to_chunk_bytes())?;
         }
 
         Ok(Self {
@@ -210,7 +241,7 @@ impl<W: Write> Encoder<W> {
     ///
     /// Returns [`CodecError::EncoderMisuse`] if fewer tiles were added than
     /// the layout requires — every CAFE file needs at least one `IDAT`
-    /// (spec section 4.3), and a partially-tiled file would silently
+    /// (spec section 4.4), and a partially-tiled file would silently
     /// decode as truncated.
     pub fn finish(mut self) -> Result<W> {
         if self.next_tile_index != self.layout.tile_count() {
@@ -854,6 +885,165 @@ mod tests {
             },
         );
         assert!(matches!(result, Err(CodecError::EncoderMisuse(_))));
+    }
+
+    #[test]
+    fn test_encode_with_palette_roundtrip() {
+        use crate::palette::{build_palette, expand_indices};
+        use cafe_format::constants::COLOR_TYPE_RGB;
+
+        // 2x2 RGB image, 2 distinct colors.
+        let direct_pixels = vec![
+            255u8, 0, 0, 0, 255, 0, // row 0: red, green
+            255, 0, 0, 0, 255, 0, // row 1: red, green
+        ];
+        let built = build_palette(&direct_pixels, 3).unwrap();
+
+        let buf = encode_bytes(
+            2,
+            2,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_RGB,
+            &built.indices,
+            EncoderOptions {
+                palette: Some(built.entries.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let img = decode_bytes(&buf).unwrap();
+        // decode_bytes already expands indices back to direct pixels.
+        assert_eq!(img.pixels, direct_pixels);
+
+        // Sanity: expand_indices independently agrees.
+        let expanded = expand_indices(&built.indices, &built.entries, 3).unwrap();
+        assert_eq!(expanded, direct_pixels);
+    }
+
+    #[test]
+    fn test_encode_with_palette_emits_plte_chunk() {
+        use cafe_format::constants::COLOR_TYPE_RGB;
+
+        let indices = vec![0u8, 1, 0, 1];
+        let entries = vec![255u8, 0, 0, 0, 255, 0];
+        let buf = encode_bytes(
+            2,
+            2,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_RGB,
+            &indices,
+            EncoderOptions {
+                palette: Some(entries),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Signature(9) + IHDR chunk(25) puts the next chunk's Type field at
+        // offset 9+25+4 = 38; with a palette configured, that's PLTE.
+        assert_eq!(&buf[9 + 25 + 4..9 + 25 + 8], b"PLTE");
+    }
+
+    #[test]
+    fn test_encode_without_palette_omits_plte_chunk() {
+        use cafe_format::constants::COLOR_TYPE_RGB;
+
+        let raw = vec![1u8; 4 * 3];
+        let buf = encode_bytes(
+            2,
+            2,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_RGB,
+            &raw,
+            EncoderOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(&buf[9 + 25 + 4..9 + 25 + 8], b"IDAT");
+    }
+
+    #[test]
+    fn test_encode_rejects_invalid_palette_color_type() {
+        use cafe_format::constants::COLOR_TYPE_GRAY;
+
+        let result = Encoder::new(
+            Vec::new(),
+            1,
+            1,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_GRAY, // PLTE is undefined for gray
+            EncoderOptions {
+                palette: Some(vec![255, 0, 0]),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(CodecError::Format(cafe_format::CafeError::InvalidPlte(_)))
+        ));
+    }
+
+    #[test]
+    fn test_encode_rejects_palette_at_wrong_bit_depth() {
+        use cafe_format::constants::COLOR_TYPE_RGB;
+
+        let result = Encoder::new(
+            Vec::new(),
+            1,
+            1,
+            16, // PLTE requires bit_depth=8
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_RGB,
+            EncoderOptions {
+                palette: Some(vec![255, 0, 0]),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(CodecError::Format(cafe_format::CafeError::InvalidPlte(_)))
+        ));
+    }
+
+    #[test]
+    fn test_encode_with_palette_and_tiling_roundtrip() {
+        use crate::palette::build_palette;
+        use cafe_format::constants::COLOR_TYPE_RGBA;
+
+        // 4x4 RGBA image, few distinct colors, split into 2x2 tiles.
+        let mut direct_pixels = Vec::new();
+        for r in 0..4u32 {
+            for c in 0..4u32 {
+                let color = if (r + c) % 2 == 0 {
+                    [255u8, 0, 0, 255]
+                } else {
+                    [0u8, 255, 0, 255]
+                };
+                direct_pixels.extend_from_slice(&color);
+            }
+        }
+        let built = build_palette(&direct_pixels, 4).unwrap();
+
+        let buf = encode_bytes(
+            4,
+            4,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_RGBA,
+            &built.indices,
+            EncoderOptions {
+                palette: Some(built.entries),
+                tile_size: Some((2, 2)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let img = decode_bytes(&buf).unwrap();
+        assert_eq!(img.pixels, direct_pixels);
     }
 
     #[test]

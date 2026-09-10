@@ -109,9 +109,9 @@ fn ihdr_first_and_iend_last_are_critical_and_singular() {
     assert_eq!(order.first(), Some(&"IHDR"));
     assert_eq!(order.last(), Some(&"IEND"));
 
-    // v0.1 deliberately excludes these three chunk types (indexed
-    // palette, HDR metadata, ZSTD dictionary) - assert none of them
-    // accidentally leaked back into the defined chunk list.
+    // v0.1 deliberately excludes these chunk types (HDR metadata, ZSTD
+    // dictionary) - assert none of them accidentally leaked back into the
+    // defined chunk list.
     let excluded: Vec<&str> = doc["excluded_from_v0_1"]
         .as_array()
         .expect("excluded_from_v0_1 array")
@@ -227,10 +227,12 @@ fn ihdr_sample_format_bit_depth_and_channels_are_internally_consistent() {
         declared_color_types, channel_color_types,
         "IHDR.color_type allowed_values must match the channels table exactly"
     );
-    // Indexed (3) must not appear anywhere - deferred to 0.3.
+    // color_type=3 is reserved and permanently unused - indexed color is
+    // an encoder-side IDAT-payload transform (PLTE, section 4.3), not a
+    // separate structural color_type value (unlike PNG).
     assert!(
         !declared_color_types.contains(&3),
-        "indexed color_type=3 is deferred to 0.3, not v0.1"
+        "color_type=3 is reserved and unused - indexed color is a PLTE transform, not a color_type"
     );
 }
 
@@ -332,4 +334,94 @@ fn security_decompression_ceiling_is_one_gib() {
     );
     assert_eq!(doc["max_width"].as_bool(), Some(false));
     assert_eq!(doc["max_height"].as_bool(), Some(false));
+}
+
+/// PLTE's declared type (RGB/RGBA) must exactly be IHDR's channels table
+/// restricted to the two color types PLTE supports - if IHDR ever grows a
+/// third RGB-like color type, plte.toml's valid_color_types would need a
+/// deliberate update, not silent drift.
+#[test]
+fn plte_valid_color_types_are_subset_of_ihdr_channels_table() {
+    let ihdr = load("ihdr.toml");
+    let plte = load("plte.toml");
+
+    let ihdr_color_types: Vec<i64> = ihdr["channels"]
+        .as_array()
+        .expect("channels array")
+        .iter()
+        .map(|c| as_int(&c["color_type"]))
+        .collect();
+    let plte_color_types: Vec<i64> = plte["valid_color_types"]
+        .as_array()
+        .expect("valid_color_types array")
+        .iter()
+        .map(as_int)
+        .collect();
+    for ct in &plte_color_types {
+        assert!(
+            ihdr_color_types.contains(ct),
+            "plte.toml's valid_color_types contains {ct}, not present in ihdr.toml's channels table"
+        );
+    }
+    // PLTE is undefined for gray (0) and gray+alpha (4) - only RGB/RGBA.
+    assert_eq!(plte_color_types, vec![2, 6]);
+}
+
+/// Cross-file consistency: plte.toml's max_entries and security.toml's
+/// max_palette_entries must agree, or one could silently drift from the
+/// other the same way idim.toml/security.toml's max_tile_count already
+/// guards against.
+#[test]
+fn plte_max_entries_agrees_with_security_invariant() {
+    let plte = load("plte.toml");
+    let security = load("security.toml");
+    assert_eq!(
+        as_int(&plte["max_entries"]),
+        as_int(&security["max_palette_entries"]),
+        "plte.toml and security.toml must declare the same max_entries/max_palette_entries"
+    );
+    assert_eq!(as_int(&security["max_palette_entries"]), 256);
+}
+
+/// entry_size table must have exactly one entry per valid_color_types
+/// value, with bytes_per_entry matching that color_type's channel count
+/// in ihdr.toml (3 for RGB, 4 for RGBA) - PLTE entries are always 8-bit
+/// samples per channel, never a separate width to reconcile.
+#[test]
+fn plte_entry_sizes_match_ihdr_channel_counts() {
+    let ihdr = load("ihdr.toml");
+    let plte = load("plte.toml");
+
+    let channels = ihdr["channels"].as_array().expect("channels array");
+    let entry_sizes = plte["entry_size"].as_array().expect("entry_size array");
+    let valid_color_types: Vec<i64> = plte["valid_color_types"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(as_int)
+        .collect();
+
+    assert_eq!(entry_sizes.len(), valid_color_types.len());
+    for entry in entry_sizes {
+        let color_type = as_int(&entry["color_type"]);
+        assert!(valid_color_types.contains(&color_type));
+        let expected_channels = channels
+            .iter()
+            .find(|c| as_int(&c["color_type"]) == color_type)
+            .map(|c| as_int(&c["channels"]))
+            .expect("matching channels entry");
+        assert_eq!(
+            as_int(&entry["bytes_per_entry"]),
+            expected_channels,
+            "PLTE entry size for color_type={color_type} must equal its channel count \
+             (1 byte per channel)"
+        );
+    }
+}
+
+#[test]
+fn plte_only_valid_at_bit_depth_8() {
+    let plte = load("plte.toml");
+    assert_eq!(as_int(&plte["plte_only_valid_at_bit_depth"]), 8);
+    assert_eq!(as_int(&plte["idat_bpp_with_plte"]), 1);
 }
