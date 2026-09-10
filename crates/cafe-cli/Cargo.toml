@@ -1,0 +1,31 @@
+[package]
+name = "cafe-cli"
+description = "CAFE command-line tools: cafe (inspect/benchmark/verify/explain), cafe-encode, cafe-decode."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cafe-format.workspace = true
+cafe-codec.workspace = true
+cafe-bench.workspace = true
+image.workspace = true
+serde_json.workspace = true
+
+[lib]
+name = "cafe_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cafe"
+path = "src/bin/cafe.rs"
+
+[[bin]]
+name = "cafe-encode"
+path = "src/bin/cafe-encode.rs"
+
+[[bin]]
+name = "cafe-decode"
+path = "src/bin/cafe-decode.rs"
