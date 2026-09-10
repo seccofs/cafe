@@ -1,0 +1,15 @@
+[package]
+name = "cafe-codec"
+description = "CAFE codec: predictors, ZSTD compression, tiling, and the streaming Encoder<W>/Decoder<R> API."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cafe-format.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
