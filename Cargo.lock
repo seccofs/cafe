@@ -246,6 +246,7 @@ dependencies = [
  "crc32fast",
  "proptest",
  "serde",
+ "serde_json",
  "toml",
 ]
 

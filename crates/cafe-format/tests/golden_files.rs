@@ -23,7 +23,7 @@ use cafe_format::constants::{
 use cafe_format::error::CafeError;
 use cafe_format::ihdr::{read_ihdr, Ihdr};
 use cafe_format::validate_signature;
-use cafe_format::Plte;
+use cafe_format::{JsonChunk, Plte, Xmpd};
 use std::path::{Path, PathBuf};
 
 fn golden_dir() -> PathBuf {
@@ -94,6 +94,47 @@ fn test_minimal_2x2_indexed_rgb_parses_and_validates() {
     assert_eq!(ihdr.bit_depth, 8);
     assert_eq!(ihdr.color_type, COLOR_TYPE_RGB);
     assert_eq!(types, vec!["PLTE", "IDAT", "IEND"]);
+}
+
+#[test]
+fn test_minimal_1x1_gray_with_metadata_parses_and_validates() {
+    let buf = read_golden("minimal_1x1_gray_with_metadata.cafe");
+    let (ihdr, types) = parse_minimal(&buf).expect("golden file should parse cleanly");
+    assert_eq!(ihdr.width, 1);
+    assert_eq!(ihdr.height, 1);
+    assert_eq!(ihdr.bit_depth, 8);
+    assert_eq!(ihdr.color_type, COLOR_TYPE_GRAY);
+    // Spec section 5's mandatory order: eXIF -> jSON -> iCCP -> xMPd,
+    // all before IDAT/IEND.
+    assert_eq!(types, vec!["eXIF", "jSON", "iCCP", "xMPd", "IDAT", "IEND"]);
+
+    // Confirm each metadata chunk's content parses correctly too, not
+    // just its framing/position.
+    let mut offset = validate_signature(&buf).unwrap();
+    let (_, next) = read_ihdr(&buf, offset).unwrap();
+    offset = next;
+
+    let exif_chunk = read_chunk(&buf, offset).unwrap();
+    assert_eq!(&exif_chunk.chunk_type, b"eXIF");
+    assert_eq!(exif_chunk.data, b"fake exif bytes");
+    offset = exif_chunk.next_offset;
+
+    let json_chunk_raw = read_chunk(&buf, offset).unwrap();
+    assert_eq!(&json_chunk_raw.chunk_type, b"jSON");
+    let json_chunk = JsonChunk::from_payload(&json_chunk_raw.data).unwrap();
+    assert_eq!(json_chunk.namespace, "com.example");
+    assert_eq!(json_chunk.payload, "{\"a\":1}");
+    offset = json_chunk_raw.next_offset;
+
+    let iccp_chunk = read_chunk(&buf, offset).unwrap();
+    assert_eq!(&iccp_chunk.chunk_type, b"iCCP");
+    assert_eq!(iccp_chunk.data, b"fake icc profile bytes");
+    offset = iccp_chunk.next_offset;
+
+    let xmpd_chunk_raw = read_chunk(&buf, offset).unwrap();
+    assert_eq!(&xmpd_chunk_raw.chunk_type, b"xMPd");
+    let xmpd_chunk = Xmpd::from_payload(&xmpd_chunk_raw.data).unwrap();
+    assert_eq!(xmpd_chunk.xml, "<x:xmpmeta></x:xmpmeta>");
 }
 
 // --- Malformed fixtures ---
@@ -247,6 +288,23 @@ fn generate_golden_fixtures() {
     buf.extend(write_chunk(b"IDAT", 0x00, &idat_payload));
     buf.extend(write_chunk(b"IEND", 0x00, b""));
     std::fs::write(dir.join("minimal_2x2_indexed_rgb.cafe"), &buf).unwrap();
+
+    // --- minimal_1x1_gray_with_metadata.cafe: exercises all four
+    // ancillary metadata chunk types (spec sections 4.5-4.8) in their
+    // mandatory order, ahead of a minimal 1x1 gray IDAT/IEND. ---
+    let mut buf = SIGNATURE.to_vec();
+    buf.extend(gray_ihdr.to_chunk_bytes());
+    buf.extend(write_chunk(b"eXIF", 0x00, b"fake exif bytes"));
+    buf.extend(
+        JsonChunk::new("com.example", "{\"a\":1}")
+            .unwrap()
+            .to_chunk_bytes(),
+    );
+    buf.extend(write_chunk(b"iCCP", 0x00, b"fake icc profile bytes"));
+    buf.extend(Xmpd::new("<x:xmpmeta></x:xmpmeta>").to_chunk_bytes());
+    buf.extend(write_chunk(b"IDAT", 0x00, &[0x00, 0x7F]));
+    buf.extend(write_chunk(b"IEND", 0x00, b""));
+    std::fs::write(dir.join("minimal_1x1_gray_with_metadata.cafe"), &buf).unwrap();
 
     // --- malformed/bad_signature.cafe: wrong magic bytes ---
     let mut buf = vec![0u8; 9];

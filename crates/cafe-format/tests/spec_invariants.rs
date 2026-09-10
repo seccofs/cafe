@@ -419,6 +419,54 @@ fn plte_entry_sizes_match_ihdr_channel_counts() {
     }
 }
 
+/// The four metadata chunk types (spec sections 4.5-4.8) must all be
+/// declared ancillary (ADR: metadata never blocks decoding, spec section
+/// 8.4), and `jSON` specifically must be the only one of the four allowed
+/// to repeat (`single_instance = false`) — a future edit accidentally
+/// flipping either property for the wrong chunk would silently violate
+/// spec text this test pins down explicitly.
+#[test]
+fn metadata_chunks_are_ancillary_and_json_is_the_only_repeatable_one() {
+    let doc = load("chunks.toml");
+    let chunks = doc["chunk"].as_array().expect("chunk array");
+
+    for ty in ["eXIF", "jSON", "iCCP", "xMPd"] {
+        let chunk = chunks
+            .iter()
+            .find(|c| c["type"].as_str() == Some(ty))
+            .unwrap_or_else(|| panic!("{ty:?} entry present"));
+        assert_eq!(
+            chunk["critical"].as_bool(),
+            Some(false),
+            "{ty:?} must be ancillary (spec section 8.4)"
+        );
+        let expected_single_instance = ty != "jSON";
+        assert_eq!(
+            chunk["single_instance"].as_bool(),
+            Some(expected_single_instance),
+            "{ty:?}'s single_instance flag disagrees with spec sections 4.5-4.8 \
+             (only jSON allows multiple instances)"
+        );
+    }
+
+    // Mandatory order (spec section 5): all four sit between iDIM and
+    // PLTE, in the fixed sequence eXIF -> jSON -> iCCP -> xMPd.
+    let order: Vec<&str> = doc["mandatory_order"]
+        .as_array()
+        .expect("mandatory_order array")
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    let positions: Vec<usize> = ["iDIM", "eXIF", "jSON", "iCCP", "xMPd", "PLTE"]
+        .iter()
+        .map(|ty| order.iter().position(|t| t == ty).expect("type in order"))
+        .collect();
+    assert!(
+        positions.windows(2).all(|w| w[0] < w[1]),
+        "mandatory_order must place iDIM < eXIF < jSON < iCCP < xMPd < PLTE"
+    );
+}
+
 #[test]
 fn plte_only_valid_at_bit_depth_8() {
     let plte = load("plte.toml");

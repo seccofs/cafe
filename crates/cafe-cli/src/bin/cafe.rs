@@ -7,7 +7,7 @@ use cafe_codec::predictor::{
 };
 use cafe_codec::zstd_codec::{decompress_chunk, FLAG_RAW, FLAG_ZSTD};
 use cafe_format::ihdr::Ihdr;
-use cafe_format::{Idim, Plte};
+use cafe_format::{Idim, JsonChunk, Plte, Xmpd};
 use std::env;
 use std::process::ExitCode;
 
@@ -136,6 +136,51 @@ fn cmd_inspect(args: &[String]) -> Result<(), String> {
     } else {
         println!();
         println!("iDIM: absent (single implicit whole-image tile)");
+    }
+
+    println!();
+    match chunks.iter().find(|c| &c.chunk_type == b"eXIF") {
+        Some(c) => match decompress_chunk(c.flag, &c.data) {
+            Ok(payload) => println!("eXIF: present ({} byte(s))", payload.len()),
+            Err(e) => println!("eXIF: present but failed to decompress: {e}"),
+        },
+        None => println!("eXIF: absent"),
+    }
+    let json_chunks: Vec<_> = chunks.iter().filter(|c| &c.chunk_type == b"jSON").collect();
+    if json_chunks.is_empty() {
+        println!("jSON: absent");
+    } else {
+        println!("jSON: {} chunk(s)", json_chunks.len());
+        for c in &json_chunks {
+            match decompress_chunk(c.flag, &c.data)
+                .map_err(|e| e.to_string())
+                .and_then(|payload| JsonChunk::from_payload(&payload).map_err(|e| e.to_string()))
+            {
+                Ok(j) => println!(
+                    "  namespace={:?} payload={} byte(s)",
+                    j.namespace,
+                    j.payload.len()
+                ),
+                Err(e) => println!("  failed to parse: {e}"),
+            }
+        }
+    }
+    match chunks.iter().find(|c| &c.chunk_type == b"iCCP") {
+        Some(c) => match decompress_chunk(c.flag, &c.data) {
+            Ok(payload) => println!("iCCP: present ({} byte(s))", payload.len()),
+            Err(e) => println!("iCCP: present but failed to decompress: {e}"),
+        },
+        None => println!("iCCP: absent"),
+    }
+    match chunks.iter().find(|c| &c.chunk_type == b"xMPd") {
+        Some(c) => match decompress_chunk(c.flag, &c.data)
+            .map_err(|e| e.to_string())
+            .and_then(|payload| Xmpd::from_payload(&payload).map_err(|e| e.to_string()))
+        {
+            Ok(x) => println!("xMPd: present ({} byte(s) of XML)", x.xml.len()),
+            Err(e) => println!("xMPd: present but failed to parse: {e}"),
+        },
+        None => println!("xMPd: absent"),
     }
 
     if let Some(plte_chunk) = chunks.iter().find(|c| &c.chunk_type == b"PLTE") {
@@ -306,6 +351,13 @@ fn cmd_explain(args: &[String]) -> Result<(), String> {
         ),
         None => println!("  palette: none (direct pixels)"),
     }
+    let json_count = chunks.iter().filter(|c| &c.chunk_type == b"jSON").count();
+    println!(
+        "  metadata: eXIF={} jSON={json_count} iCCP={} xMPd={}",
+        chunks.iter().any(|c| &c.chunk_type == b"eXIF"),
+        chunks.iter().any(|c| &c.chunk_type == b"iCCP"),
+        chunks.iter().any(|c| &c.chunk_type == b"xMPd"),
+    );
     println!();
 
     let layout = cafe_codec::tiling::TileLayout::new(idim, ihdr.width, ihdr.height)

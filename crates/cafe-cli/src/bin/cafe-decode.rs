@@ -18,17 +18,106 @@ use std::env;
 use std::process::ExitCode;
 
 fn usage() {
-    eprintln!("Usage: cafe-decode <input.cafe> <output>");
+    eprintln!("Usage: cafe-decode <input.cafe> <output> [options]");
     eprintln!();
     eprintln!(
         "Supports 8-bit and 16-bit uint CAFE images (gray/gray+alpha/RGB/RGBA, writes PNG) \
          and float32 HDR CAFE images (RGB/RGBA, writes .exr)."
     );
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --extract-exif <file>  Write the file's eXIF chunk bytes to <file>, if present");
+    eprintln!("  --extract-icc <file>   Write the file's iCCP chunk bytes to <file>, if present");
+    eprintln!("  --extract-xmp <file>   Write the file's xMPd XML text to <file>, if present");
 }
 
-fn run(input: &str, output: &str) -> Result<(), String> {
+struct Args {
+    input: String,
+    output: String,
+    extract_exif: Option<String>,
+    extract_icc: Option<String>,
+    extract_xmp: Option<String>,
+}
+
+fn parse_args(args: &[String]) -> Result<Args, String> {
+    if args.len() < 2 {
+        return Err("missing <input.cafe> and/or <output>".to_string());
+    }
+    let input = args[0].clone();
+    let output = args[1].clone();
+    let mut extract_exif = None;
+    let mut extract_icc = None;
+    let mut extract_xmp = None;
+
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--extract-exif" => {
+                extract_exif = Some(
+                    args.get(i + 1)
+                        .ok_or("--extract-exif requires a file path")?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--extract-icc" => {
+                extract_icc = Some(
+                    args.get(i + 1)
+                        .ok_or("--extract-icc requires a file path")?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--extract-xmp" => {
+                extract_xmp = Some(
+                    args.get(i + 1)
+                        .ok_or("--extract-xmp requires a file path")?
+                        .clone(),
+                );
+                i += 2;
+            }
+            other => return Err(format!("unknown option: {other}")),
+        }
+    }
+
+    Ok(Args {
+        input,
+        output,
+        extract_exif,
+        extract_icc,
+        extract_xmp,
+    })
+}
+
+fn run(args: &Args) -> Result<(), String> {
+    let input = &args.input;
+    let output = &args.output;
     let buf = std::fs::read(input).map_err(|e| format!("failed to read {input:?}: {e}"))?;
     let img = decode_bytes(&buf).map_err(|e| format!("decode failed: {e}"))?;
+
+    if let Some(path) = &args.extract_exif {
+        match &img.exif {
+            Some(bytes) => {
+                std::fs::write(path, bytes).map_err(|e| format!("failed to write {path:?}: {e}"))?
+            }
+            None => eprintln!("warning: {input} has no eXIF chunk, nothing written to {path}"),
+        }
+    }
+    if let Some(path) = &args.extract_icc {
+        match &img.icc_profile {
+            Some(bytes) => {
+                std::fs::write(path, bytes).map_err(|e| format!("failed to write {path:?}: {e}"))?
+            }
+            None => eprintln!("warning: {input} has no iCCP chunk, nothing written to {path}"),
+        }
+    }
+    if let Some(path) = &args.extract_xmp {
+        match &img.xmp {
+            Some(xmpd) => std::fs::write(path, &xmpd.xml)
+                .map_err(|e| format!("failed to write {path:?}: {e}"))?,
+            None => eprintln!("warning: {input} has no xMPd chunk, nothing written to {path}"),
+        }
+    }
 
     let dynimg = if img.ihdr.sample_format == SAMPLE_FORMAT_FLOAT {
         cafe_pixels_to_dynamic_image_hdr(
@@ -64,12 +153,17 @@ fn run(input: &str, output: &str) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        usage();
-        return ExitCode::FAILURE;
-    }
-    match run(&args[1], &args[2]) {
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+    let parsed = match parse_args(&raw_args) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("error: {e}");
+            usage();
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match run(&parsed) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");

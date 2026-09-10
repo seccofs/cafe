@@ -1364,9 +1364,123 @@ binaries.
       bytes, 147-byte `.cafe` output — confirmed via `cafe inspect`
       reporting `bit_depth: 16`, `color_type: 6 (RGBA)`, no `PLTE`/`iDIM`),
       decoded back via `cafe-decode`, and the two PNGs' `to_rgba16()`
-      sample buffers confirmed byte-for-byte identical (256 samples). All
+      sample buffers confirmed byte-for-byte identical (256       samples). All
       workspace tests, `cargo fmt --all --check`, and `cargo clippy
       --all-targets -- -D warnings` pass cleanly.
+- [x] **Metadata chunks: eXIF/jSON/iCCP/xMPd (post-16-bit-uint-CLI-support
+      follow-up).** Spec section 5 has always listed `eXIF`/`jSON`/`iCCP`/
+      `xMPd` as defined ancillary chunk types (their framing/ordering rules
+      already existed in `spec/invariants/chunks.toml`), but no crate
+      actually read or wrote their content — `cafe-format`'s `read_chunk`
+      only ever returned them as opaque, unparsed bytes, and neither the
+      decoder nor the encoder had any awareness of them at all. This phase
+      closes that spec-vs-implementation gap for all four types.
+
+      **Design decisions, per this project's decoder-before-encoder,
+      spec-first process:** `eXIF`/`iCCP` stay opaque `Vec<u8>` blobs — spec
+      section 4.5's only rule for `eXIF` is "raw EXIF bytes, first instance
+      wins", and `iCCP`'s content (an ICC color profile) is likewise
+      meaningless for this project to parse — so neither gets a dedicated
+      `cafe-format` struct, only pass-through handling via
+      `chunk::write_chunk`/`read_chunk` directly, kept consistent with the
+      "decoder needs to know a small, fixed set of primitives" principle:
+      CAFE doesn't need to understand EXIF/ICC structure to pass it through
+      losslessly. `jSON` and `xMPd`, in contrast, have real internal framing
+      (`jSON`'s 1-byte namespace-length prefix ahead of its JSON payload)
+      or a validity constraint worth enforcing at the format layer (`xMPd`'s
+      UTF-8 requirement, since XML is inherently text) — both get dedicated
+      `cafe-format` modules mirroring `idim.rs`/`plte.rs`'s existing shape
+      (`new`/`to_payload`/`from_payload`/`to_chunk_bytes`). Per spec section
+      8.4, a decoder must never fail a whole file over malformed *ancillary*
+      chunk content — so `jSON`/`xMPd` parse failures are silently
+      discarded by the decoder (`if let Ok(...) = ...`, no error
+      propagated), while structural/framing failures (truncation,
+      decompression) still propagate exactly like any other chunk, and the
+      *encoder* (given content the caller controls directly) still rejects
+      malformed content up front as a caller error, never silently drops
+      it. `eXIF`/`iCCP`/`xMPd` are single-instance (first occurrence wins,
+      spec section 4.5's explicit rule for `eXIF`, applied consistently to
+      the other two since the spec doesn't specify otherwise); `jSON` is
+      the only repeatable type, and all instances are kept in file order.
+
+      Implemented as: `cafe-format` gained `CafeError::
+      InvalidJsonChunk(String)`/`InvalidXmpd(String)`, a new
+      `JSON_NAMESPACE_LEN_FIELD_LEN` constant, a `serde_json` workspace
+      dependency, and two new modules — `json` (`JsonChunk { namespace,
+      payload }`, 14 tests) and `xmpd` (`Xmpd { xml }`, 5 tests) — both
+      re-exported from `lib.rs`; a new `spec_invariants.rs` test,
+      `metadata_chunks_are_ancillary_and_json_is_the_only_repeatable_one`,
+      cross-checks `chunks.toml`'s existing rules for all four types. Two
+      new golden fixtures were hand-built via the existing `#[ignore]`d
+      `generate_golden_fixtures` test (same precedent as every prior golden
+      fixture in this project — never a real encoder):
+      `golden/minimal_1x1_gray_with_metadata.cafe` (all four chunk types
+      present, validated by a new `golden_files.rs` test and a new
+      `cafe-codec` decoder test). `cafe-codec`'s `decoder::DecodedImage`
+      gained `exif: Option<Vec<u8>>`, `json_chunks: Vec<JsonChunk>`,
+      `icc_profile: Option<Vec<u8>>`, `xmp: Option<Xmpd>`; `decode_bytes`
+      now recognizes all four chunk types at their spec-mandated position
+      (before `PLTE`/`IDAT`), enforcing first-instance-wins for the three
+      single-instance types and file-order collection for `jSON` (7 new
+      tests). `cafe-codec`'s `encoder::EncoderOptions` gained the mirror
+      fields (`exif`, `json_chunks`, `icc_profile`, `xmp: Option<String>`);
+      `Encoder::new` writes any present metadata chunks eagerly, right
+      after `iDIM` and before `PLTE`/`IDAT` per spec section 5's mandatory
+      order, racing raw-vs-ZSTD via the same `compress_with_fallback`
+      policy `IDAT` already uses (respecting `EncoderOptions::allow_zstd`,
+      5 new tests); `EncoderOptions` lost its `derive(Copy)` (now `Debug,
+      Clone, PartialEq` only) due to the new `Vec<u8>`/`Vec<JsonChunk>`
+      fields, with `cafe-encode` updated to `.clone()` at its one call
+      site that relied on `Copy`.
+
+      `cafe-cli` gained: `cafe inspect` prints a metadata section (presence
+      and byte counts for `eXIF`/`iCCP`/`xMPd`, namespace+payload size per
+      `jSON` chunk), decompressing each chunk directly via
+      `zstd_codec::decompress_chunk` rather than adding new `cafe-codec`
+      API surface (matching `chunks.rs`'s existing "presentation-layer
+      parsing belongs in `cafe-cli`" precedent); `cafe explain` gained one
+      summary line reporting each type's presence/count; `cafe-encode`
+      gained `--exif <file>`, `--icc <file>`, `--xmp <file>`, and
+      repeatable `--json <ns>:<file>` flags, each populating the
+      corresponding new `EncoderOptions` field and erroring out cleanly on
+      invalid `--json` namespace/JSON syntax before ever calling
+      `Encoder::new`; `cafe-decode` gained the mirror `--extract-exif`,
+      `--extract-icc`, `--extract-xmp` flags, writing a decoded file's
+      recovered metadata bytes back out to disk (this required
+      restructuring `cafe-decode`'s previously-inline `main`/`run` into a
+      small `parse_args`/`Args` pair, since it now needs to parse optional
+      flags beyond the original fixed two positional arguments).
+
+      Manually verified end-to-end (not just unit-tested), per this
+      project's established practice: encoding
+      `corpus/gradient/gradient_64x64.png` via `cafe-encode` with all four
+      new flags produced a file `cafe inspect` confirmed contains
+      `eXIF`/`jSON`/`iCCP`/`xMPd` in the correct spec order ahead of
+      `IDAT`, which `cafe verify` accepted and `cafe explain` summarized
+      correctly; `cafe-decode --extract-exif/--extract-icc/--extract-xmp`
+      recovered each embedded file's bytes exactly; decoding that file
+      back to PNG and re-encoding the result *without* any metadata flags
+      produced a `.cafe` file with an identical SHA-256 hash to encoding
+      the original PNG directly — confirming metadata embedding has zero
+      effect on pixel data or predictor/compression decisions, as
+      required. `cafe-encode` was also confirmed to reject a
+      deliberately-malformed `--json` file's syntax error before writing
+      any output, distinct from the decoder's silent-discard behavior for
+      untrusted file input.
+
+      33 new tests across four areas (14 `json` + 5 `xmpd` in
+      `cafe-format`'s lib, 1 `spec_invariants`, 1 `golden_files`, 7
+      `decoder` + 5 `encoder` in `cafe-codec`'s lib), for 305 total
+      workspace tests (up from 272 at the end of the 16-bit-uint-CLI-support
+      phase): 139 `cafe-codec` (lib, up from 127) + 12 + 3 + 8
+      (`cafe-codec` integration files, unchanged) + 79 `cafe-format` lib
+      (up from 60) + 3 `chunk_proptest` (unchanged) + 18 `cafe-cli`
+      (unchanged — no unit tests live in `cafe-cli`'s binaries themselves,
+      per this project's presentation-layer convention) + 12 golden (11
+      passed + 1 ignored generator, up from 11 total) + 14 spec-invariants
+      (up from 13) + 17 `cafe-bench` (unchanged). All workspace tests,
+      `cargo fmt --all --check`, and `cargo clippy --all-targets --
+      -D warnings` pass cleanly.
 
 ## Commands
 

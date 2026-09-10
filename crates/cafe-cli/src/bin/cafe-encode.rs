@@ -19,6 +19,7 @@ use cafe_codec::{encode_bytes, EncoderOptions};
 use cafe_format::constants::{
     COLOR_TYPE_RGB, COLOR_TYPE_RGBA, SAMPLE_FORMAT_UINT, SCAN_ORDER_ROW_MAJOR, SCAN_ORDER_Z_ORDER,
 };
+use cafe_format::JsonChunk;
 use image::ColorType;
 use std::env;
 use std::process::ExitCode;
@@ -34,6 +35,13 @@ fn usage() {
     eprintln!("  --level <N>         ZSTD level, 1-22 (default: 19)");
     eprintln!("  --no-zstd           Never use ZSTD; every IDAT is written raw");
     eprintln!("  --no-palette        Never emit a PLTE chunk; always encode direct pixels");
+    eprintln!("  --exif <file>       Embed <file>'s raw bytes as an eXIF chunk");
+    eprintln!("  --icc <file>        Embed <file>'s raw bytes as an iCCP chunk");
+    eprintln!("  --xmp <file>        Embed <file>'s UTF-8 text as an xMPd chunk");
+    eprintln!(
+        "  --json <ns>:<file>  Embed <file>'s JSON text as a jSON chunk under namespace <ns> \
+         (repeatable)"
+    );
     eprintln!();
     eprintln!(
         "Supports 8-bit and 16-bit PNG input (gray/gray+alpha/RGB/RGBA) and float32 HDR \
@@ -116,6 +124,40 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "--no-palette" => {
                 try_palette = false;
                 i += 1;
+            }
+            "--exif" => {
+                let path = args.get(i + 1).ok_or("--exif requires a file path")?;
+                let bytes = std::fs::read(path)
+                    .map_err(|e| format!("failed to read --exif file {path:?}: {e}"))?;
+                options.exif = Some(bytes);
+                i += 2;
+            }
+            "--icc" => {
+                let path = args.get(i + 1).ok_or("--icc requires a file path")?;
+                let bytes = std::fs::read(path)
+                    .map_err(|e| format!("failed to read --icc file {path:?}: {e}"))?;
+                options.icc_profile = Some(bytes);
+                i += 2;
+            }
+            "--xmp" => {
+                let path = args.get(i + 1).ok_or("--xmp requires a file path")?;
+                let text = std::fs::read_to_string(path)
+                    .map_err(|e| format!("failed to read --xmp file {path:?}: {e}"))?;
+                options.xmp = Some(text);
+                i += 2;
+            }
+            "--json" => {
+                let value = args.get(i + 1).ok_or("--json requires <ns>:<file>")?;
+                let (namespace, path) = value
+                    .split_once(':')
+                    .ok_or_else(|| format!("--json expects <namespace>:<file>, got {value:?}"))?;
+                let payload = std::fs::read_to_string(path)
+                    .map_err(|e| format!("failed to read --json file {path:?}: {e}"))?;
+                let json_chunk = JsonChunk::new(namespace, &payload).map_err(|e| {
+                    format!("invalid --json content for namespace {namespace:?}: {e}")
+                })?;
+                options.json_chunks.push(json_chunk);
+                i += 2;
             }
             other => return Err(format!("unknown option: {other}")),
         }

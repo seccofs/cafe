@@ -52,6 +52,18 @@ pub enum CafeError {
     /// A chunk was expected to be a specific type (e.g. `IHDR` must be
     /// first) but a different type was found.
     UnexpectedChunkType { expected: String, found: String },
+    /// A `jSON` chunk's content violates spec section 4.6 — e.g. a
+    /// declared namespace length exceeding the remaining payload, a
+    /// non-ASCII namespace, a payload that isn't valid UTF-8, or a
+    /// payload that isn't syntactically valid JSON. Per spec section 8.4,
+    /// a decoder must discard only the offending `jSON` chunk, not the
+    /// whole file — callers that want that behavior should catch this
+    /// variant specifically rather than propagating it.
+    InvalidJsonChunk(String),
+    /// An `xMPd` chunk's payload is not valid UTF-8 (spec section 4.8
+    /// requires "Valid UTF-8 XML"). Same discard-only-this-chunk handling
+    /// as [`CafeError::InvalidJsonChunk`] applies (spec section 8.4).
+    InvalidXmpd(String),
 }
 
 impl fmt::Display for CafeError {
@@ -83,6 +95,8 @@ impl fmt::Display for CafeError {
                 f,
                 "Expected chunk type {expected:?}, found {found:?}"
             ),
+            Self::InvalidJsonChunk(msg) => write!(f, "Invalid jSON chunk: {msg}"),
+            Self::InvalidXmpd(msg) => write!(f, "Invalid xMPd chunk: {msg}"),
         }
     }
 }

@@ -14,16 +14,47 @@ use crate::zstd_codec::decompress_with_limit;
 use cafe_format::chunk::{is_critical, read_chunk};
 use cafe_format::ihdr::{read_ihdr, Ihdr};
 use cafe_format::validate_signature;
-use cafe_format::{Idim, Plte};
+use cafe_format::{Idim, JsonChunk, Plte, Xmpd};
 
 /// A fully decoded CAFE image: the validated header plus raw, unpredicted
 /// pixel bytes in row-major order (top-to-bottom), each sample stored per
 /// `Ihdr::bit_depth`'s endianness (spec section 4.1: big-endian for
 /// `bit_depth > 8`), channels interleaved per `Ihdr::color_type`'s order.
+///
+/// Also carries any of the four ancillary metadata chunks (spec sections
+/// 4.5-4.8) found before the first `IDAT`, if present. All four are
+/// `Option`/`Vec`-shaped so a file with none of them still decodes
+/// normally with everything empty/`None` — metadata is purely additive,
+/// never required (spec section 8.4: pixel decoding never depends on
+/// metadata content).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedImage {
     pub ihdr: Ihdr,
     pub pixels: Vec<u8>,
+    /// Raw EXIF TIFF blob (spec section 4.5), if an `eXIF` chunk was
+    /// present. Only the *first* instance is kept (spec section 4.5: "a
+    /// decoder finding more than one must consider only the first").
+    pub exif: Option<Vec<u8>>,
+    /// Every successfully parsed `jSON` chunk (spec section 4.6), in file
+    /// order. A chunk whose *content* is malformed (bad namespace length,
+    /// non-ASCII namespace, invalid JSON syntax) is silently skipped
+    /// here rather than surfaced as a decode error, per spec section
+    /// 8.4 — it never appears in this list, but does not abort decoding
+    /// either. Multiple entries may share the same namespace if the file
+    /// deliberately repeats one; this type does not deduplicate.
+    pub json_chunks: Vec<JsonChunk>,
+    /// Raw ICC profile bytes (spec section 4.7), if an `iCCP` chunk was
+    /// present. Only the first instance is kept (mirrors `eXIF`'s
+    /// single-instance handling, since spec section 4.7 doesn't specify
+    /// duplicate behavior explicitly). `None` means the default color
+    /// space applies: sRGB (IEC 61966-2-1).
+    pub icc_profile: Option<Vec<u8>>,
+    /// Parsed XMP metadata (spec section 4.8), if an `xMPd` chunk was
+    /// present and its payload was valid UTF-8. A non-UTF-8 `xMPd`
+    /// payload is silently discarded here (spec section 8.4), leaving
+    /// this `None`, rather than surfaced as a decode error. Only the
+    /// first instance is kept if more than one is present.
+    pub xmp: Option<Xmpd>,
 }
 
 /// Decodes a whole in-memory `.cafe` file into pixel bytes.
@@ -51,6 +82,19 @@ pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
     let mut pixels: Option<Vec<u8>> = None;
     let mut tiles_seen = 0usize;
     let mut saw_iend = false;
+
+    // Ancillary metadata (spec sections 4.5-4.8), collected as chunks are
+    // encountered. Per spec section 8.4, malformed *content* in any of
+    // these never aborts decoding — only a genuine framing error (caught
+    // by `read_chunk`/`decompress_with_limit` before we even get here)
+    // does. Single-instance types (eXIF/iCCP/xMPd) keep only the first
+    // occurrence (spec section 4.5's explicit rule, applied consistently
+    // to iCCP/xMPd too since the spec doesn't call out different
+    // behavior for them).
+    let mut exif: Option<Vec<u8>> = None;
+    let mut json_chunks: Vec<JsonChunk> = Vec::new();
+    let mut icc_profile: Option<Vec<u8>> = None;
+    let mut xmp: Option<Xmpd> = None;
 
     // `PLTE` (spec section 4.3) changes IDAT's effective bpp to 1 (one
     // palette index per pixel) — this must be resolved before any IDAT is
@@ -101,6 +145,46 @@ pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
                 let parsed = Plte::from_payload(&payload, ihdr.color_type)?;
                 parsed.validate(ihdr.color_type, ihdr.bit_depth)?;
                 plte = Some(parsed);
+            }
+            b"eXIF" => {
+                // Spec section 4.5: "a decoder finding more than one must
+                // consider only the first" — never an error, later
+                // instances are simply ignored, not rejected.
+                if exif.is_none() {
+                    let payload = crate::zstd_codec::decompress_chunk(chunk.flag, &chunk.data)?;
+                    exif = Some(payload);
+                }
+            }
+            b"jSON" => {
+                // Spec section 8.4: a malformed jSON chunk's *content*
+                // must not invalidate the file — decompression failures
+                // here are still framing-level (bounded by the chunk's
+                // own declared Length, same as every other chunk type),
+                // but JsonChunk::from_payload's InvalidJsonChunk errors
+                // are deliberately swallowed rather than propagated.
+                let payload = crate::zstd_codec::decompress_chunk(chunk.flag, &chunk.data)?;
+                if let Ok(parsed) = JsonChunk::from_payload(&payload) {
+                    json_chunks.push(parsed);
+                }
+            }
+            b"iCCP" => {
+                // Single instance (spec section 4.7); mirrors eXIF's
+                // first-instance-wins handling.
+                if icc_profile.is_none() {
+                    let payload = crate::zstd_codec::decompress_chunk(chunk.flag, &chunk.data)?;
+                    icc_profile = Some(payload);
+                }
+            }
+            b"xMPd" => {
+                // Single instance (spec section 4.8). A non-UTF-8 payload
+                // is a content-level problem (spec section 8.4), silently
+                // discarded rather than propagated as a decode error.
+                if xmp.is_none() {
+                    let payload = crate::zstd_codec::decompress_chunk(chunk.flag, &chunk.data)?;
+                    if let Ok(parsed) = Xmpd::from_payload(&payload) {
+                        xmp = Some(parsed);
+                    }
+                }
             }
             b"IDAT" => {
                 if layout.is_none() {
@@ -179,9 +263,10 @@ pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
                 ));
             }
             _ => {
-                // Ancillary chunk this decoder doesn't yet interpret
-                // (eXIF/jSON/iCCP/xMPd — deferred to a later phase, spec
-                // section 8.4: safe to skip).
+                // Unrecognized ancillary chunk (not one of eXIF/jSON/
+                // iCCP/xMPd/iDIM/PLTE, all handled above) — spec section
+                // 8.4/3.1: a decoder may always safely skip an ancillary
+                // chunk type it doesn't understand.
             }
         }
     }
@@ -221,7 +306,14 @@ pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
         pixels
     };
 
-    Ok(DecodedImage { ihdr, pixels })
+    Ok(DecodedImage {
+        ihdr,
+        pixels,
+        exif,
+        json_chunks,
+        icc_profile,
+        xmp,
+    })
 }
 
 #[cfg(test)]
@@ -291,6 +383,25 @@ mod tests {
             img.pixels,
             vec![0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0x00]
         );
+    }
+
+    #[test]
+    fn test_decode_golden_minimal_1x1_gray_with_metadata() {
+        let buf = read_golden("minimal_1x1_gray_with_metadata.cafe");
+        let img = decode_bytes(&buf).expect("golden file should decode");
+        assert_eq!(img.ihdr.width, 1);
+        assert_eq!(img.ihdr.height, 1);
+        assert_eq!(img.ihdr.color_type, COLOR_TYPE_GRAY);
+        assert_eq!(img.pixels, vec![0x7F]);
+        assert_eq!(img.exif.as_deref(), Some(b"fake exif bytes".as_slice()));
+        assert_eq!(img.json_chunks.len(), 1);
+        assert_eq!(img.json_chunks[0].namespace, "com.example");
+        assert_eq!(img.json_chunks[0].payload, "{\"a\":1}");
+        assert_eq!(
+            img.icc_profile.as_deref(),
+            Some(b"fake icc profile bytes".as_slice())
+        );
+        assert_eq!(img.xmp.as_ref().unwrap().xml, "<x:xmpmeta></x:xmpmeta>");
     }
 
     #[test]
@@ -910,5 +1021,122 @@ mod tests {
             decode_bytes(&buf),
             Err(CodecError::Format(cafe_format::CafeError::InvalidPlte(_)))
         ));
+    }
+
+    #[test]
+    fn test_decode_parses_exif_json_iccp_xmpd_chunks() {
+        let ihdr = gray_2x2_ihdr();
+        let json = JsonChunk::new("com.example", "{\"a\":1}").unwrap();
+        let xmpd = Xmpd::new("<x:xmpmeta></x:xmpmeta>");
+        let mut buf = SIGNATURE.to_vec();
+        buf.extend(ihdr.to_chunk_bytes());
+        buf.extend(write_chunk(b"eXIF", 0x00, b"fake exif bytes"));
+        buf.extend(json.to_chunk_bytes());
+        buf.extend(write_chunk(b"iCCP", 0x00, b"fake icc profile bytes"));
+        buf.extend(xmpd.to_chunk_bytes());
+        buf.extend(write_chunk(b"IDAT", 0x00, &[0u8, 10, 20, 0u8, 30, 40]));
+        buf.extend(write_chunk(b"IEND", 0x00, b""));
+
+        let img = decode_bytes(&buf).unwrap();
+        assert_eq!(img.pixels, vec![10, 20, 30, 40]);
+        assert_eq!(img.exif.as_deref(), Some(b"fake exif bytes".as_slice()));
+        assert_eq!(img.json_chunks, vec![json]);
+        assert_eq!(
+            img.icc_profile.as_deref(),
+            Some(b"fake icc profile bytes".as_slice())
+        );
+        assert_eq!(img.xmp, Some(xmpd));
+    }
+
+    #[test]
+    fn test_decode_keeps_only_first_instance_of_single_instance_metadata_chunks() {
+        // Spec section 4.5: "a decoder finding more than one must consider
+        // only the first" — applied consistently here to eXIF/iCCP/xMPd.
+        let ihdr = gray_2x2_ihdr();
+        let xmpd_first = Xmpd::new("first");
+        let xmpd_second = Xmpd::new("second");
+        let mut buf = SIGNATURE.to_vec();
+        buf.extend(ihdr.to_chunk_bytes());
+        buf.extend(write_chunk(b"eXIF", 0x00, b"first exif"));
+        buf.extend(write_chunk(b"eXIF", 0x00, b"second exif"));
+        buf.extend(write_chunk(b"iCCP", 0x00, b"first icc"));
+        buf.extend(write_chunk(b"iCCP", 0x00, b"second icc"));
+        buf.extend(xmpd_first.to_chunk_bytes());
+        buf.extend(xmpd_second.to_chunk_bytes());
+        buf.extend(write_chunk(b"IDAT", 0x00, &[0u8, 10, 20, 0u8, 30, 40]));
+        buf.extend(write_chunk(b"IEND", 0x00, b""));
+
+        let img = decode_bytes(&buf).unwrap();
+        assert_eq!(img.exif.as_deref(), Some(b"first exif".as_slice()));
+        assert_eq!(img.icc_profile.as_deref(), Some(b"first icc".as_slice()));
+        assert_eq!(img.xmp, Some(xmpd_first));
+    }
+
+    #[test]
+    fn test_decode_keeps_multiple_json_chunks_in_file_order() {
+        // Spec section 4.6: jSON is the only metadata chunk type allowed
+        // to repeat.
+        let ihdr = gray_2x2_ihdr();
+        let json_a = JsonChunk::new("a.namespace", "{\"n\":1}").unwrap();
+        let json_b = JsonChunk::new("b.namespace", "{\"n\":2}").unwrap();
+        let mut buf = SIGNATURE.to_vec();
+        buf.extend(ihdr.to_chunk_bytes());
+        buf.extend(json_a.to_chunk_bytes());
+        buf.extend(json_b.to_chunk_bytes());
+        buf.extend(write_chunk(b"IDAT", 0x00, &[0u8, 10, 20, 0u8, 30, 40]));
+        buf.extend(write_chunk(b"IEND", 0x00, b""));
+
+        let img = decode_bytes(&buf).unwrap();
+        assert_eq!(img.json_chunks, vec![json_a, json_b]);
+    }
+
+    #[test]
+    fn test_decode_silently_discards_malformed_json_content() {
+        // Spec section 8.4: malformed ancillary *content* must not
+        // invalidate the file — this jSON payload has invalid JSON
+        // syntax (unterminated object) but valid chunk framing, so
+        // decoding as a whole must still succeed with the chunk simply
+        // absent from json_chunks.
+        let ihdr = gray_2x2_ihdr();
+        let mut json_payload = vec![b"ns".len() as u8];
+        json_payload.extend_from_slice(b"ns");
+        json_payload.extend_from_slice(b"{not valid json");
+        let mut buf = SIGNATURE.to_vec();
+        buf.extend(ihdr.to_chunk_bytes());
+        buf.extend(write_chunk(b"jSON", 0x00, &json_payload));
+        buf.extend(write_chunk(b"IDAT", 0x00, &[0u8, 10, 20, 0u8, 30, 40]));
+        buf.extend(write_chunk(b"IEND", 0x00, b""));
+
+        let img = decode_bytes(&buf).unwrap();
+        assert_eq!(img.pixels, vec![10, 20, 30, 40]);
+        assert!(img.json_chunks.is_empty());
+    }
+
+    #[test]
+    fn test_decode_silently_discards_non_utf8_xmpd_content() {
+        // Spec section 8.4: a non-UTF-8 xMPd payload is a content-level
+        // problem, discarded, not a decode-aborting error.
+        let ihdr = gray_2x2_ihdr();
+        let invalid_utf8: &[u8] = &[0xFF, 0xFE, 0xFD];
+        let mut buf = SIGNATURE.to_vec();
+        buf.extend(ihdr.to_chunk_bytes());
+        buf.extend(write_chunk(b"xMPd", 0x00, invalid_utf8));
+        buf.extend(write_chunk(b"IDAT", 0x00, &[0u8, 10, 20, 0u8, 30, 40]));
+        buf.extend(write_chunk(b"IEND", 0x00, b""));
+
+        let img = decode_bytes(&buf).unwrap();
+        assert_eq!(img.pixels, vec![10, 20, 30, 40]);
+        assert_eq!(img.xmp, None);
+    }
+
+    #[test]
+    fn test_decode_with_no_metadata_chunks_leaves_metadata_fields_empty() {
+        let ihdr = gray_2x2_ihdr();
+        let buf = build_file(&ihdr, 0x00, &[0u8, 10, 20, 0u8, 30, 40], None, true);
+        let img = decode_bytes(&buf).unwrap();
+        assert_eq!(img.exif, None);
+        assert!(img.json_chunks.is_empty());
+        assert_eq!(img.icc_profile, None);
+        assert_eq!(img.xmp, None);
     }
 }

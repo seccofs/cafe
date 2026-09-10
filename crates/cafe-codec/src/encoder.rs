@@ -25,7 +25,7 @@ use crate::zstd_codec::{compress_with_fallback, FLAG_RAW};
 use cafe_format::chunk::write_chunk;
 use cafe_format::constants::{COMPRESSION_METHOD_ZSTD_BIT, SCAN_ORDER_ROW_MAJOR, SIGNATURE};
 use cafe_format::ihdr::Ihdr;
-use cafe_format::{Idim, Plte};
+use cafe_format::{Idim, JsonChunk, Plte, Xmpd};
 use std::io::Write;
 
 /// Encoder-side knobs (spec section 3.2's fallback rule, section 4.1's
@@ -72,6 +72,27 @@ pub struct EncoderOptions {
     /// `entries` and the index buffer to pass as `add_tile`/`encode_bytes`'
     /// pixel data from a real direct-color image).
     pub palette: Option<Vec<u8>>,
+    /// Raw EXIF TIFF blob to embed as an `eXIF` chunk (spec section 4.5).
+    /// `None` (default) omits the chunk entirely. This encoder never
+    /// inspects or validates EXIF content — it's an opaque blob as far as
+    /// `cafe-format`/`cafe-codec` are concerned.
+    pub exif: Option<Vec<u8>>,
+    /// `jSON` chunks to embed (spec section 4.6), in the order they should
+    /// appear in the file. Empty (default) omits the chunk type entirely.
+    /// Unlike every other metadata field here, more than one is allowed —
+    /// `jSON` is the only repeatable metadata chunk type. Each
+    /// [`JsonChunk`] is already validated (ASCII namespace, well-formed
+    /// JSON payload) by its own constructor before it ever reaches this
+    /// struct.
+    pub json_chunks: Vec<JsonChunk>,
+    /// Raw ICC color profile bytes to embed as an `iCCP` chunk (spec
+    /// section 4.7). `None` (default) omits the chunk, meaning the
+    /// default color space applies: sRGB (IEC 61966-2-1). This encoder
+    /// never inspects or validates ICC content.
+    pub icc_profile: Option<Vec<u8>>,
+    /// XMP metadata (raw XML text) to embed as an `xMPd` chunk (spec
+    /// section 4.8). `None` (default) omits the chunk.
+    pub xmp: Option<String>,
 }
 
 impl Default for EncoderOptions {
@@ -82,6 +103,10 @@ impl Default for EncoderOptions {
             tile_size: None,
             scan_order: SCAN_ORDER_ROW_MAJOR,
             palette: None,
+            exif: None,
+            json_chunks: Vec::new(),
+            icc_profile: None,
+            xmp: None,
         }
     }
 }
@@ -171,6 +196,41 @@ impl<W: Write> Encoder<W> {
         writer.write_all(&ihdr.to_chunk_bytes())?;
         if let Some(idim) = &idim {
             writer.write_all(&idim.to_chunk_bytes())?;
+        }
+        // Metadata chunks, in spec section 5's mandatory order: eXIF ->
+        // jSON -> iCCP -> xMPd, all before PLTE/IDAT. All four are fully
+        // determined by `options` alone (no pixel data needed), so — like
+        // IHDR/iDIM above — they're written eagerly here rather than
+        // deferred to `add_tile`/`finish`. Each payload races raw vs. ZSTD
+        // exactly like IDAT does (spec section 3.2: the raw-vs-compressed
+        // fallback applies to any compressible chunk, not just IDAT) —
+        // `JsonChunk`/`Xmpd::to_chunk_bytes()` always emit `Flag = 0x00`
+        // by design (`cafe-format` doesn't make compression decisions), so
+        // this encoder calls `to_payload()` and does the race itself,
+        // respecting `options.allow_zstd` the same way `add_tile` does
+        // (compression_method's bit0 must stay 0 if nothing ever sets
+        // `Flag = 0x01`, spec section 4.1).
+        let write_metadata_chunk =
+            |writer: &mut W, chunk_type: &[u8; 4], payload: &[u8]| -> Result<()> {
+                let (flag, data) = if options.allow_zstd {
+                    compress_with_fallback(payload, options.level)?
+                } else {
+                    (FLAG_RAW, payload.to_vec())
+                };
+                writer.write_all(&write_chunk(chunk_type, flag, &data))?;
+                Ok(())
+            };
+        if let Some(exif) = &options.exif {
+            write_metadata_chunk(&mut writer, b"eXIF", exif)?;
+        }
+        for json_chunk in &options.json_chunks {
+            write_metadata_chunk(&mut writer, b"jSON", &json_chunk.to_payload())?;
+        }
+        if let Some(icc_profile) = &options.icc_profile {
+            write_metadata_chunk(&mut writer, b"iCCP", icc_profile)?;
+        }
+        if let Some(xmp) = &options.xmp {
+            write_metadata_chunk(&mut writer, b"xMPd", &Xmpd::new(xmp).to_payload())?;
         }
         if let Some(plte) = &plte {
             writer.write_all(&plte.to_chunk_bytes())?;
@@ -1044,6 +1104,137 @@ mod tests {
 
         let img = decode_bytes(&buf).unwrap();
         assert_eq!(img.pixels, direct_pixels);
+    }
+
+    #[test]
+    fn test_encode_embeds_and_roundtrips_all_metadata_chunk_types() {
+        let raw = vec![0x7Fu8];
+        let json_chunk = JsonChunk::new("com.example", "{\"a\":1}").unwrap();
+        let buf = encode_bytes(
+            1,
+            1,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_GRAY,
+            &raw,
+            EncoderOptions {
+                exif: Some(b"fake exif bytes".to_vec()),
+                json_chunks: vec![json_chunk.clone()],
+                icc_profile: Some(b"fake icc profile bytes".to_vec()),
+                xmp: Some("<x:xmpmeta></x:xmpmeta>".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let img = decode_bytes(&buf).unwrap();
+        assert_eq!(img.pixels, raw);
+        assert_eq!(img.exif.as_deref(), Some(b"fake exif bytes".as_slice()));
+        assert_eq!(img.json_chunks, vec![json_chunk]);
+        assert_eq!(
+            img.icc_profile.as_deref(),
+            Some(b"fake icc profile bytes".as_slice())
+        );
+        assert_eq!(
+            img.xmp,
+            Some(cafe_format::Xmpd::new("<x:xmpmeta></x:xmpmeta>"))
+        );
+    }
+
+    #[test]
+    fn test_encode_without_metadata_options_omits_all_metadata_chunks() {
+        let raw = vec![0x7Fu8];
+        let buf = encode_bytes(
+            1,
+            1,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_GRAY,
+            &raw,
+            EncoderOptions::default(),
+        )
+        .unwrap();
+        // Signature(9) + IHDR chunk(25) puts the next chunk's Type field
+        // at offset 9+25+4 = 38; with no metadata/tiling/palette
+        // configured, that's IDAT directly.
+        assert_eq!(&buf[9 + 25 + 4..9 + 25 + 8], b"IDAT");
+    }
+
+    #[test]
+    fn test_encode_embeds_multiple_json_chunks_in_order() {
+        let raw = vec![0x7Fu8];
+        let json_a = JsonChunk::new("a.namespace", "{\"n\":1}").unwrap();
+        let json_b = JsonChunk::new("b.namespace", "{\"n\":2}").unwrap();
+        let buf = encode_bytes(
+            1,
+            1,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_GRAY,
+            &raw,
+            EncoderOptions {
+                json_chunks: vec![json_a.clone(), json_b.clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let img = decode_bytes(&buf).unwrap();
+        assert_eq!(img.json_chunks, vec![json_a, json_b]);
+    }
+
+    #[test]
+    fn test_encode_metadata_chunks_precede_plte_and_idat() {
+        use cafe_format::constants::COLOR_TYPE_RGB;
+
+        let indices = vec![0u8];
+        let entries = vec![255u8, 0, 0];
+        let buf = encode_bytes(
+            1,
+            1,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_RGB,
+            &indices,
+            EncoderOptions {
+                exif: Some(b"exif".to_vec()),
+                palette: Some(entries),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Signature(9) + IHDR chunk(25) = 34; the eXIF chunk's Type field
+        // is at offset 34+4 = 38, confirming eXIF precedes PLTE (spec
+        // section 5's mandatory order).
+        assert_eq!(&buf[38..42], b"eXIF");
+    }
+
+    #[test]
+    fn test_encode_forces_raw_flag_for_metadata_when_zstd_disallowed() {
+        // A large, highly compressible EXIF blob: if allow_zstd were
+        // honored, this would normally pick FLAG_ZSTD, so forcing raw
+        // here directly exercises the allow_zstd=false branch of
+        // write_metadata_chunk.
+        let raw = vec![0x7Fu8];
+        let exif_blob = vec![7u8; 4096];
+        let buf = encode_bytes(
+            1,
+            1,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_GRAY,
+            &raw,
+            EncoderOptions {
+                allow_zstd: false,
+                exif: Some(exif_blob.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Signature(9) + IHDR chunk(25) = 34; eXIF's Flag byte is at
+        // offset 34 + Length(4) + Type(4) = 42.
+        assert_eq!(buf[42], crate::zstd_codec::FLAG_RAW);
+        let img = decode_bytes(&buf).unwrap();
+        assert_eq!(img.exif.as_deref(), Some(exif_blob.as_slice()));
     }
 
     #[test]

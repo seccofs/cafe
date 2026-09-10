@@ -9,6 +9,10 @@ repository.workspace = true
 
 [dependencies]
 crc32fast.workspace = true
+# Used only to validate `jSON` chunk payload syntax (spec section 4.6) —
+# this crate never deserializes into an application type or interprets
+# the JSON's structure, only checks "is this syntactically valid JSON".
+serde_json.workspace = true
 
 [dev-dependencies]
 serde = { workspace = true }

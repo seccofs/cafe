@@ -73,6 +73,10 @@ pub fn is_valid_sample_format_bit_depth(sample_format: u8, bit_depth: u8) -> boo
     }
 }
 
+/// `jSON` chunk's namespace-length field size in bytes (spec section
+/// 4.6): a single byte preceding the namespace string itself.
+pub const JSON_NAMESPACE_LEN_FIELD_LEN: usize = 1;
+
 /// Returns the size in bytes of one `PLTE` entry for a given
 /// `color_type` (spec section 4.3): `3` (R,G,B) for `COLOR_TYPE_RGB`, `4`
 /// (R,G,B,A) for `COLOR_TYPE_RGBA`, or `None` for any other `color_type`
