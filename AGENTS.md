@@ -727,6 +727,75 @@ binaries.
       tests, `cargo fmt --all --check`, `cargo clippy --all-targets --
       -D warnings`, and `cargo +nightly check --manifest-path
       fuzz/Cargo.toml` pass cleanly.
+- [x] **HDR regression investigation (post-HDR-benchmark-wiring follow-up).**
+      The HDR benchmark wiring phase above reported `Cannon.exr` losing to
+      its own source file (131.9%) without explaining why, while
+      `Blobbies.exr` won (61.5%). This follow-up root-causes that gap
+      using a throwaway `crates/cafe-bench/examples/hdr_investigate.rs`
+      (since deleted, along with the `exr`/`half` dev-dependencies it
+      needed — pure research code, per `AGENTS.md`'s "every feature
+      proves itself with a benchmark first" principle, never intended to
+      become a permanent tool). Two independent, additive causes were
+      found, both stemming from the same root: `image::to_rgba32f()`
+      forces every `.exr` into a 4-channel float32 buffer regardless of
+      what the source file actually contains, which is not what either
+      fixture actually stores.
+
+      Inspecting both files' real channel layout directly via the `exr`
+      crate (`exr::meta::MetaData::read_from_file`) showed neither is
+      genuinely float32 RGBA data: `Blobbies.exr` stores HALF (16-bit
+      float) R/G/B/A channels (plus an unrelated F32 depth channel, `Z`,
+      which the RGBA-only decode path never touches) under `ZIP16`
+      (lossless) compression; `Cannon.exr` stores HALF R/G/B **with no
+      alpha channel at all** under `B44` compression. `to_rgba32f()`
+      quietly (a) widens every 16-bit sample to 32 bits — doubling
+      `raw_bytes` with zero-information padding the source file never
+      had — and (b) synthesizes a constant alpha=1.0 channel for Cannon
+      that doesn't exist in the source, inflating `raw_bytes` by another
+      25% on top of that. Re-encoding at the fixtures' native 16-bit
+      width (measuring the half-precision bit patterns as opaque uint16
+      samples — a research measurement only, since CAFE's v0.1 spec's
+      `is_valid_sample_format_bit_depth` only accepts
+      `SAMPLE_FORMAT_FLOAT` at `bit_depth == 32`, no float16 support
+      exists) improved both: `Blobbies.exr` 61.5% -> 55.3%,
+      `Cannon.exr` 131.9% -> 124.2%. Additionally dropping Cannon's
+      synthesized alpha channel (RGB-only, matching the source exactly)
+      improved it further to 113.4%.
+
+      Even after removing both artifacts, `Cannon.exr` still loses to
+      its `.exr` file. The reason is unrelated to CAFE's predictors at
+      all: `B44` is a **lossy**, fixed-ratio compression scheme — per
+      OpenEXR's own technical documentation, "the size of a B44-compressed
+      file depends on the number of pixels in the image, but not on the
+      data in the pixels", packing every 4x4 block of HALF samples into a
+      constant 14 bytes (~44% of uncompressed size) regardless of
+      content. Measuring `Cannon.exr`'s real RGB-HALF raw size
+      (780×566×3×2 = 2,648,880 bytes) against its on-disk size
+      (1,163,637 bytes) confirms this exactly: 43.9%, matching B44's
+      documented ratio to within rounding. `Blobbies.exr`'s `ZIP16` is
+      lossless, so it was never in this category — the phase above's
+      framing of "CAFE loses to `Cannon.exr`" was, in hindsight, an
+      apples-to-oranges comparison: a lossless CAFE encode being judged
+      against a lossy fixed-ratio baseline that discards image data CAFE
+      is not permitted to discard. **This does not change the
+      SIMD/palette/dictionary-style no-go verdict** from the HDR
+      benchmark wiring phase — it sharpens it: there is no evidence here
+      that CAFE's v0.1 predictor set underperforms on HDR content
+      generally, only that one specific fixture's baseline was never a
+      fair lossless-vs-lossless comparison to begin with, and that
+      `image::to_rgba32f()`'s channel-widening/alpha-synthesis behavior
+      (a decode-path detail, not a CAFE format limitation) was inflating
+      `raw_bytes` for both fixtures. No permanent code changed as a
+      result of this investigation — it is diagnostic, not corrective;
+      adding native float16 support to `cafe-format`/`cafe-codec` remains
+      unscheduled speculative work per this project's "benchmark before
+      feature" principle, and would need its own hypothesis/golden-vector
+      treatment against a larger HDR corpus than today's two fixtures,
+      not a reactive patch driven by a single lossy-vs-lossless
+      mismeasurement. All workspace tests (207, unchanged — no
+      test-relevant code changed), `cargo fmt --all --check`, and
+      `cargo clippy --all-targets -- -D warnings` continue to pass
+      cleanly.
 
 ## Commands
 
