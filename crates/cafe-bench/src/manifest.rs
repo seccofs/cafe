@@ -44,14 +44,25 @@ pub struct ImageEntry {
     pub height: u32,
     /// Always `"rgba"` for the current generator (see `corpus` module doc).
     pub color_type: String,
-    /// Bits per channel. Always 8 today; `cafe-format`/`cafe-codec` will
-    /// eventually support 16-bit and float32 too (see `AGENTS.md`), at
-    /// which point this field starts varying.
+    /// Bits per channel. 8 for every PNG entry; HDR entries (see
+    /// `crate::import::register_hdr_sources`) are `32` (float32).
     pub bit_depth: u8,
-    /// SHA-256 of the PNG file's bytes on disk, hex-encoded.
+    /// SHA-256 of the file's bytes on disk (PNG or, for HDR entries, the
+    /// original `.exr`), hex-encoded.
     pub sha256: String,
-    /// Size of the PNG file on disk, in bytes.
+    /// Size of the file on disk, in bytes (PNG or original `.exr`).
     pub file_size: u64,
+    /// Container format of the file at `path`: `"png"` for every entry
+    /// produced by [`generate_corpus`]/[`crate::import::import_sources`],
+    /// `"exr"` for HDR entries from
+    /// [`crate::import::register_hdr_sources`]. Defaults to `"png"` when
+    /// absent so manifests written before this field existed still parse.
+    #[serde(default = "default_format")]
+    pub format: String,
+}
+
+fn default_format() -> String {
+    "png".to_string()
 }
 
 /// Top-level `manifest.json` document.
@@ -138,6 +149,7 @@ pub fn generate_corpus(corpus_root: &Path) -> Result<Manifest, ManifestError> {
                 bit_depth: 8,
                 sha256,
                 file_size: png_bytes.len() as u64,
+                format: default_format(),
             });
         }
     }

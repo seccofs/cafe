@@ -11,6 +11,6 @@ pub mod manifest;
 pub mod measure;
 
 pub use corpus::{generate, Pattern};
-pub use import::{import_sources, merge_and_write, SourceImage};
+pub use import::{import_sources, merge_and_write, register_hdr_sources, HdrSource, SourceImage};
 pub use manifest::{generate_corpus, Manifest};
-pub use measure::{measure, Measurement};
+pub use measure::{measure, measure_hdr, HdrMeasurement, Measurement};

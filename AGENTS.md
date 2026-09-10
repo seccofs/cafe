@@ -629,6 +629,104 @@ binaries.
       206 total workspace tests (up from 199). All workspace tests,
       `cargo fmt --all --check`, and
       `cargo clippy --all-targets -- -D warnings` pass cleanly.
+- [x] **HDR benchmark wiring (post-corpus-population follow-up).** The
+      corpus-population follow-up above left "wiring HDR into the
+      benchmark path" as a distinct, unscheduled item, since `cafe-cli`'s
+      `png_io` bridge is 8-bit-PNG-only and PNG can't represent float32
+      HDR samples at all. This follow-up wires `corpus/hdr/`'s two `.exr`
+      fixtures into `cafe-bench`/`cafe benchmark` without touching
+      `png_io` or the CLI's encode/decode binaries — the `image` crate's
+      `to_rgba32f()` decodes `.exr` directly into `cafe_codec::
+      encode_bytes`'s expected float32 buffer shape, so no new PNG
+      bridge code was needed, only a new comparison path.
+      A throwaway `crates/cafe-bench/examples/hdr_poc.rs` (since deleted)
+      proved the hypothesis first, per `AGENTS.md`'s "every feature
+      proves itself with a benchmark first" principle, before any
+      permanent code was written — see "PoC result and comparison
+      baseline decision" below.
+
+      **PoC result and comparison baseline decision.** Unlike every prior
+      benchmark in this project, PNG isn't a meaningful baseline for HDR
+      at all (tonemapping float32 to 8-bit is lossy, so it isn't
+      comparing equivalent representations). The alternative considered
+      and chosen instead: compare against the original `.exr` file's size
+      on disk — a different container format, but the most meaningful
+      real-world number, since that's the file CAFE would actually be
+      replacing. The PoC's result was mixed, not a clean win: encoding
+      `Blobbies.exr`'s decoded float32 RGBA through
+      `cafe_codec::encode_bytes` (default `EncoderOptions`, no tiling)
+      produced a `.cafe` file at 61.5% of the original `.exr`'s size, but
+      `Cannon.exr` produced one at 131.9% — *larger* than the source
+      file. This is the first case in this project where CAFE's v0.1
+      predictor set does not consistently beat the comparison baseline,
+      and is reported here rather than hidden, per this project's
+      practice (e.g. the `texture`/`synthetic` categories' weaker ratios
+      in the "Benchmark vs PNG" phase above): OpenEXR's own compression
+      (wavelet+Huffman coding tuned for HDR float data) evidently
+      outperforms generic per-row-predictor-plus-ZSTD on at least one of
+      the two fixtures on hand — the six spec predictors were designed
+      around uint8/16 neighbor-delta locality, and nothing in `AGENTS.md`
+      ever claimed that transfers cleanly to float32 bit patterns.
+
+      Implemented as: a new `format` field on `cafe_bench::manifest::
+      ImageEntry` (`"png"`/`"exr"`, defaulting to `"png"` via
+      `#[serde(default)]` so every pre-existing manifest entry keeps
+      parsing without a migration) distinguishing HDR entries from every
+      other category; `cafe_bench::import::{HdrSource,
+      register_hdr_sources}` (new, alongside the pre-existing
+      `SourceImage`/`import_sources` pair), which records `.exr` files
+      already sitting under `corpus/hdr/` into the manifest by reference
+      (reading just their header for dimensions via `image::ImageReader::
+      into_dimensions`, no resize/re-encode step — deliberately not
+      reusing `import_sources`, since there's no PNG output to write for
+      this category at all, unlike photo/screenshot/illustration/
+      lineart); `cafe_bench::measure::{HdrMeasurement, measure_hdr}` (new,
+      alongside the pre-existing `Measurement`/`measure` pair, kept
+      separate rather than shoehorned into one struct since the two have
+      genuinely different baselines — `cafe_vs_png` doesn't apply to HDR,
+      `cafe_vs_exr` doesn't apply to the synthetic/real PNG corpus); and
+      `import-corpus`'s `EXPECTED_HDR_SOURCES` table plus a `-` sentinel
+      for its previously-mandatory `staging-dir` argument (HDR sources,
+      unlike every other category, are never staged anywhere — they're
+      registered directly from their final `corpus/hdr/` location, so
+      running `import-corpus -` re-registers HDR entries without
+      requiring an unrelated staging directory to exist). `cafe
+      benchmark` (`cmd_benchmark` in `cafe-cli`'s `cafe.rs`) now splits
+      manifest entries by `format`: PNG entries print in the pre-existing
+      table exactly as before (confirmed byte-identical `TOTAL` line to
+      the corpus-population phase above — `raw=3760128 png=1324113
+      (35.2%) cafe=795462 (21.2%)` — since no PNG-path code changed), and
+      HDR entries print afterward in a second table explicitly labeled
+      as comparing against the original `.exr`, not PNG:
+
+      ```
+      HDR (compared against the original .exr file, not PNG — see AGENTS.md):
+      image                                           raw        exr       cafe cafe vs exr %
+      hdr/Blobbies.exr                           16000000    6109568    3754970        61.5%
+      hdr/Cannon.exr                              7063680    1163637    1535160       131.9%
+      ```
+
+      `corpus/manifest.json` now has 24 entries (22 from the
+      corpus-population phase plus the 2 HDR entries) — every PNG entry's
+      bytes are unchanged, confirmed by re-running `import-corpus -`
+      being a pure addition (`merge_and_write`'s existing replace-by-path
+      behavior left all 22 prior entries untouched). This result is a
+      narrower, evidence-based version of a SIMD/palette/dictionary-style
+      no-go: it does **not** justify adding an HDR-specific predictor or
+      transform speculatively — a two-fixture sample is too small to
+      generalize from, and per `AGENTS.md`'s guiding principles, that
+      would need its own hypothesis/benchmark/golden-vector treatment,
+      not a reactive patch. The honest, current state is recorded as-is:
+      CAFE's existing v0.1 format handles HDR float32 correctly and
+      sometimes beats OpenEXR's own compression, but not reliably enough
+      yet to claim a general win for this content type. 1 new test
+      (`measure::tests::measure_hdr_produces_sane_sizes_for_corpus_files`,
+      skipping its real assertions gracefully if the corpus checkout
+      lacks the `.exr` fixtures rather than failing environments without
+      them), for 207 total workspace tests (up from 206). All workspace
+      tests, `cargo fmt --all --check`, `cargo clippy --all-targets --
+      -D warnings`, and `cargo +nightly check --manifest-path
+      fuzz/Cargo.toml` pass cleanly.
 
 ## Commands
 

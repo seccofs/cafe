@@ -356,7 +356,17 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
     let mut total_png = 0u64;
     let mut total_cafe = 0u64;
 
+    let mut hdr_entries: Vec<&cafe_bench::manifest::ImageEntry> = Vec::new();
+
     for entry in &manifest.images {
+        if entry.format == "exr" {
+            // HDR entries have no PNG baseline (see
+            // `cafe_bench::measure::HdrMeasurement`'s docs) and print in a
+            // separate table below, once every PNG entry has been listed.
+            hdr_entries.push(entry);
+            continue;
+        }
+
         let image_path = corpus_dir.join(&entry.path);
         let img = image::ImageReader::open(&image_path)
             .map_err(|e| format!("failed to open {image_path:?}: {e}"))?
@@ -387,6 +397,28 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
         100.0 * total_png as f64 / total_raw as f64,
         100.0 * total_cafe as f64 / total_raw as f64
     );
+
+    if !hdr_entries.is_empty() {
+        println!();
+        println!("HDR (compared against the original .exr file, not PNG — see AGENTS.md):");
+        println!(
+            "{:<40} {:>10} {:>10} {:>10} {:>12}",
+            "image", "raw", "exr", "cafe", "cafe vs exr %"
+        );
+        for entry in hdr_entries {
+            let image_path = corpus_dir.join(&entry.path);
+            let m =
+                cafe_bench::measure_hdr(&image_path).map_err(|e| format!("{}: {e}", entry.path))?;
+            println!(
+                "{:<40} {:>10} {:>10} {:>10} {:>11.1}%",
+                entry.path,
+                m.raw_bytes,
+                m.exr_bytes,
+                m.cafe_bytes,
+                m.cafe_vs_exr() * 100.0
+            );
+        }
+    }
 
     Ok(())
 }

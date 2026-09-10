@@ -9,10 +9,14 @@
 //! `screenshot`, `illustration`, and `lineart` as `.gitkeep`-only
 //! placeholders — procedurally generating believable photographic or UI
 //! content isn't practical, so those categories need real source images
-//! instead. `hdr` is out of scope here: `cafe-cli`/`cafe-bench` only
-//! support 8-bit PNG I/O today (see `cafe_cli::png_io`'s module docs), so
-//! HDR source files (`.exr`) are placed directly in `corpus/hdr/` without
-//! going through this module or `manifest.json`.
+//! instead.
+//!
+//! `hdr` is handled separately by [`register_hdr_sources`], not
+//! [`import_sources`]: `.exr` files are float32 and aren't representable as
+//! an 8-bit PNG at all (`cafe-cli`'s `png_io` bridge is 8-bit-only, see its
+//! module docs), so there's no resize-and-re-encode-as-PNG step for this
+//! category — the original `.exr` is the corpus asset, referenced by path
+//! rather than transcoded.
 //!
 //! Unlike [`crate::manifest::generate_corpus`], this module is not
 //! idempotent in the "byte-identical on every run" sense — it resizes
@@ -169,6 +173,68 @@ pub fn import_sources(
             bit_depth: 8,
             sha256,
             file_size: png_bytes.len() as u64,
+            format: "png".to_string(),
+        });
+    }
+
+    Ok(entries)
+}
+
+/// One `.exr` file already staged under `corpus/hdr/`, to be recorded in
+/// `manifest.json` without any resizing/re-encoding (see module docs for
+/// why this differs from [`import_sources`]).
+#[derive(Debug, Clone)]
+pub struct HdrSource {
+    /// Path to the `.exr` file, already in its final `corpus/hdr/`
+    /// location (unlike [`SourceImage::source_path`], nothing is copied or
+    /// transcoded — this *is* the corpus asset).
+    pub path: std::path::PathBuf,
+    /// Short filesystem-safe slug identifying this image, used as the
+    /// manifest's `pattern` field, e.g. `"blobbies"`.
+    pub slug: String,
+}
+
+/// Records HDR `.exr` files already present under `corpus_root/hdr/` as
+/// [`ImageEntry`] values, without resizing or transcoding them (see module
+/// docs). Dimensions come from decoding the file just far enough to read
+/// its header via `image::ImageReader`; `bit_depth` is always `32`
+/// (float32) and `format` is `"exr"`, distinguishing these entries from
+/// every PNG entry [`generate_corpus`]/[`import_sources`] produce.
+pub fn register_hdr_sources(
+    corpus_root: &Path,
+    sources: &[HdrSource],
+) -> Result<Vec<ImageEntry>, ImportError> {
+    let mut entries = Vec::with_capacity(sources.len());
+
+    for source in sources {
+        let bytes = fs::read(&source.path)?;
+        let (width, height) = image::ImageReader::open(&source.path)?
+            .with_guessed_format()?
+            .into_dimensions()
+            .map_err(|e| ImportError::Decode {
+                path: source.path.clone(),
+                source: e,
+            })?;
+
+        let sha256 = hex_sha256(&bytes);
+        let rel_path = source
+            .path
+            .strip_prefix(corpus_root)
+            .unwrap_or(&source.path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        entries.push(ImageEntry {
+            path: rel_path,
+            category: "hdr".to_string(),
+            pattern: source.slug.clone(),
+            width,
+            height,
+            color_type: "rgba".to_string(),
+            bit_depth: 32,
+            sha256,
+            file_size: bytes.len() as u64,
+            format: "exr".to_string(),
         });
     }
 
@@ -303,6 +369,7 @@ mod tests {
             bit_depth: 8,
             sha256: "deadbeef".to_string(),
             file_size: 123,
+            format: "png".to_string(),
         }];
 
         let manifest = merge_and_write(corpus_dir.path(), entries).expect("merge");
@@ -324,6 +391,7 @@ mod tests {
             bit_depth: 8,
             sha256: "aaaa".to_string(),
             file_size: 100,
+            format: "png".to_string(),
         }];
         merge_and_write(corpus_dir.path(), first).expect("first merge");
 
@@ -337,6 +405,7 @@ mod tests {
             bit_depth: 8,
             sha256: "bbbb".to_string(),
             file_size: 200,
+            format: "png".to_string(),
         }];
         let manifest = merge_and_write(corpus_dir.path(), second).expect("second merge");
 
@@ -359,6 +428,7 @@ mod tests {
             bit_depth: 8,
             sha256: "cccc".to_string(),
             file_size: 300,
+            format: "png".to_string(),
         }];
         merge_and_write(corpus_dir.path(), synthetic).expect("seed manifest");
 
@@ -372,6 +442,7 @@ mod tests {
             bit_depth: 8,
             sha256: "dddd".to_string(),
             file_size: 400,
+            format: "png".to_string(),
         }];
         let manifest = merge_and_write(corpus_dir.path(), real).expect("merge real");
 

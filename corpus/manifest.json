@@ -10,7 +10,8 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "706eeee9a011339df617b7908a10f72d1ec002706263bf76e07a3c91087185b5",
-      "file_size": 474
+      "file_size": 474,
+      "format": "png"
     },
     {
       "path": "gradient/gradient_256x256.png",
@@ -21,7 +22,8 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "0cd327a1968c4ecef5f04ec1738efba16ff979d47c35f341ea427f7fe72d3898",
-      "file_size": 2382
+      "file_size": 2382,
+      "format": "png"
     },
     {
       "path": "pixelart/checkerboard4_64x64.png",
@@ -32,7 +34,8 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "8e5ce3f9fa7383f6cfe7b22550f49acd1839d63b1be0f4fd0ec4d7502fb91c7e",
-      "file_size": 1021
+      "file_size": 1021,
+      "format": "png"
     },
     {
       "path": "pixelart/checkerboard4_256x256.png",
@@ -43,7 +46,8 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "1c6cb689d5c2e146013662742148a03679d4a1d83c95bcef566c0ac14d416e5d",
-      "file_size": 13285
+      "file_size": 13285,
+      "format": "png"
     },
     {
       "path": "texture/texture_64x64.png",
@@ -54,7 +58,8 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "9bc845e98558168a191542f2ebb2767a26443899016cd9c598e05c5da76a38f5",
-      "file_size": 9605
+      "file_size": 9605,
+      "format": "png"
     },
     {
       "path": "texture/texture_256x256.png",
@@ -65,7 +70,8 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "e42ce1595bc357b536d3014a2d75531d7b273f1db1acff60d8712d825f6e6c83",
-      "file_size": 126931
+      "file_size": 126931,
+      "format": "png"
     },
     {
       "path": "synthetic/noisec0ffee_64x64.png",
@@ -76,7 +82,8 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "b6452a61378f077b4c227122d0ba3ae05420fc6eb1aa0ec05dea27321ddefb95",
-      "file_size": 16516
+      "file_size": 16516,
+      "format": "png"
     },
     {
       "path": "synthetic/noisec0ffee_256x256.png",
@@ -87,7 +94,8 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "6ce1957ba1fb62b61d0dfbb62fd6ea40df6041d4d3519d726c071e54c06bc8b3",
-      "file_size": 212515
+      "file_size": 212515,
+      "format": "png"
     },
     {
       "path": "photo/kodim01.png",
@@ -98,7 +106,8 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "57c9dc2b2db9077fbbfc900ab72901bee012289908c29fc7c5c10347a3f2d9c3",
-      "file_size": 107739
+      "file_size": 107739,
+      "format": "png"
     },
     {
       "path": "photo/kodim05.png",
@@ -109,7 +118,8 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "48a7ae27d63cf9618149a0c7cc0d0dc093baf3b33615776aa71f31d68a029f7a",
-      "file_size": 128171
+      "file_size": 128171,
+      "format": "png"
     },
     {
       "path": "photo/kodim15.png",
@@ -120,7 +130,8 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "c58366551c9c4732ae21ec4078f22ac5d3646ef125587fc06004cb5d31ee2afb",
-      "file_size": 83552
+      "file_size": 83552,
+      "format": "png"
     },
     {
       "path": "photo/kodim23.png",
@@ -131,7 +142,8 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "bc3e05c31a2dd93764a6ea4f6687a8c3ea52474e9d77786d9fe8a724dc80f3fb",
-      "file_size": 83134
+      "file_size": 83134,
+      "format": "png"
     },
     {
       "path": "lineart/blip-psf.png",
@@ -142,7 +154,8 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "b7c449238aa47083e4df0cbef04f99bba789b461c84c6a2877e186e45617e03a",
-      "file_size": 52103
+      "file_size": 52103,
+      "format": "png"
     },
     {
       "path": "lineart/abacus-psf.png",
@@ -153,7 +166,8 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "95491b366ec623b4e18f344faa4075bef1c5a93be41649e1ee7e1c7ea8c65342",
-      "file_size": 86291
+      "file_size": 86291,
+      "format": "png"
     },
     {
       "path": "lineart/abdomen-psf.png",
@@ -164,7 +178,8 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "6bbdc68d5614aede8cc13c15b479fe6743c5f5ddab01b65f3a192bc69c9faf3c",
-      "file_size": 53080
+      "file_size": 53080,
+      "format": "png"
     },
     {
       "path": "lineart/aardvark2-psf-colourised.png",
@@ -175,7 +190,8 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "272b72fa27e9abc04051cd05993fd9454416f70d9526372d95a038ce84957295",
-      "file_size": 79346
+      "file_size": 79346,
+      "format": "png"
     },
     {
       "path": "illustration/abstract-art-psf.png",
@@ -186,7 +202,8 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "bf67ae718522951b5c400d8a420e20c75772d18d676c6f0ce40a87de62d3decc",
-      "file_size": 109522
+      "file_size": 109522,
+      "format": "png"
     },
     {
       "path": "illustration/hr-chart-psf.png",
@@ -197,7 +214,8 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "d9fa8a6104e37b4c413c670df8baf4604efd24b149a96a7d7f624c53f8613cde",
-      "file_size": 39407
+      "file_size": 39407,
+      "format": "png"
     },
     {
       "path": "screenshot/calculator.png",
@@ -208,7 +226,8 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "fefa6bd5c8ca9c0d4b43b7fd35264018441c173c0b8bd11448972456707889e5",
-      "file_size": 19188
+      "file_size": 19188,
+      "format": "png"
     },
     {
       "path": "screenshot/charmap.png",
@@ -219,7 +238,8 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "5320b8c76ed8995ea836e324cf414a01a111140b608dd0045d6557e550cb1420",
-      "file_size": 73843
+      "file_size": 73843,
+      "format": "png"
     },
     {
       "path": "screenshot/notepad.png",
@@ -230,7 +250,8 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "53e9452b6953ea645a0db3fba2e1f10ad6d131947eef0d6e9cb9187487209e31",
-      "file_size": 7375
+      "file_size": 7375,
+      "format": "png"
     },
     {
       "path": "screenshot/paint.png",
@@ -241,7 +262,32 @@
       "color_type": "rgba",
       "bit_depth": 8,
       "sha256": "9991cbeddbe83862c6ac83c3c76fec10d842b85cc706442c38c6903fd04a4bb3",
-      "file_size": 18633
+      "file_size": 18633,
+      "format": "png"
+    },
+    {
+      "path": "hdr/Blobbies.exr",
+      "category": "hdr",
+      "pattern": "blobbies",
+      "width": 1000,
+      "height": 1000,
+      "color_type": "rgba",
+      "bit_depth": 32,
+      "sha256": "c46dd0147e027ca2885fc75a7acb773759b900945ecafe998edb8319cdfb3278",
+      "file_size": 6109568,
+      "format": "exr"
+    },
+    {
+      "path": "hdr/Cannon.exr",
+      "category": "hdr",
+      "pattern": "cannon",
+      "width": 780,
+      "height": 566,
+      "color_type": "rgba",
+      "bit_depth": 32,
+      "sha256": "1ac7ae21c22fe1b006f18e3b6b53d52330fb7314ba4b1e0c68016967182d0fa9",
+      "file_size": 1163637,
+      "format": "exr"
     }
   ]
 }

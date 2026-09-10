@@ -12,9 +12,10 @@
 //! `cafe_codec::encoder::EncoderOptions::default().level`.
 
 use cafe_codec::{encode_bytes, EncoderOptions};
-use cafe_format::constants::{COLOR_TYPE_RGBA, SAMPLE_FORMAT_UINT};
+use cafe_format::constants::{COLOR_TYPE_RGBA, SAMPLE_FORMAT_FLOAT, SAMPLE_FORMAT_UINT};
 use image::RgbaImage;
 use std::io;
+use std::path::Path;
 
 /// ZSTD compression level used for the raw-buffer placeholder measurement,
 /// matching `cafe_codec::encoder::EncoderOptions::default().level` so
@@ -115,6 +116,87 @@ impl From<cafe_codec::CodecError> for MeasureError {
     }
 }
 
+/// Compressed-size measurement for a single HDR (`.exr`) source image.
+///
+/// Unlike [`Measurement`], there's no PNG baseline here — PNG can't
+/// represent float32 samples without lossy tonemapping, which would be
+/// comparing CAFE against a different (lossy) representation of the image
+/// rather than an equivalent one. Instead, the baseline is the original
+/// `.exr` file's size on disk: OpenEXR's own compression (PIZ/ZIP-style
+/// wavelet+Huffman coding, tuned for HDR float data) is a meaningful
+/// real-world comparison even though it's a different container format,
+/// per this project's decision to report that number rather than only a
+/// same-format one.
+#[derive(Debug, Clone, Copy)]
+pub struct HdrMeasurement {
+    pub width: u32,
+    pub height: u32,
+    /// Uncompressed float32 RGBA size in bytes (`width * height * 4 * 4`).
+    pub raw_bytes: usize,
+    /// Size of the original `.exr` file on disk.
+    pub exr_bytes: usize,
+    /// Size of a real `.cafe` file produced by `cafe_codec::encode_bytes`
+    /// over the decoded float32 RGBA samples.
+    pub cafe_bytes: usize,
+}
+
+impl HdrMeasurement {
+    /// CAFE size divided by raw size: smaller is better.
+    pub fn cafe_ratio(&self) -> f64 {
+        self.cafe_bytes as f64 / self.raw_bytes as f64
+    }
+
+    /// How CAFE compares to the original `.exr` file: `< 1.0` means CAFE
+    /// produces a smaller file than the source `.exr`; `> 1.0` means the
+    /// `.exr`'s own compression still wins. Unlike [`Measurement::
+    /// cafe_vs_png`], this is not expected to always favor CAFE — OpenEXR's
+    /// codecs are purpose-built for HDR float data, whereas CAFE's v0.1
+    /// predictors were designed against uint8/16 neighbor deltas; see
+    /// `AGENTS.md`'s HDR benchmark wiring note for measured results.
+    pub fn cafe_vs_exr(&self) -> f64 {
+        self.cafe_bytes as f64 / self.exr_bytes as f64
+    }
+}
+
+/// Decodes the `.exr` file at `path` to float32 RGBA, encodes it through
+/// `cafe_codec::encode_bytes`, and returns sizes for both against the
+/// original file on disk.
+pub fn measure_hdr(path: &Path) -> Result<HdrMeasurement, MeasureError> {
+    let exr_bytes = std::fs::read(path)?;
+
+    let img = image::ImageReader::open(path)?
+        .with_guessed_format()?
+        .decode()?;
+    let (width, height) = (img.width(), img.height());
+    let rgba32f = img.to_rgba32f();
+
+    // Big-endian bytes per spec section 4.1's endianness rule for
+    // bit_depth > 8 (mirrors what `cafe_codec::encoder` expects for any
+    // multi-byte sample, uint16 or float32 alike).
+    let mut raw_be = Vec::with_capacity(rgba32f.as_raw().len() * 4);
+    for &sample in rgba32f.as_raw() {
+        raw_be.extend_from_slice(&sample.to_be_bytes());
+    }
+
+    let cafe_bytes = encode_bytes(
+        width,
+        height,
+        32,
+        SAMPLE_FORMAT_FLOAT,
+        COLOR_TYPE_RGBA,
+        &raw_be,
+        EncoderOptions::default(),
+    )?;
+
+    Ok(HdrMeasurement {
+        width,
+        height,
+        raw_bytes: raw_be.len(),
+        exr_bytes: exr_bytes.len(),
+        cafe_bytes: cafe_bytes.len(),
+    })
+}
+
 /// Encodes `img` as PNG, as a real `.cafe` file, and as raw-ZSTD, returning
 /// all three sizes alongside the dimensions and uncompressed size.
 pub fn measure(img: &RgbaImage) -> Result<Measurement, MeasureError> {
@@ -186,5 +268,29 @@ mod tests {
         // treat this pattern's "noise" label as "LCG output", not "entropy
         // upper bound".
         assert!(m.cafe_ratio() < 0.5);
+    }
+
+    #[test]
+    fn measure_hdr_produces_sane_sizes_for_corpus_files() {
+        let hdr_dir = crate::manifest::default_corpus_dir().join("hdr");
+        for name in ["Blobbies.exr", "Cannon.exr"] {
+            let path = hdr_dir.join(name);
+            if !path.is_file() {
+                // Keep this test from failing in environments where the
+                // corpus checkout is incomplete (e.g. a shallow clone);
+                // the real assertions below only run against files that
+                // are actually present.
+                continue;
+            }
+            let m = measure_hdr(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(m.width > 0 && m.height > 0);
+            assert_eq!(m.raw_bytes, (m.width * m.height * 4 * 4) as usize);
+            assert!(m.exr_bytes > 0);
+            assert!(m.cafe_bytes > 0);
+            // Always smaller than the uncompressed float32 buffer, at
+            // least -- this is not always true vs the original .exr (see
+            // HdrMeasurement::cafe_vs_exr's docs).
+            assert!(m.cafe_ratio() < 1.0);
+        }
     }
 }
