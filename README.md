@@ -8,9 +8,10 @@ general-purpose compressor, CAFE adaptively transforms pixels (per-row
 predictors) so that Zstandard compresses them exceptionally well.
 
 **Format Version**: 0.1 — see [`spec/CAFE-spec.md`](spec/CAFE-spec.md)
-**Status**: ground-up reboot of an earlier, more feature-heavy implementation.
-See [Status](#status) and [`AGENTS.md`](AGENTS.md) for the full phased
-roadmap, design rationale, and per-phase implementation notes.
+**Status**: initial implementation, built decoder-first from a small,
+boringly-simple spec. See [Status](#status) and [`AGENTS.md`](AGENTS.md)
+for the full phased roadmap, design rationale, and per-phase implementation
+notes.
 **Compatibility**: Rust 2021+
 
 ---

@@ -1,22 +1,15 @@
-# CAFE Reboot — Developer Guide & Roadmap
+# CAFE — Developer Guide & Roadmap
 
-## Why a reboot
+## Design philosophy
 
-The original implementation (`cafe-rs` v1.12.0, preserved untouched in
-[`old/`](old/)) grew feature-by-feature over ~12 releases shipped within
-days of each other: 16 predictors, 5 filter heuristics, Adam7 + even/odd
-interlacing, indexed palette as a structural format mode, auto-trained
-ZSTD dictionaries, a monolithic 7.8k-line `src/cafe.rs`, and two parallel
-`EncodeOptions`/`EncoderOptions` structs. It works and is well-tested, but
-it grew via `problem -> feature -> another problem -> another feature`
-rather than `hypothesis -> benchmark -> minimal feature -> spec -> golden
-vectors -> implementation`.
-
-This reboot keeps the core insight — *don't invent another general
-compressor; adaptively transform pixels so Zstandard compresses them
-better* — and rebuilds around a much smaller, boringly-simple format with
-benchmarking and a golden corpus from commit zero, decoder-first, with a
-single streaming-first API.
+CAFE's core insight is simple: don't invent another general-purpose
+compressor — adaptively transform pixels so that Zstandard compresses them
+exceptionally well. Around that insight, this project is built as a small,
+boringly-simple format with benchmarking and a golden corpus from commit
+zero, decoder-first, with a single streaming-first API. The process is
+`hypothesis -> benchmark -> minimal feature -> spec -> golden vectors ->
+implementation` for every feature, not `problem -> feature -> another
+problem -> another feature`.
 
 ## Guiding principles
 
@@ -36,25 +29,25 @@ single streaming-first API.
    order) is optional and encoder-side. The decoder needs to know a small,
    fixed set of primitives.
 
-## What v0.1 keeps, defers, or removes
+## Core v0.1 design decisions
 
 | Area | v0.1 decision |
 |---|---|
-| Chunk container (Length/Type/Flag/Data/CRC32, critical/ancillary naming) | **Keep**, adapted from `old/src/chunk.rs` |
-| ZSTD with raw-vs-compressed fallback | **Keep**, adapted from `old/src/codec.rs` |
-| Security ceilings (decompression budget, tile count, palette count) | **Keep**, adapted from `old/src/constants.rs` |
-| Predictors | **Reduce** to 6: None, Sub, Up, Average, Paeth, Gradient — behind a new `trait Predictor` (didn't exist in v1) |
-| Per-row predictor selection | **Keep**, structural from day one (not bolted on later) |
-| Tiling | **Unify** into a single `iDIM`-based mechanism (32/64/128, default 64×64) — v1 had three parallel APIs (`add_tile`/`add_idim_tile`/`add_even_odd_rows`) |
-| Scan order | **Keep** row-major + Morton/Z-order only |
-| SIMD (AVX2/NEON) | **Defer to 0.2.** Scalar-is-reference/SIMD-is-optimization architecture planned from day one, but not implemented until the scalar format is validated |
-| Adam7 interlace | **Remove.** Not streamable, high complexity, low benefit vs. tiles |
-| Even/Odd interlace | **Remove** from core. Tiles already give progressive display |
-| Indexed/Palette (PLTE) | **Defer to 0.3**, as an *encoder-side transform* (`direct` vs `palette transform`), not a decoder structural mode |
-| K-means / MedianCut quantization | **Defer to 0.3**, encoder-only, decoder never needs to know how the encoder chose colors |
-| ZSTD dictionary (zDIC/auto_dictionary) | **Defer to 0.4** (external dictionary first, embedded/trained later) — conflicts with single-pass streaming |
-| HDR (FP16/PQ/HLG/tonemap) | **Defer.** Core v0.1 supports uint8/16 + float32 only. `old/src/tonemap.rs` kept as reference, not ported |
-| Metadata (EXIF/ICC/XMP/JSON) | **Keep**, ancillary, decoder must decode pixels without understanding metadata |
+| Chunk container (Length/Type/Flag/Data/CRC32, critical/ancillary naming) | PNG-style framing, kept intentionally simple |
+| ZSTD with raw-vs-compressed fallback | Per-chunk race between raw and ZSTD; whichever is smaller wins |
+| Security ceilings (decompression budget, tile count) | Hard ceilings checked before any proportional allocation (CWE-409, CWE-789) |
+| Predictors | 6 total: None, Sub, Up, Average, Paeth, Gradient — behind a `trait Predictor` |
+| Per-row predictor selection | Structural from day one, the only filtering granularity — no per-block mode |
+| Tiling | A single `iDIM`-based mechanism (32/64/128, default 64×64) — one unified API, not several parallel ones |
+| Scan order | Row-major + Morton/Z-order only |
+| SIMD (AVX2/NEON) | **Deferred to 0.2.** Scalar-is-reference/SIMD-is-optimization architecture planned from day one, but not implemented until the scalar format is validated |
+| Adam7 interlace | **Removed from scope.** Not streamable, high complexity, low benefit vs. tiles |
+| Even/Odd interlace | **Removed from scope.** Tiles already give progressive display |
+| Indexed/Palette (PLTE) | **Deferred to 0.3**, as an *encoder-side transform* (`direct` vs `palette transform`), not a decoder structural mode |
+| K-means / MedianCut quantization | **Deferred to 0.3**, encoder-only, decoder never needs to know how the encoder chose colors |
+| ZSTD dictionary (zDIC/auto_dictionary) | **Deferred to 0.4** (external dictionary first, embedded/trained later) — conflicts with single-pass streaming |
+| HDR (FP16/PQ/HLG/tonemap) | **Deferred.** Core v0.1 supports uint8/16 + float32 only |
+| Metadata (EXIF/ICC/XMP/JSON) | Ancillary; decoder must decode pixels without understanding metadata |
 | API | Single `EncoderOptions`/`DecoderOptions`-style struct with capability gating, not two divergent structs |
 
 ## Workspace layout
@@ -68,21 +61,20 @@ Cafe/
 │   │                    #  + legacy-named cafe-encode/cafe-decode binaries
 │   └── cafe-bench/      # harness comparing CAFE vs PNG (WebP/JPEG XL/AVIF later)
 ├── spec/
-│   ├── CAFE-spec.md          # normative, simplified vs old/docs/CAFE-spec.md
+│   ├── CAFE-spec.md          # normative format specification
 │   ├── invariants/           # spec rules expressed as data/tests
 │   └── test-vectors/         # golden test cases derived from invariants
 ├── corpus/                   # photo/screenshot/illustration/pixelart/lineart/
 │                              # gradient/texture/synthetic/hdr + manifest.json
 ├── golden/                    # golden .cafe files + golden/malformed/
-├── fuzz/fuzz_targets/         # decode_fuzz, chunk_roundtrip_fuzz (ported from old/)
+├── fuzz/fuzz_targets/         # decode_fuzz, chunk_roundtrip_fuzz
 ├── tests/                     # workspace-level integration tests
-├── .github/workflows/         # ci.yml, fuzz.yml (adapted from old/)
-├── old/                       # frozen v1.12.0 reference implementation — do not modify
+├── .github/workflows/         # ci.yml, fuzz.yml
 └── Cargo.toml                 # workspace root
 ```
 
 No umbrella `cafe` library crate — consumers depend on `cafe-format`
-and/or `cafe-codec` directly. The CLI binary is still named `cafe` (inside
+and/or `cafe-codec` directly. The CLI binary is named `cafe` (inside
 `cafe-cli`), plus the legacy-compatible `cafe-encode`/`cafe-decode`
 binaries.
 
@@ -93,8 +85,7 @@ binaries.
 - [x] **Phase 1 — `cafe-bench` minimal.** Harness comparing compressed size
       against PNG (via the `image` crate) on a tiny synthetic corpus.
       Implemented as `cafe_bench::corpus` (deterministic gradient/
-      checkerboard/noise generators, no `rand` dependency, formulas
-      cross-checked against `old/benches/benchmark_image.rs`) and
+      checkerboard/noise generators, no `rand` dependency) and
       `cafe_bench::measure` (PNG size vs a naive raw-ZSTD-level-19
       placeholder — `cafe-codec` doesn't exist yet, so this is the number
       it needs to beat). `cafe-bench` binary prints a comparison table;
@@ -105,17 +96,16 @@ binaries.
       lineart/hdr` start as placeholders for real content added later.
       Implemented as `cafe_bench::manifest` (`generate_corpus`, reusing
       `cafe_bench::corpus`'s generators plus a new `Pattern::Texture`
-      sinusoidal+hash-noise pattern ported from `old/tests/
-      dictionary_regression.rs`'s `"photo"` case) and the `gen-corpus`
-      binary (`cargo run -p cafe-bench --bin gen-corpus`), which writes PNGs
+      sinusoidal+hash-noise pattern) and the `gen-corpus` binary
+      (`cargo run -p cafe-bench --bin gen-corpus`), which writes PNGs
       under `corpus/{gradient,pixelart,texture,synthetic}/` and
       `corpus/manifest.json`. `photo/screenshot/illustration/lineart/hdr`
       remain `.gitkeep`-only and `.gitignore`d except for their `.gitkeep`,
       pending real content.
-- [x] **Phase 3 — `spec/`.** `CAFE-spec.md` simplified from `old/docs/
-      CAFE-spec.md`; invariants formalized in `spec/invariants/` and turned
-      into automatic tests. Implemented as `spec/CAFE-spec.md` (11
-      sections: overview, signature, chunk structure, defined chunks —
+- [x] **Phase 3 — `spec/`.** `CAFE-spec.md`, formalized normatively;
+      invariants formalized in `spec/invariants/` and turned into
+      automatic tests. Implemented as `spec/CAFE-spec.md` (11 sections:
+      overview, signature, chunk structure, defined chunks —
       `IHDR`/`iDIM`/`IDAT`/`eXIF`/`jSON`/`iCCP`/`xMPd`/`IEND` —, mandatory
       chunk order, streaming, design considerations, security, licensing,
       versioning, future extensions) plus six `spec/invariants/*.toml`
@@ -123,82 +113,73 @@ binaries.
       `security`) mirroring the normative text as machine-readable data,
       validated for internal/cross-file consistency by 9 tests in
       `crates/cafe-format/tests/spec_invariants.rs` (new `toml`
-      dev-dependency). Key simplifications vs. `old/docs/CAFE-spec.md`:
-      `IHDR` shrinks from 14 to 12 bytes (no `filter_method` byte — per-row
+      dev-dependency). Core simplicity choices baked into the spec from
+      the start: `IHDR` is 12 bytes (no `filter_method` byte — per-row
       predictor selection is the only, structural mode; no
-      `interlace_method` byte — interlacing removed entirely); predictors
-      reduced from 16 to 6 (None/Sub/Up/Average/Paeth/Gradient), always
-      chosen per-row (never per-block, unlike the v1 lineage's dual
-      per-block/per-row modes); a single `iDIM`-based tiling mechanism
-      (row-major or Z-order) replaces the v1 lineage's row-strip/2D-tile/
-      even-odd trichotomy; `PLTE` (indexed palette), `cHDR` (HDR metadata),
-      and `zDIC` (ZSTD dictionary) chunks are dropped from the chunk set
-      (deferred to 0.3/0.3/0.4 or unscheduled, per the "What v0.1 keeps,
-      defers, or removes" table above — none removed permanently except
-      Adam7/even-odd interlace and byte-shuffle, which this spec's section
-      11 marks as permanently gone, not deferred). Security ceilings
-      (`MAX_DECOMPRESSED_CHUNK_SIZE` = 1 GiB, `MAX_TILE_COUNT` = 1,048,576)
-      carried forward unchanged from `old/src/constants.rs`, since their
-      underlying DoS reasoning (CWE-409, CWE-789) is unaffected by the
-      simplification. All workspace tests (17 total across `cafe-bench` and
-      `cafe-format`), `cargo fmt --check`, and
+      `interlace_method` byte — interlacing is out of scope entirely);
+      6 predictors (None/Sub/Up/Average/Paeth/Gradient), always chosen
+      per-row (never per-block); a single `iDIM`-based tiling mechanism
+      (row-major or Z-order) instead of several parallel tiling
+      mechanisms; `PLTE` (indexed palette), `cHDR` (HDR metadata), and
+      `zDIC` (ZSTD dictionary) chunks are absent from the v0.1 chunk set
+      (deferred to 0.3/0.3/0.4 or unscheduled, per the "Core v0.1 design
+      decisions" table above — Adam7/even-odd interlace and byte-shuffle
+      are permanently out of scope, per the spec's section 11, not
+      deferred). Security ceilings (`MAX_DECOMPRESSED_CHUNK_SIZE` = 1 GiB,
+      `MAX_TILE_COUNT` = 1,048,576) are grounded in well-understood DoS
+      classes (CWE-409, CWE-789). All workspace tests (17 total across
+      `cafe-bench` and `cafe-format`), `cargo fmt --check`, and
       `cargo clippy --all-targets -- -D warnings` pass cleanly.
 - [x] **Phase 4 — `cafe-format`.** Chunk framing, `IHDR`, critical/
       ancillary validation, hand-written golden files for the minimal
       decoder to target. Implemented as five modules: `constants` (signature
       bytes, security ceilings, `IHDR`/`iDIM` enums — mirrors
       `spec/invariants/*.toml`), `chunk` (Length/Type/Flag/Data/CRC32
-      framing, adapted from `old/src/chunk.rs`'s slice-based `read_chunk`/
-      `write_chunk`; the `Read`-based streaming primitive
-      (`read_chunk_from`) is deferred to `cafe-codec`'s `Decoder<R>` in
-      Phase 5+, since Phase 4 only needs to parse a whole in-memory file for
-      golden-file tests), `signature` (9-byte magic validation), and `ihdr`
-      (`Ihdr` struct with `to_payload`/`from_payload`/`to_chunk_bytes`/
-      `validate`/`read_ihdr`, enforcing spec section 4.1's `width/height >
-      0`, valid `sample_format`×`bit_depth` combinations, known
-      `color_type`, and no reserved `compression_method` bits). Two new
-      `CafeError` variants added (`InvalidIhdr`, `UnexpectedChunkType`) not
-      present in the frozen v1 lineage's `old/src/error.rs`, since this
-      crate validates `IHDR` content itself rather than deferring to a
-      monolithic `cafe.rs`. `read_chunk` also gained an early
+      framing, slice-based `read_chunk`/`write_chunk`; the `Read`-based
+      streaming primitive (`read_chunk_from`) is deferred to
+      `cafe-codec`'s `Decoder<R>` in Phase 5+, since Phase 4 only needs to
+      parse a whole in-memory file for golden-file tests), `signature`
+      (9-byte magic validation), and `ihdr` (`Ihdr` struct with
+      `to_payload`/`from_payload`/`to_chunk_bytes`/`validate`/`read_ihdr`,
+      enforcing spec section 4.1's `width/height > 0`, valid
+      `sample_format`×`bit_depth` combinations, known `color_type`, and no
+      reserved `compression_method` bits). `CafeError` includes
+      `InvalidIhdr` and `UnexpectedChunkType` variants, since this crate
+      validates `IHDR` content itself rather than deferring that to a
+      larger, monolithic module. `read_chunk` also enforces an early
       `DecompressionLimitExceeded` check against a chunk's raw (still
-      compressed, if `Flag=0x01`) `Length` field — stricter than
-      `old/src/chunk.rs`'s slice-based path, which only bounded the
-      `Read`-based streaming variant this way, not the slice-based one (the
-      slice path's forged-`Length`-overruns-buffer check already prevented
-      OOM in the old lineage, but bounding `Length` itself earlier is
-      simpler to reason about and costs nothing). Golden fixtures
-      (`golden/minimal_1x1_gray.cafe`, `golden/minimal_2x2_rgba.cafe`,
-      `golden/malformed/{bad_signature,truncated_header,crc_mismatch,
-      invalid_ihdr_zero_width,forged_length,wrong_first_chunk}.cafe`) are
-      hand-built by an `#[ignore]`d fixture-generator test
-      (`crates/cafe-format/tests/golden_files.rs`) rather than a real
-      encoder (which doesn't exist until Phase 6) — 8 golden tests (2 valid
-      + 6 malformed) confirm this crate's parser accepts the valid fixtures
-      and rejects each malformed one with the correct `CafeError` variant.
-      37 new unit tests added across the four modules (9 chunk, 4 signature,
-      15 ihdr framing/validation, plus the golden-file tests), for 45 total
-      `cafe-format` tests (28 lib + 8 golden + 9 spec-invariants, the latter
-      unchanged from Phase 3) plus the pre-existing 8 `cafe-bench` tests —
-      53 across the workspace. This crate still has zero predictor/pixel
-      logic by design (per `AGENTS.md`'s "decoder before encoder" and
-      "boringly simple" principles) — `IDAT` payloads are opaque bytes from
-      its point of view; reversing predictors and reconstructing pixels is
+      compressed, if `Flag=0x01`) `Length` field, before any decompression
+      is attempted — bounding `Length` itself upfront is simpler to reason
+      about than checking only the decompressed output size, and costs
+      nothing. Golden fixtures (`golden/minimal_1x1_gray.cafe`,
+      `golden/minimal_2x2_rgba.cafe`, `golden/malformed/{bad_signature,
+      truncated_header,crc_mismatch,invalid_ihdr_zero_width,forged_length,
+      wrong_first_chunk}.cafe`) are hand-built by an `#[ignore]`d
+      fixture-generator test (`crates/cafe-format/tests/golden_files.rs`)
+      rather than a real encoder (which doesn't exist until Phase 6) — 8
+      golden tests (2 valid + 6 malformed) confirm this crate's parser
+      accepts the valid fixtures and rejects each malformed one with the
+      correct `CafeError` variant. 37 new unit tests added across the four
+      modules (9 chunk, 4 signature, 15 ihdr framing/validation, plus the
+      golden-file tests), for 45 total `cafe-format` tests (28 lib + 8
+      golden + 9 spec-invariants, the latter unchanged from Phase 3) plus
+      the pre-existing 8 `cafe-bench` tests — 53 across the workspace.
+      This crate still has zero predictor/pixel logic by design (per
+      `AGENTS.md`'s "decoder before encoder" and "boringly simple"
+      principles) — `IDAT` payloads are opaque bytes from its point of
+      view; reversing predictors and reconstructing pixels is
       `cafe-codec`'s job (Phase 5). All workspace tests, `cargo fmt --check`,
       and `cargo clippy --all-targets -- -D warnings` pass cleanly.
 - [x] **Phase 5 — `cafe-codec` decoder (scalar).** header -> chunks ->
       ZSTD decompress -> unpredict -> pixels. Validated against Phase 4's
-      golden files. Implemented as five modules: `error` (new
-      `CodecError` enum — `Format(cafe_format::CafeError)`,
-      `InvalidPredictorCode(u8)`, `UnsupportedTiling(String)` — with
-      `From<cafe_format::CafeError>`/`From<std::io::Error>`),
-      `predictor` (the 6 spec predictors behind `filter_row`/
-      `unfilter_row`; Paeth and Gradient formulas ported from
-      `old/src/filter.rs`, Sub/Up/Average/None are direct arithmetic;
-      absent neighbors at row/column 0 treated as zero per spec section
-      4.3), `zstd_codec` (`compress_with_fallback`/`decompress_with_limit`/
-      `decompress_chunk`, adapted from `old/src/codec.rs`'s
-      `read_to_end_limited`; decompression is bounded by the caller-given
+      golden files. Implemented as five modules: `error` (`CodecError`
+      enum — `Format(cafe_format::CafeError)`, `InvalidPredictorCode(u8)`,
+      `UnsupportedTiling(String)` — with `From<cafe_format::CafeError>`/
+      `From<std::io::Error>`), `predictor` (the 6 spec predictors behind
+      `filter_row`/`unfilter_row`; absent neighbors at row/column 0 are
+      treated as zero per spec section 4.3), `zstd_codec`
+      (`compress_with_fallback`/`decompress_with_limit`/
+      `decompress_chunk`; decompression is bounded by the caller-given
       limit capped at `MAX_DECOMPRESSED_CHUNK_SIZE`, never trusting a
       ZSTD frame header's declared size), `tile` (`encode_tile_rows`/
       `decode_tile_rows`, applying/reversing one predictor code across
@@ -231,8 +212,7 @@ binaries.
       `encode_bytes` sugar) closing the round-trip with Phase 5's decoder.
       Implemented as one new module, `encoder`, and two small additions to
       existing Phase 5 modules: `predictor::shannon_entropy` (private,
-      zero-order byte-histogram entropy, adapted from `old/src/
-      filter.rs::shannon_entropy`) plus public `predictor::
+      zero-order byte-histogram entropy) plus public `predictor::
       choose_best_row_predictor(row, prev_row, bpp) -> (u8, Vec<u8>)`
       (tries all `NUM_PREDICTORS` candidates via `filter_row`, keeps the
       lowest-entropy result, ties favor the smaller code — so `PREDICTOR_NONE`
@@ -241,60 +221,60 @@ binaries.
       counterpart that calls `choose_best_row_predictor` independently per
       row instead of applying one fixed code to the whole tile). Only
       `Entropy`-style scoring is implemented — real compression-test/MSAD
-      heuristics from `old/src/filter.rs` are deferred until `cafe-bench`
-      shows they justify the extra encode cost, per `AGENTS.md`'s "every
-      feature proves itself with a benchmark first". `encoder::Encoder<W>`
-      mirrors the decoder's scope exactly (single whole-image tile, no
-      `iDIM` emitted — multi-tile is Phase 7): `Encoder::new` validates
-      `IHDR` fields via `Ihdr::validate` and records them without writing
-      anything yet; `add_tile` accepts exactly one raw-pixel buffer of the
-      expected `height * bytes_per_row` size; `finish` runs
+      heuristics are deferred until `cafe-bench` shows they justify the
+      extra encode cost, per `AGENTS.md`'s "every feature proves itself
+      with a benchmark first". `encoder::Encoder<W>` mirrors the decoder's
+      scope exactly (single whole-image tile, no `iDIM` emitted —
+      multi-tile is Phase 7): `Encoder::new` validates `IHDR` fields via
+      `Ihdr::validate` and records them without writing anything yet;
+      `add_tile` accepts exactly one raw-pixel buffer of the expected
+      `height * bytes_per_row` size; `finish` runs
       `encode_tile_rows_auto`, then `zstd_codec::compress_with_fallback`
       (or forces `FLAG_RAW` if `EncoderOptions::allow_zstd` is `false`),
       then writes `IHDR`/`IDAT`/`IEND` via `cafe_format::chunk::write_chunk`
       in spec section 5's mandatory order, and returns the writer.
-      Deferring all writes to `finish` (rather than writing `IHDR` eagerly
-      in `new`, as the frozen `old/src/cafe.rs::Encoder` did) is a
-      deliberate Phase-6-only simplification: with only one tile ever
-      accepted, every chunk can be emitted exactly once without a
-      placeholder-then-patch step; true incremental writing (`IHDR` before
-      pixel data is fully known) becomes relevant once Phase 7 allows more
-      than one `IDAT`. A new `CodecError::EncoderMisuse(String)` variant
-      covers caller misuse specifically (`add_tile` called twice, wrong
-      buffer length, `finish` called before any `add_tile`) — unlike every
-      other `CodecError` variant, this always indicates a programming error
-      in the caller, never untrusted file input, so it's kept distinct from
-      `CodecError::Format`. Confirmed against the Phase 4 golden fixtures:
-      `encode_bytes` reproduces `golden/minimal_1x1_gray.cafe`
-      **byte-for-byte** (single sample, no left neighbor to predict from —
-      `choose_best_row_predictor` independently arrives at the same
-      `PREDICTOR_NONE` the golden was hand-built with); for
-      `golden/minimal_2x2_rgba.cafe`, the encoder's output differs at the
-      byte level — the per-row heuristic finds `Sub` beats that golden's
-      hand-picked `None` for its constant-step row 0 — so that case is
-      instead asserted on decoded-pixel equality, documented in the test
-      itself as a genuine improvement rather than a discrepancy to paper
-      over. 24 new tests across `predictor` (10: `shannon_entropy` on
-      empty/constant/uniform/varied input, `choose_best_row_predictor`
-      picking None/Sub/Up correctly depending on row shape, always
-      producing decoder-reversible output, and never scoring worse than
-      `PREDICTOR_NONE`), `tile` (3: `encode_tile_rows_auto` round-trip,
-      wrong-length rejection, and confirming per-row selection is
-      independent row-to-row), and `encoder` (19: encode-then-decode
-      round-trips across gray/RGBA, 8/16-bit, 1x1/2x2/16x16/64x64,
-      uniform/varied content; raw-vs-ZSTD `Flag` selection in both
-      directions including the `allow_zstd = false` override; the two
-      golden-file comparisons above; and `EncoderMisuse`/`InvalidIhdr`
-      rejection paths), for 77 total `cafe-codec` tests (up from 49) and
-      122 across the workspace's format/codec/bench crates combined.
-      `cafe-bench`'s `measure()` also stopped being a "PNG vs ZSTD-raw
-      placeholder" and now calls the real `cafe_codec::encode_bytes`
-      (new `Measurement::cafe_bytes`/`cafe_ratio`/`cafe_vs_png`, alongside
-      the pre-existing PNG and raw-ZSTD-floor numbers, which are kept as a
-      lower bound predictors+tiling must beat rather than removed) — this
-      surfaced that CAFE already beats PNG by a wide margin on every
-      synthetic pattern tried (e.g. ~0.6% of raw size vs PNG's ~2.9% on a
-      64x64 gradient; ~30% vs PNG's ~101% on the `Noise` pattern, whose
+      Deferring all writes to `finish` (rather than writing `IHDR`
+      eagerly in `new`) is a deliberate Phase-6-only simplification: with
+      only one tile ever accepted, every chunk can be emitted exactly once
+      without a placeholder-then-patch step; true incremental writing
+      (`IHDR` before pixel data is fully known) becomes relevant once
+      Phase 7 allows more than one `IDAT`. A new `CodecError::
+      EncoderMisuse(String)` variant covers caller misuse specifically
+      (`add_tile` called twice, wrong buffer length, `finish` called
+      before any `add_tile`) — unlike every other `CodecError` variant,
+      this always indicates a programming error in the caller, never
+      untrusted file input, so it's kept distinct from `CodecError::
+      Format`. Confirmed against the Phase 4 golden fixtures: `encode_bytes`
+      reproduces `golden/minimal_1x1_gray.cafe` **byte-for-byte** (single
+      sample, no left neighbor to predict from — `choose_best_row_predictor`
+      independently arrives at the same `PREDICTOR_NONE` the golden was
+      hand-built with); for `golden/minimal_2x2_rgba.cafe`, the encoder's
+      output differs at the byte level — the per-row heuristic finds `Sub`
+      beats that golden's hand-picked `None` for its constant-step row 0
+      — so that case is instead asserted on decoded-pixel equality,
+      documented in the test itself as a genuine improvement rather than
+      a discrepancy to paper over. 24 new tests across `predictor` (10:
+      `shannon_entropy` on empty/constant/uniform/varied input,
+      `choose_best_row_predictor` picking None/Sub/Up correctly depending
+      on row shape, always producing decoder-reversible output, and never
+      scoring worse than `PREDICTOR_NONE`), `tile` (3:
+      `encode_tile_rows_auto` round-trip, wrong-length rejection, and
+      confirming per-row selection is independent row-to-row), and
+      `encoder` (19: encode-then-decode round-trips across gray/RGBA,
+      8/16-bit, 1x1/2x2/16x16/64x64, uniform/varied content; raw-vs-ZSTD
+      `Flag` selection in both directions including the
+      `allow_zstd = false` override; the two golden-file comparisons
+      above; and `EncoderMisuse`/`InvalidIhdr` rejection paths), for 77
+      total `cafe-codec` tests (up from 49) and 122 across the workspace's
+      format/codec/bench crates combined. `cafe-bench`'s `measure()` also
+      stopped being a "PNG vs ZSTD-raw placeholder" and now calls the real
+      `cafe_codec::encode_bytes` (new `Measurement::cafe_bytes`/
+      `cafe_ratio`/`cafe_vs_png`, alongside the pre-existing PNG and
+      raw-ZSTD-floor numbers, which are kept as a lower bound
+      predictors+tiling must beat rather than removed) — this surfaced
+      that CAFE already beats PNG by a wide margin on every synthetic
+      pattern tried (e.g. ~0.6% of raw size vs PNG's ~2.9% on a 64x64
+      gradient; ~30% vs PNG's ~101% on the `Noise` pattern, whose
       LCG-based low-order bytes turn out to be far more predictor-exploitable
       than true entropy — the affected `cafe-bench` test and doc comments
       were updated to explain this rather than silently loosening an
@@ -305,15 +285,12 @@ binaries.
 - [x] **Phase 7 — Tiling + Morton.** `iDIM`, 64×64 default, row-major +
       Z-order. Implemented as three new/extended modules plus a
       generalization of the Phase 5/6 decoder and encoder: `cafe-codec::
-      morton` (new — `morton_code`/`morton_decode`, naive bit-interleaving
-      ported from `old/src/types.rs`, 4 tests including exhaustive 32x32
-      round-trip and a Z-order block-locality property);
-      `cafe_format::idim` (new — `Idim` struct, renamed from the old
-      lineage's `iDim` for standard casing, with `for_image`
-      (ceiling-division derivation), `validate` (nonzero fields, known
-      `scan_order`, `MAX_TILE_COUNT` ceiling checked *before* the
-      tiles_x/tiles_y-vs-IHDR consistency check — mirrors
-      `old/src/cafe.rs::handle_idim_chunk`'s check ordering, CWE-789/
+      morton` (new — `morton_code`/`morton_decode`, naive bit-interleaving,
+      4 tests including exhaustive 32x32 round-trip and a Z-order
+      block-locality property); `cafe_format::idim` (new — `Idim` struct
+      with `for_image` (ceiling-division derivation), `validate` (nonzero
+      fields, known `scan_order`, `MAX_TILE_COUNT` ceiling checked
+      *before* the tiles_x/tiles_y-vs-IHDR consistency check, CWE-789/
       CWE-409-class), `tile_dimensions` (saturating arithmetic for partial
       edge tiles), `to_payload`/`from_payload`/`to_chunk_bytes`; 16 tests
       including the `tiles_x=tiles_y=65535`-via-`tile_width=tile_height=1`
@@ -356,73 +333,68 @@ binaries.
       105 `cafe-codec` + 42 `cafe-format` lib + 8 golden + 9
       spec-invariants + 8 `cafe-bench`), `cargo fmt --all --check`, and
       `cargo clippy --all-targets -- -D warnings` pass cleanly.
-- [x] **Phase 8 — Fuzzing & robustness.** Port `decode_fuzz`/
-      `chunk_roundtrip_fuzz`, adversarial/truncated-input tests, nightly
-      fuzz CI. Implemented as a standalone `fuzz/` directory containing its
-      own Cargo workspace (`fuzz/Cargo.toml`, crate `cafe-fuzz`, deliberately
-      **not** a member of the root workspace — `cargo fuzz` requires
-      nightly + libFuzzer's `#[no_main]` entry point, which doesn't mix
-      with the root workspace's stable-toolchain `build`/`test`/`clippy`
-      commands; mirrors the implicit separation `old/fuzz/` had for a
-      different reason, since the old repo root wasn't a workspace at all)
-      with two bins ported from `old/fuzz/fuzz_targets/`: `decode_fuzz.rs`
+- [x] **Phase 8 — Fuzzing & robustness.** `decode_fuzz`/
+      `chunk_roundtrip_fuzz` harnesses, adversarial/truncated-input tests,
+      nightly fuzz CI. Implemented as a standalone `fuzz/` directory
+      containing its own Cargo workspace (`fuzz/Cargo.toml`, crate
+      `cafe-fuzz`, deliberately **not** a member of the root workspace —
+      `cargo fuzz` requires nightly + libFuzzer's `#[no_main]` entry
+      point, which doesn't mix with the root workspace's stable-toolchain
+      `build`/`test`/`clippy` commands) with two bins: `decode_fuzz.rs`
       (calls `cafe_codec::decode_bytes`, ignoring the result — the only
       forbidden outcome is a panic) and `chunk_roundtrip_fuzz.rs` (calls
-      `cafe_format::chunk::read_chunk` directly — an improvement over the
-      old lineage, where `read_chunk` was private and only reachable
-      indirectly via `decode_bytes` — plus `cafe_codec::decode_bytes` for
-      the same whole-file coverage `decode_fuzz` provides). Real libFuzzer
-      execution requires Linux/nightly (confirmed via `cargo +nightly fuzz
-      build --sanitizer none`, which compiles cleanly on Windows but fails
-      to *link* with `LNK2001: unresolved external symbol
-      __stop___sancov_cntrs`/`__start___sancov_pcs` — libFuzzer's coverage
-      instrumentation is a known Unix-only limitation on MSVC, not a bug in
-      this crate); local Windows development instead relies on two new
-      proptest-based integration-test files that exercise the same
-      "never panic on adversarial input" contract without needing
-      libFuzzer at all: `crates/cafe-codec/tests/decode_robustness.rs` (12
-      hand-written adversarial cases — empty buffer, truncated/invalid
-      signature, garbage after a valid signature, forged/huge chunk
-      lengths, zero-width `IHDR`, and two exhaustive sweeps against the
-      Phase 4 golden fixture `golden/minimal_2x2_rgba.cafe`: every
-      truncation length and every single-bit flip, confirming
-      `decode_bytes` never panics across either) and
-      `crates/cafe-codec/tests/roundtrip_proptest.rs` (3 proptest
-      properties, new `proptest` dev-dependency added to `cafe-format` in
-      addition to its pre-existing `cafe-codec` dev-dependency: arbitrary
-      byte sequences up to 4 KiB never panic `decode_bytes`, the same with
-      a genuine CAFE signature prefix, and a full
-      `encode_bytes`/`decode_bytes` round-trip across random small
-      width/height/color-type/seed/tiling combinations always reproduces
-      the exact input pixels). A third new file,
-      `crates/cafe-format/tests/chunk_proptest.rs` (3 properties), applies
-      the same treatment one layer down, directly at `read_chunk` rather
-      than the whole-file decoder: arbitrary bytes at arbitrary offsets,
-      single-bit-flipped well-formed chunks, and truncated well-formed
-      chunks at every length, all confirmed panic-free. CI gained two
-      pieces: a `fuzz` job in `.github/workflows/ci.yml` (adapted from
-      `old/.github/workflows/ci.yml`'s own `fuzz` job) running each of the
-      two harnesses for a 60-second smoke test on every push/PR, and a new
-      `.github/workflows/fuzz.yml` (adapted from
-      `old/.github/workflows/fuzz.yml`) running each harness for a full
-      hour nightly at 2 AM UTC (configurable via `workflow_dispatch`'s
-      `duration_seconds` input), both uploading crash artifacts (and, for
-      the nightly job, the accumulated corpus) on failure. Both workflow
-      files were validated for YAML/schema correctness with `js-yaml`
-      (Docker wasn't available to run `actionlint` directly in this
-      environment) confirming both jobs and their step lists parse as
-      intended. 18 new tests across the three new files (12
-      `decode_robustness` + 3 `roundtrip_proptest` in `cafe-codec`, 3
-      `chunk_proptest` in `cafe-format`), for 190 total workspace tests (up
-      from 172): 105 + 12 + 3 `cafe-codec` (lib + the two new integration
-      files) + 42 `cafe-format` lib + 3 `chunk_proptest` + 8 golden + 9
-      spec-invariants + 8 `cafe-bench`. All workspace tests, `cargo fmt
-      --all --check`, and `cargo clippy --all-targets -- -D warnings` pass
-      cleanly; the standalone `fuzz/` crate was confirmed to still compile
-      cleanly via `cargo +nightly check --manifest-path fuzz/Cargo.toml`
-      (its own workspace isn't covered by the root's `fmt`/`clippy`
-      commands, so this is checked separately, as documented in
-      `fuzz/Cargo.toml`'s own comments).
+      `cafe_format::chunk::read_chunk` directly, plus
+      `cafe_codec::decode_bytes` for the same whole-file coverage
+      `decode_fuzz` provides). Real libFuzzer execution requires
+      Linux/nightly (confirmed via `cargo +nightly fuzz build --sanitizer
+      none`, which compiles cleanly on Windows but fails to *link* with
+      `LNK2001: unresolved external symbol __stop___sancov_cntrs`/
+      `__start___sancov_pcs` — libFuzzer's coverage instrumentation is a
+      known Unix-only limitation on MSVC, not a bug in this crate); local
+      Windows development instead relies on two new proptest-based
+      integration-test files that exercise the same "never panic on
+      adversarial input" contract without needing libFuzzer at all:
+      `crates/cafe-codec/tests/decode_robustness.rs` (12 hand-written
+      adversarial cases — empty buffer, truncated/invalid signature,
+      garbage after a valid signature, forged/huge chunk lengths,
+      zero-width `IHDR`, and two exhaustive sweeps against the Phase 4
+      golden fixture `golden/minimal_2x2_rgba.cafe`: every truncation
+      length and every single-bit flip, confirming `decode_bytes` never
+      panics across either) and `crates/cafe-codec/tests/
+      roundtrip_proptest.rs` (3 proptest properties, new `proptest`
+      dev-dependency added to `cafe-format` in addition to its
+      pre-existing `cafe-codec` dev-dependency: arbitrary byte sequences
+      up to 4 KiB never panic `decode_bytes`, the same with a genuine
+      CAFE signature prefix, and a full `encode_bytes`/`decode_bytes`
+      round-trip across random small width/height/color-type/seed/tiling
+      combinations always reproduces the exact input pixels). A third new
+      file, `crates/cafe-format/tests/chunk_proptest.rs` (3 properties),
+      applies the same treatment one layer down, directly at `read_chunk`
+      rather than the whole-file decoder: arbitrary bytes at arbitrary
+      offsets, single-bit-flipped well-formed chunks, and truncated
+      well-formed chunks at every length, all confirmed panic-free. CI
+      gained two pieces: a `fuzz` job in `.github/workflows/ci.yml`
+      running each of the two harnesses for a 60-second smoke test on
+      every push/PR, and a new `.github/workflows/fuzz.yml` running each
+      harness for a full hour nightly at 2 AM UTC (configurable via
+      `workflow_dispatch`'s `duration_seconds` input), both uploading
+      crash artifacts (and, for the nightly job, the accumulated corpus)
+      on failure. Both workflow files were validated for YAML/schema
+      correctness with `js-yaml` (Docker wasn't available to run
+      `actionlint` directly in this environment) confirming both jobs and
+      their step lists parse as intended. 18 new tests across the three
+      new files (12 `decode_robustness` + 3 `roundtrip_proptest` in
+      `cafe-codec`, 3 `chunk_proptest` in `cafe-format`), for 190 total
+      workspace tests (up from 172): 105 + 12 + 3 `cafe-codec` (lib + the
+      two new integration files) + 42 `cafe-format` lib + 3
+      `chunk_proptest` + 8 golden + 9 spec-invariants + 8 `cafe-bench`.
+      All workspace tests, `cargo fmt --all --check`, and
+      `cargo clippy --all-targets -- -D warnings` pass cleanly; the
+      standalone `fuzz/` crate was confirmed to still compile cleanly via
+      `cargo +nightly check --manifest-path fuzz/Cargo.toml` (its own
+      workspace isn't covered by the root's `fmt`/`clippy` commands, so
+      this is checked separately, as documented in `fuzz/Cargo.toml`'s
+      own comments).
 - [x] **Phase 9 — `cafe-cli`.** `cafe inspect/verify/explain/benchmark` +
       `cafe-encode`/`cafe-decode`. Scope decided up front (v0.1): PNG-only,
       8-bit-only I/O (16-bit/float32 deferred to a later CLI pass even
@@ -658,23 +630,6 @@ binaries.
       `cargo fmt --all --check`, and
       `cargo clippy --all-targets -- -D warnings` pass cleanly.
 
-## Reuse map (what comes from `old/`)
-
-| New component | Source in `old/` | Treatment |
-|---|---|---|
-| `cafe-format::chunk` | `src/chunk.rs` | Copy framing + CRC32, adapt to the reduced chunk set |
-| `cafe-format` security constants | `src/constants.rs` | Copy `MAX_DECOMPRESSED_CHUNK_SIZE`, `MAX_TILE_COUNT`, decompression budget |
-| `cafe-codec::zstd` | `src/codec.rs` | Copy `compress_with_fallback`, drop the dictionary variant (returns in 0.4) |
-| `cafe-codec::predictor` | `src/filter.rs` (5-6 core formulas) | Copy formulas, wrap in a new `trait Predictor` |
-| Morton/scan order | `src/types.rs` (`morton_code`/`morton_decode`, `iDim::tile_order`) | Copy/adapt |
-| Fuzz targets | `fuzz/fuzz_targets/*.rs` | Port, adapt to new API |
-| CI workflows | `.github/workflows/{ci,fuzz}.yml` | Adapt to multi-crate workspace |
-| Spec | `docs/CAFE-spec.md` | Rewrite: drop Adam7/palette/dictionary/HDR from the core, move to "future extensions" |
-
-Everything else in `old/` (the monolithic `cafe.rs`, 16 predictors,
-tonemap, k-means/median-cut, dual options structs) is reference-only —
-read for context, not copied.
-
 ## Commands
 
 ```bash
@@ -683,8 +638,3 @@ cargo test                 # run all tests
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
-
-## Rule about `old/`
-
-`old/` is frozen. Do not edit files under it; it exists solely as a
-reference implementation for the reboot.
