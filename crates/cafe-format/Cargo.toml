@@ -1,0 +1,16 @@
+[package]
+name = "cafe-format"
+description = "CAFE image format: chunk container, IHDR, validation, and the normative spec-as-code invariants. No codec logic (predictors, ZSTD, tiling) lives here — see cafe-codec."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+crc32fast.workspace = true
+
+[dev-dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+proptest = { workspace = true }
