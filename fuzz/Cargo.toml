@@ -1,0 +1,35 @@
+[package]
+name = "cafe-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Deliberately its own workspace, not a member of the root workspace
+# (`cargo fuzz` requires nightly + libFuzzer's `#[no_main]` entry point,
+# which conflicts with the root workspace's regular build/test/clippy
+# targets running on stable). Mirrors the frozen `old/fuzz/` lineage,
+# which achieved the same isolation implicitly by the root crate not
+# being a workspace at all.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+cafe-codec = { path = "../crates/cafe-codec" }
+cafe-format = { path = "../crates/cafe-format" }
+
+[[bin]]
+name = "decode_fuzz"
+path = "fuzz_targets/decode_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunk_roundtrip_fuzz"
+path = "fuzz_targets/chunk_roundtrip_fuzz.rs"
+test = false
+doc = false
+bench = false
