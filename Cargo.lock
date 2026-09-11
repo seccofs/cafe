@@ -205,7 +205,7 @@ checksum = "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495"
 
 [[package]]
 name = "cafe-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cafe-codec",
  "cafe-format",
@@ -220,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "cafe-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cafe-bench",
  "cafe-codec",
@@ -231,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "cafe-codec"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cafe-format",
  "criterion",
@@ -241,7 +241,7 @@ dependencies = [
 
 [[package]]
 name = "cafe-format"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crc32fast",
  "proptest",

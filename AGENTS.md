@@ -40,11 +40,11 @@ problem -> another feature`.
 | Per-row predictor selection | Structural from day one, the only filtering granularity — no per-block mode |
 | Tiling | A single `iDIM`-based mechanism (32/64/128, default 64×64) — one unified API, not several parallel ones |
 | Scan order | Row-major + Morton/Z-order only |
-| SIMD (AVX2/NEON) | **Deferred to 0.2.** Scalar-is-reference/SIMD-is-optimization architecture planned from day one, but not implemented until the scalar format is validated |
+| SIMD (AVX2/NEON) | Deferred at v0.1 launch, **implemented since** (see the "SIMD (0.2) for predictors" phase below) — scalar-is-reference/SIMD-is-optimization architecture, AVX2/NEON fast paths for `filter_row` (all 6 predictors) and `unfilter_row` (None/Up), byte-identical output to the scalar reference |
 | Adam7 interlace | **Removed from scope.** Not streamable, high complexity, low benefit vs. tiles |
 | Even/Odd interlace | **Removed from scope.** Tiles already give progressive display |
-| Indexed/Palette (PLTE) | **Deferred to 0.3**, as an *encoder-side transform* (`direct` vs `palette transform`), not a decoder structural mode |
-| K-means / MedianCut quantization | **Deferred to 0.3**, encoder-only, decoder never needs to know how the encoder chose colors |
+| Indexed/Palette (PLTE) | Deferred at v0.1 launch, **implemented since** (see the "Palette (0.3) implementation" phase below) — an *encoder-side transform* (`direct` vs `palette transform`), not a decoder structural mode |
+| K-means / MedianCut quantization | **Still deferred.** Encoder-only; only needed for images with more distinct colors than `PLTE`'s 256-entry ceiling allows — decoder never needs to know how the encoder chose colors |
 | ZSTD dictionary (zDIC/auto_dictionary) | **Deferred to 0.4** (external dictionary first, embedded/trained later) — conflicts with single-pass streaming |
 | HDR (FP16/PQ/HLG/tonemap) | **Deferred.** Core v0.1 supports uint8/16 + float32 only |
 | Metadata (EXIF/ICC/XMP/JSON) | Ancillary; decoder must decode pixels without understanding metadata |

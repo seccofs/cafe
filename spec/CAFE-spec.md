@@ -539,12 +539,15 @@ evolution, as they do in PNG.
 These are documented here only as pointers — none are normative for
 Format 0.1, and none should be implemented until a benchmark on
 `cafe-bench` justifies them (per `AGENTS.md`'s guiding principles). See
-`AGENTS.md`'s "What v0.1 keeps, defers, or removes" table for the full
-rationale per item.
+`AGENTS.md`'s "Core v0.1 design decisions" table for the full rationale
+per item, including two implementation-only items (SIMD, and `PLTE`
+itself) that have since shipped and are therefore no longer listed below
+— neither changed the on-disk format shape: SIMD is byte-identical to the
+scalar reference, and `PLTE` was already normatively defined in this
+section's chunk set from Format 0.1's first draft.
 
 | Feature | Target version | Notes |
 |---|---|---|
-| SIMD (AVX2/NEON) | 0.2 | Scalar-is-reference/SIMD-is-optimization; zero on-disk effect when it lands |
 | Palette quantization algorithms | 0.3+ | Median-cut / k-means / redmean, encoder-only — `PLTE` itself (section 4.3) is implemented; only picking a palette for images with *more* than 256 distinct colors (quantization) remains deferred |
 | ZSTD dictionary (external, then embedded) | 0.4 | Conflicts with single-pass streaming until designed carefully |
 | HDR (fp16, PQ/HLG/tonemap) | Unscheduled | No design work started |
