@@ -519,9 +519,9 @@ handled at the chunk-parser level, not the content-parser level.
 
 Format version is tracked as `MAJOR.MINOR`, independent of any crate's own
 SemVer. During the `0.x` line, **breaking changes may occur between minor
-versions** — the format is not yet stabilized, and `spec/test-vectors/`/
-`golden/` exist precisely to catch unintentional breakage as the format
-solidifies. Once declared `1.0`, the discipline becomes: `MAJOR` bumps
+versions** — the format is not yet stabilized, and `golden/` (plus
+`spec/invariants/`) exist precisely to catch unintentional breakage as the
+format solidifies. Once declared `1.0`, the discipline becomes: `MAJOR` bumps
 only for breaking changes, `MINOR` bumps only for backward-compatible
 normative extensions.
 
@@ -558,4 +558,4 @@ tiling APIs.
 
 *This document is normative for CAFE Format 0.1. Machine-readable
 invariants derived from it live in `spec/invariants/`; golden test vectors
-live in `spec/test-vectors/` and `golden/`.*
+live in `golden/`.*

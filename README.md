@@ -111,8 +111,7 @@ Cafe/
 │   └── cafe-bench/            # Benchmark harness vs. PNG, corpus tooling
 ├── spec/
 │   ├── CAFE-spec.md           # Normative Format 0.1 specification
-│   ├── invariants/*.toml      # Spec rules as machine-readable data
-│   └── test-vectors/
+│   └── invariants/*.toml      # Spec rules as machine-readable data
 ├── corpus/                    # Synthetic + real benchmark images + manifest.json
 │   └── ATTRIBUTION.md         # Source/author/license for every real image
 ├── golden/                    # Hand-built valid + malformed .cafe fixtures

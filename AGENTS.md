@@ -62,16 +62,22 @@ Cafe/
 │   └── cafe-bench/      # harness comparing CAFE vs PNG (WebP/JPEG XL/AVIF later)
 ├── spec/
 │   ├── CAFE-spec.md          # normative format specification
-│   ├── invariants/           # spec rules expressed as data/tests
-│   └── test-vectors/         # golden test cases derived from invariants
+│   └── invariants/           # spec rules expressed as data/tests
 ├── corpus/                   # photo/screenshot/illustration/pixelart/lineart/
 │                              # gradient/texture/synthetic/hdr + manifest.json
 ├── golden/                    # golden .cafe files + golden/malformed/
+│                              # (these are the project's actual golden test
+│                              #  vectors, referenced from crate-local tests)
 ├── fuzz/fuzz_targets/         # decode_fuzz, chunk_roundtrip_fuzz
-├── tests/                     # workspace-level integration tests
 ├── .github/workflows/         # ci.yml, fuzz.yml
 └── Cargo.toml                 # workspace root
 ```
+
+Integration tests and benchmarks live inside each crate's own `tests/`/
+`benches/` directory (e.g. `crates/cafe-format/tests/`,
+`crates/cafe-codec/tests/`, `crates/cafe-codec/benches/`,
+`crates/cafe-bench/benches/`) rather than a root-level `tests/`/`benches/`
+— there is no workspace-level integration-test crate.
 
 No umbrella `cafe` library crate — consumers depend on `cafe-format`
 and/or `cafe-codec` directly. The CLI binary is named `cafe` (inside
