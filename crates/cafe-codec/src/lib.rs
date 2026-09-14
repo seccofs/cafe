@@ -17,12 +17,13 @@ pub mod encoder;
 pub mod error;
 pub mod morton;
 pub mod palette;
+mod parallel;
 pub mod predictor;
 mod simd;
 pub mod tile;
 pub mod tiling;
 pub mod zstd_codec;
 
-pub use decoder::{decode_bytes, DecodedImage};
-pub use encoder::{encode_bytes, Encoder, EncoderOptions};
+pub use decoder::{decode_bytes, decode_bytes_parallel, DecodedImage};
+pub use encoder::{encode_bytes, encode_bytes_parallel, Encoder, EncoderOptions};
 pub use error::{CodecError, Result};

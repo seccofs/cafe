@@ -285,13 +285,15 @@ impl<W: Write> Encoder<W> {
             )));
         }
 
-        let payload = encode_tile_rows_auto(raw, tile_h, tile_bytes_per_row, self.bpp)?;
-        let (flag, data) = if self.options.allow_zstd {
-            compress_with_fallback(&payload, self.options.level)?
-        } else {
-            (FLAG_RAW, payload)
-        };
-        self.writer.write_all(&write_chunk(b"IDAT", flag, &data))?;
+        let chunk_bytes = encode_tile_chunk(
+            raw,
+            tile_h,
+            tile_bytes_per_row,
+            self.bpp,
+            self.options.level,
+            self.options.allow_zstd,
+        )?;
+        self.writer.write_all(&chunk_bytes)?;
         self.next_tile_index += 1;
         Ok(())
     }
@@ -336,6 +338,29 @@ fn extract_tile_pixels(
         out.extend_from_slice(&full[src_start..src_start + row_bytes]);
     }
     out
+}
+
+/// Encodes one tile's raw pixel bytes into a complete, ready-to-write
+/// `IDAT` chunk (predictor selection + raw-vs-ZSTD fallback race + chunk
+/// framing) — the exact per-tile work [`Encoder::add_tile`] does, factored
+/// out so [`encode_bytes_parallel`] can run it concurrently across tiles
+/// without duplicating [`Encoder::add_tile`]'s logic (or the two drifting
+/// apart over time).
+fn encode_tile_chunk(
+    raw: &[u8],
+    tile_h: u32,
+    tile_bytes_per_row: u32,
+    bpp: u32,
+    level: i32,
+    allow_zstd: bool,
+) -> Result<Vec<u8>> {
+    let payload = encode_tile_rows_auto(raw, tile_h, tile_bytes_per_row, bpp)?;
+    let (flag, data) = if allow_zstd {
+        compress_with_fallback(&payload, level)?
+    } else {
+        (FLAG_RAW, payload)
+    };
+    Ok(write_chunk(b"IDAT", flag, &data))
 }
 
 /// Sugar over `Encoder::new(...).add_tile(...)*.finish()` for the common
@@ -400,6 +425,122 @@ pub fn encode_bytes(
         encoder.add_tile(&tile_raw)?;
     }
     encoder.finish()
+}
+
+/// Parallel counterpart to [`encode_bytes`]: identical header/`iDIM`/
+/// metadata/`PLTE` handling (via the same [`Encoder::new`], which still
+/// runs once, sequentially, up front — none of that depends on pixel
+/// data), but every tile's predictor selection + ZSTD fallback race +
+/// chunk framing (the work [`encode_tile_chunk`] does) runs concurrently
+/// across tiles instead of one at a time, via
+/// [`crate::parallel::map_parallel`]. The resulting `IDAT` chunks are
+/// then written to the output buffer sequentially, in scan order — spec
+/// section 4.2's "the N-th `IDAT` in the file corresponds to the N-th
+/// position in this enumeration order" is a file-structure requirement,
+/// not a scheduling one, so which thread computed a chunk's bytes never
+/// affects where they land in the output.
+///
+/// Produces byte-for-byte identical output to [`encode_bytes`] for the
+/// same input and options — confirmed by this module's
+/// `test_encode_bytes_parallel_matches_sequential_*` tests. Like
+/// [`crate::decoder::decode_bytes_parallel`], this transparently falls
+/// back to sequential execution for small tile counts or single-core
+/// hosts (see `crate::parallel::MIN_TILES_FOR_PARALLEL`), so there is no
+/// throughput reason to prefer [`encode_bytes`] on small images — only
+/// use it to force deterministic single-threaded scheduling explicitly.
+///
+/// Note: this is *not* built on the streaming [`Encoder<W>`] API at all
+/// (unlike [`encode_bytes`], which is sugar over
+/// `Encoder::new(...).add_tile(...)*.finish()`) — [`Encoder::add_tile`]'s
+/// contract writes its `IDAT` to the underlying writer immediately, which
+/// is fundamentally incompatible with computing tiles out of order across
+/// threads. This function instead calls [`Encoder::new`] only for its
+/// header/metadata-writing side effect, extracting the tile geometry it
+/// needs (`bpp`, `layout`) before computing every tile's chunk bytes via
+/// [`encode_tile_chunk`] directly.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_bytes_parallel(
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    sample_format: u8,
+    color_type: u8,
+    raw_pixels: &[u8],
+    options: EncoderOptions,
+) -> Result<Vec<u8>> {
+    let level = options.level;
+    let allow_zstd = options.allow_zstd;
+    let encoder = Encoder::new(
+        Vec::new(),
+        width,
+        height,
+        bit_depth,
+        sample_format,
+        color_type,
+        options,
+    )?;
+
+    let bpp = encoder.bpp;
+    let full_bytes_per_row = width.checked_mul(bpp).ok_or_else(|| {
+        CodecError::Format(cafe_format::CafeError::TruncatedFile(
+            "overflow computing bytes_per_row (width * bpp)".into(),
+        ))
+    })?;
+    let expected_total = (height as usize)
+        .checked_mul(full_bytes_per_row as usize)
+        .ok_or_else(|| {
+            CodecError::Format(cafe_format::CafeError::TruncatedFile(
+                "overflow computing expected total pixel buffer size".into(),
+            ))
+        })?;
+    if raw_pixels.len() != expected_total {
+        return Err(CodecError::EncoderMisuse(format!(
+            "encode_bytes_parallel: expected {expected_total} bytes (height={height} * \
+             bytes_per_row={full_bytes_per_row}), got {}",
+            raw_pixels.len()
+        )));
+    }
+
+    let tile_count = encoder.layout.tile_count();
+    let layout = &encoder.layout;
+    let idat_chunks = crate::parallel::map_parallel(tile_count, move |i| {
+        let (origin_x, origin_y, tile_w, tile_h) = layout.tile_rect(i);
+        let tile_raw = extract_tile_pixels(
+            raw_pixels,
+            origin_x,
+            origin_y,
+            tile_w,
+            tile_h,
+            full_bytes_per_row,
+            bpp,
+        );
+        let tile_bytes_per_row = tile_w.checked_mul(bpp).ok_or_else(|| {
+            CodecError::Format(cafe_format::CafeError::TruncatedFile(
+                "overflow computing tile bytes_per_row (tile_width * bpp)".into(),
+            ))
+        })?;
+        encode_tile_chunk(
+            &tile_raw,
+            tile_h,
+            tile_bytes_per_row,
+            bpp,
+            level,
+            allow_zstd,
+        )
+    })?;
+
+    // `encoder.writer` already holds every byte up through
+    // signature/IHDR/iDIM/metadata/PLTE (all written eagerly by
+    // `Encoder::new`, none of which depends on pixel data) — append every
+    // tile's precomputed `IDAT` bytes in scan order, then `IEND`,
+    // completing the file exactly as `Encoder::finish` would after a
+    // sequential `add_tile` loop.
+    let mut writer = encoder.writer;
+    for chunk_bytes in idat_chunks {
+        writer.write_all(&chunk_bytes)?;
+    }
+    writer.write_all(&write_chunk(b"IEND", 0x00, b""))?;
+    Ok(writer)
 }
 
 #[cfg(test)]
@@ -1235,6 +1376,193 @@ mod tests {
         assert_eq!(buf[42], crate::zstd_codec::FLAG_RAW);
         let img = decode_bytes(&buf).unwrap();
         assert_eq!(img.exif.as_deref(), Some(exif_blob.as_slice()));
+    }
+
+    // --- encode_bytes_parallel parity tests -------------------------------
+    //
+    // `encode_bytes_parallel` shares `Encoder::new`/`encode_tile_chunk`
+    // with `encode_bytes`, so these tests focus on confirming the two
+    // produce byte-for-byte identical output across a range of tile
+    // counts, not on re-testing header/tiling validation already covered
+    // above.
+
+    #[test]
+    fn test_encode_bytes_parallel_matches_sequential_single_tile() {
+        let width = 4u32;
+        let height = 4u32;
+        let raw: Vec<u8> = (0..(width * height))
+            .map(|i| ((i * 37 + 11) % 251) as u8)
+            .collect();
+        let seq = encode_bytes(
+            width,
+            height,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_GRAY,
+            &raw,
+            EncoderOptions::default(),
+        )
+        .unwrap();
+        let par = encode_bytes_parallel(
+            width,
+            height,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_GRAY,
+            &raw,
+            EncoderOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(seq, par);
+    }
+
+    #[test]
+    fn test_encode_bytes_parallel_matches_sequential_below_threshold_tile_count() {
+        let width = 6u32;
+        let height = 4u32;
+        let raw: Vec<u8> = (0..(width * height)).map(|i| (i % 251) as u8).collect();
+        let options = EncoderOptions {
+            tile_size: Some((3, 2)),
+            ..Default::default()
+        };
+        let seq = encode_bytes(
+            width,
+            height,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_GRAY,
+            &raw,
+            options.clone(),
+        )
+        .unwrap();
+        let par = encode_bytes_parallel(
+            width,
+            height,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_GRAY,
+            &raw,
+            options,
+        )
+        .unwrap();
+        assert_eq!(seq, par);
+    }
+
+    #[test]
+    fn test_encode_bytes_parallel_matches_sequential_many_tiles() {
+        let width = 32u32;
+        let height = 32u32;
+        let raw: Vec<u8> = (0..(width * height * 4))
+            .map(|i| ((i * 17 + 5) % 251) as u8)
+            .collect();
+        let options = EncoderOptions {
+            tile_size: Some((4, 4)),
+            ..Default::default()
+        };
+        let seq = encode_bytes(
+            width,
+            height,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_RGBA,
+            &raw,
+            options.clone(),
+        )
+        .unwrap();
+        let par = encode_bytes_parallel(
+            width,
+            height,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_RGBA,
+            &raw,
+            options,
+        )
+        .unwrap();
+        assert_eq!(seq, par);
+        let img = decode_bytes(&par).unwrap();
+        assert_eq!(img.pixels, raw);
+    }
+
+    #[test]
+    fn test_encode_bytes_parallel_matches_sequential_with_partial_edge_tiles() {
+        let width = 5u32;
+        let height = 5u32;
+        let raw: Vec<u8> = (0..(width * height)).map(|i| i as u8).collect();
+        let options = EncoderOptions {
+            tile_size: Some((2, 2)),
+            ..Default::default()
+        };
+        let seq = encode_bytes(
+            width,
+            height,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_GRAY,
+            &raw,
+            options.clone(),
+        )
+        .unwrap();
+        let par = encode_bytes_parallel(
+            width,
+            height,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_GRAY,
+            &raw,
+            options,
+        )
+        .unwrap();
+        assert_eq!(seq, par);
+    }
+
+    #[test]
+    fn test_encode_bytes_parallel_matches_sequential_z_order() {
+        let width = 8u32;
+        let height = 8u32;
+        let raw: Vec<u8> = (0..(width * height))
+            .map(|i| ((i * 7 + 3) % 251) as u8)
+            .collect();
+        let options = EncoderOptions {
+            tile_size: Some((4, 4)),
+            scan_order: cafe_format::constants::SCAN_ORDER_Z_ORDER,
+            ..Default::default()
+        };
+        let seq = encode_bytes(
+            width,
+            height,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_GRAY,
+            &raw,
+            options.clone(),
+        )
+        .unwrap();
+        let par = encode_bytes_parallel(
+            width,
+            height,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_GRAY,
+            &raw,
+            options,
+        )
+        .unwrap();
+        assert_eq!(seq, par);
+    }
+
+    #[test]
+    fn test_encode_bytes_parallel_rejects_wrong_buffer_length() {
+        let result = encode_bytes_parallel(
+            2,
+            2,
+            8,
+            SAMPLE_FORMAT_UINT,
+            COLOR_TYPE_GRAY,
+            &[1, 2, 3], // needs 4 bytes
+            EncoderOptions::default(),
+        );
+        assert!(matches!(result, Err(CodecError::EncoderMisuse(_))));
     }
 
     #[test]

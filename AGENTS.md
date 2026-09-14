@@ -1487,6 +1487,140 @@ binaries.
       (up from 13) + 17 `cafe-bench` (unchanged). All workspace tests,
       `cargo fmt --all --check`, and `cargo clippy --all-targets --
       -D warnings` pass cleanly.
+- [x] **Parallel tile encode/decode (post-metadata-chunks follow-up).**
+      Spec section 4.4's independence rule ("Each `IDAT` is independent
+      ... decoded as soon as it arrives") was already exploited for
+      streaming (Phase 6-7) and per-row predictor selection, but never for
+      actual multi-core execution — every tile was still encoded/decoded
+      strictly one at a time, on one thread, regardless of tile count.
+      This phase closes that gap, per `AGENTS.md`'s "every feature proves
+      itself with a benchmark first" principle: a throwaway PoC (three
+      successive throwaway files under `crates/cafe-bench/examples/`,
+      all deleted after use) using only `std::thread::scope` (no new
+      dependency) measured, on a synthetic 4096x4096 RGBA image tiled
+      64x64 (4096 tiles) on this development machine's 24 logical cores:
+      encode at ZSTD level 1 sped up 11.9x (2.42s -> 203ms), level 3 7.8x
+      (5.66s -> 727ms), level 19 (the encoder's own default) 3.4x
+      (89.4s -> 26.3s — still a real win, just smaller since ZSTD itself
+      dominates at that level); decode sped up ~2.3x consistently across
+      levels (93-193ms -> 40-84ms sequential vs. parallel, decode being
+      ZSTD-decompression-bound rather than ZSTD-compression-bound, so
+      level doesn't change its shape). Confirmed worthwhile at every
+      level tried, so implementation proceeded — the same
+      decoder-before-encoder order this project always follows.
+
+      **Scope decision:** tile *framing* (chunk offsets/CRC/ordering)
+      stays strictly sequential — each chunk's byte offset depends on
+      every prior chunk having been fully parsed, so this part is not a
+      candidate for parallelism at all. Only the genuinely independent
+      work *inside* that sequential skeleton — per-tile ZSTD
+      compress/decompress, predictor selection/reversal, and pixel-buffer
+      copy — runs across threads. `std::thread::scope` (stable since Rust
+      1.63, no new workspace dependency) was used throughout rather than
+      pulling in `rayon`, since the PoC's fan-out/join pattern is simple
+      enough not to need a work-stealing scheduler.
+
+      Implemented as: a new private module, `cafe-codec::parallel` (`mod
+      parallel`, not `pub mod` — no public API surface of its own, purely
+      an internal primitive for `decoder`/`encoder`), with `worker_count`
+      (wraps `std::thread::available_parallelism`, falling back to `1`),
+      `MIN_TILES_FOR_PARALLEL = 4` (below this many tiles, thread
+      spawn/join overhead isn't worth it — chosen conservatively per the
+      PoC's own observation that a handful of tiles finishes before
+      threads would even be done spawning; not independently tuned
+      further, an acknowledged limitation of this phase), `RawSliceMut`
+      (an unsafe `Send + Sync` pointer+length wrapper letting multiple
+      scoped threads write into disjoint byte ranges of one shared `&mut
+      [u8]` without a lock — the same "known-disjoint-writes" pattern
+      `[T]::chunks_mut`/rayon use internally; its `as_mut_slice` method
+      documents the safety contract explicitly: callers must guarantee
+      non-overlapping ranges, which `TileLayout::tile_rect`'s
+      grid-partitioning geometry always provides by construction),
+      `split_ranges` (divides `0..item_count` into `n_workers`
+      contiguous ranges), `for_each_parallel` (fan-out via
+      `std::thread::scope`, sequential fallback below
+      `MIN_TILES_FOR_PARALLEL` or on a single-core host, deterministic
+      lowest-index-wins error selection regardless of which thread
+      finishes first), and `map_parallel` (the value-returning
+      counterpart, collecting one output per tile in index order rather
+      than just success/failure — needed by the encoder, whose per-tile
+      work produces variable-length `IDAT` chunk bytes that must land in
+      the output in scan order regardless of computation order).
+
+      `cafe-codec::decoder` gained `decode_bytes_parallel`, sharing every
+      byte of chunk-framing/validation logic with the pre-existing
+      `decode_bytes` via a refactor that extracted that logic into a new
+      `parse_chunks(buf) -> Result<ParsedFile>` (the sequential pass:
+      signature, `IHDR`, iterating chunks, validating `iDIM`/`PLTE`
+      ordering, collecting every `IDAT`'s raw bytes without decompressing
+      them yet) plus a shared `decode_tile_into` (the actual per-tile
+      decompress + predictor-reversal + rectangular copy into the pixel
+      buffer — the one piece of real work, now callable identically from
+      either function) and `finish_decoded_image` (palette expansion +
+      final struct assembly). `decode_bytes` simply loops
+      `decode_tile_into` sequentially; `decode_bytes_parallel` instead
+      shares the pixel buffer via `RawSliceMut` and calls it through
+      `for_each_parallel`. `cafe-codec::encoder` gained
+      `encode_bytes_parallel` similarly, factoring `Encoder::add_tile`'s
+      per-tile logic out into a new `encode_tile_chunk` helper (predictor
+      selection + ZSTD fallback race + chunk framing, returning complete
+      `IDAT` bytes) — but unlike the decoder, this could not reuse the
+      streaming `Encoder<W>` type directly, since `Encoder::add_tile`'s
+      contract writes its `IDAT` to the underlying writer immediately,
+      fundamentally incompatible with computing tiles out of order across
+      threads. Instead, `encode_bytes_parallel` calls `Encoder::new` once
+      (sequentially — header/`iDIM`/metadata/`PLTE` writing needs no pixel
+      data, exactly as `Encoder::new` already assumed), computes every
+      tile's `IDAT` bytes concurrently via `map_parallel`, then appends
+      them to the same writer in scan order followed by `IEND` — the
+      streaming `Encoder<W>` API itself is completely unchanged and
+      remains the project's one true streaming-first API per `AGENTS.md`'s
+      guiding principles; `encode_bytes_parallel` is an additional
+      whole-buffer-in-whole-buffer-out entry point alongside
+      `encode_bytes`, not a replacement for anything.
+
+      Both new functions are documented as producing byte-for-byte
+      (`decode_bytes_parallel`) or struct-identical
+      (`encode_bytes_parallel`, confirmed byte-for-byte in every test)
+      output to their sequential counterparts for the same input, and
+      both transparently fall back to sequential execution below
+      `MIN_TILES_FOR_PARALLEL` or on a single-core host — so there is no
+      throughput reason to ever prefer the sequential functions on small
+      images; they remain useful only to force deterministic
+      single-threaded scheduling explicitly.
+
+      A new permanent Criterion benchmark,
+      `crates/cafe-codec/benches/parallel_tiles.rs` (new `[[bench]]`
+      target in `cafe-codec/Cargo.toml`, mirroring `predictor_simd.rs`'s
+      existing setup), records this phase's numbers going forward rather
+      than leaving them only in a deleted PoC: encode at level 1
+      (1024x1024, 64x64 tiles) 152.5ms sequential vs. 16.8ms parallel
+      (9.1x); level 3, same image, 189.0ms vs. 24.4ms (7.7x); level 19
+      (256x256, smaller since ZSTD dominates and the sequential baseline
+      needs to stay fast enough per Criterion sample) 300.9ms vs. 85.8ms
+      (3.5x); decode (512x512) 1.37ms vs. 0.98ms (1.4x) — all directionally
+      confirming the PoC's findings on real, permanent, implemented code
+      rather than the throwaway estimate, though the exact ratios differ
+      somewhat from the PoC (different image sizes/content and, unlike
+      the PoC, real production code paths with their own fixed overhead).
+
+      23 new tests: 11 in the new `parallel` module (covering
+      `split_ranges`, `RawSliceMut`'s disjoint-write safety,
+      `for_each_parallel`'s every-index/below-threshold/error-propagation/
+      empty-input behavior, and `map_parallel`'s equivalent set), 6 in
+      `decoder` (`decode_bytes_parallel` vs. `decode_bytes` parity across
+      single-tile, below-threshold, many-tile RGBA, partial-edge-tile,
+      error-propagation, and golden-fixture cases), and 6 in `encoder`
+      (`encode_bytes_parallel` vs. `encode_bytes` parity across the same
+      shape of cases plus Z-order scan and misuse rejection) — for 328
+      total workspace tests (up from 305 at the end of the metadata-chunks
+      phase): 162 `cafe-codec` (lib, up from 139) + 12 + 3 + 8
+      (`cafe-codec` integration files, unchanged) + 79 `cafe-format` lib
+      (unchanged) + 3 `chunk_proptest` (unchanged) + 18 `cafe-cli`
+      (unchanged) + 12 golden (unchanged) + 14 spec-invariants (unchanged)
+      + 17 `cafe-bench` (unchanged). All workspace tests, `cargo fmt --all
+      --check`, `cargo clippy --all-targets -- -D warnings`, and
+      `cargo +nightly check --manifest-path fuzz/Cargo.toml` pass cleanly.
 
 ## Commands
 

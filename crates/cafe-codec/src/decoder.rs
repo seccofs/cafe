@@ -57,14 +57,40 @@ pub struct DecodedImage {
     pub xmp: Option<Xmpd>,
 }
 
-/// Decodes a whole in-memory `.cafe` file into pixel bytes.
+/// The result of the sequential, spec-mandated chunk-framing/ordering pass
+/// (spec section 5's mandatory chunk order; `iDIM`/`PLTE` single-instance
+/// and before-first-`IDAT` rules; CRC validation via
+/// [`cafe_format::chunk::read_chunk`]) — everything a `.cafe` file's byte
+/// layout requires to be checked strictly in file order, before any tile's
+/// pixel content is touched.
 ///
-/// Streaming (chunk-at-a-time, without requiring the whole file in memory)
-/// is deferred to a `Decoder<R>` type in a later phase (mirrors
-/// `cafe-format`'s Phase 4 decision to defer the `Read`-based chunk
-/// primitive) — this is the reference, whole-buffer path golden files are
-/// validated against.
-pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
+/// `idat_chunks` holds each `IDAT` [`cafe_format::ReadChunk`] in scan
+/// order (the *i*-th entry is tile *i*, spec section 4.2), still
+/// compressed/unfiltered — actually decompressing and reversing the
+/// predictor for each one is deliberately deferred to the caller
+/// ([`decode_bytes`] or [`decode_bytes_parallel`]), since spec section 4.4
+/// ("Each `IDAT` is independent ... decoded as soon as it arrives") makes
+/// that part of the work embarrassingly parallel, unlike the framing pass
+/// itself (each chunk's offset depends on the previous chunk having been
+/// fully parsed, so this part must stay sequential).
+struct ParsedFile {
+    ihdr: Ihdr,
+    layout: TileLayout,
+    effective_bpp: u32,
+    bytes_per_row: u32,
+    plte: Option<Plte>,
+    exif: Option<Vec<u8>>,
+    json_chunks: Vec<JsonChunk>,
+    icc_profile: Option<Vec<u8>>,
+    xmp: Option<Xmpd>,
+    idat_chunks: Vec<cafe_format::ReadChunk>,
+}
+
+/// Runs the sequential chunk-framing/validation pass shared by
+/// [`decode_bytes`] and [`decode_bytes_parallel`]. See [`ParsedFile`]'s
+/// doc comment for why `IDAT` decompression/unfiltering itself is not
+/// done here.
+fn parse_chunks(buf: &[u8]) -> Result<ParsedFile> {
     let mut offset = validate_signature(buf)?;
     let (ihdr, next) = read_ihdr(buf, offset)?;
     offset = next;
@@ -78,9 +104,8 @@ pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
 
     let mut idim: Option<Idim> = None;
     let mut plte: Option<Plte> = None;
-    let mut layout: Option<TileLayout> = None;
-    let mut pixels: Option<Vec<u8>> = None;
-    let mut tiles_seen = 0usize;
+    let mut layout: Option<(TileLayout, u32)> = None;
+    let mut idat_chunks: Vec<cafe_format::ReadChunk> = Vec::new();
     let mut saw_iend = false;
 
     // Ancillary metadata (spec sections 4.5-4.8), collected as chunks are
@@ -96,15 +121,6 @@ pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
     let mut icc_profile: Option<Vec<u8>> = None;
     let mut xmp: Option<Xmpd> = None;
 
-    // `PLTE` (spec section 4.3) changes IDAT's effective bpp to 1 (one
-    // palette index per pixel) — this must be resolved before any IDAT is
-    // decoded, but PLTE itself can only be parsed once we've seen its
-    // bytes, so `effective_bpp`/`bytes_per_row` are computed lazily, right
-    // before the first IDAT (mirroring `layout`'s own lazy construction
-    // below), once we know whether a PLTE chunk preceded it.
-    let mut effective_bpp: Option<u32> = None;
-    let mut bytes_per_row: Option<u32> = None;
-
     while offset < buf.len() {
         let chunk = read_chunk(buf, offset)?;
         offset = chunk.next_offset;
@@ -116,7 +132,7 @@ pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
                         "duplicate iDIM chunk (spec section 4.2: single instance per file)".into(),
                     ));
                 }
-                if tiles_seen > 0 {
+                if !idat_chunks.is_empty() {
                     return Err(CodecError::TilingMismatch(
                         "iDIM chunk must appear before the first IDAT (spec section 5's \
                          mandatory chunk order)"
@@ -134,7 +150,7 @@ pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
                         "duplicate PLTE chunk (spec section 4.3: single instance per file)".into(),
                     ));
                 }
-                if tiles_seen > 0 {
+                if !idat_chunks.is_empty() {
                     return Err(CodecError::TilingMismatch(
                         "PLTE chunk must appear before the first IDAT (spec section 5's \
                          mandatory chunk order)"
@@ -189,66 +205,17 @@ pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
             b"IDAT" => {
                 if layout.is_none() {
                     let this_bpp = if plte.is_some() { 1 } else { bpp };
-                    let this_bytes_per_row = ihdr.width.checked_mul(this_bpp).ok_or_else(|| {
-                        CodecError::Format(cafe_format::CafeError::TruncatedFile(
-                            "overflow computing bytes_per_row (width * bpp)".into(),
-                        ))
-                    })?;
-                    effective_bpp = Some(this_bpp);
-                    bytes_per_row = Some(this_bytes_per_row);
                     let built = TileLayout::new(idim, ihdr.width, ihdr.height)?;
-                    // Allocate the full assembled pixel buffer once, sized
-                    // exactly to IHDR's declared dimensions — each tile's
-                    // own decompression remains individually bounded below
-                    // by that tile's own expected size, so this allocation
-                    // is never larger than the sum of legitimately-bounded
-                    // per-tile work the file's chunks actually justify.
-                    let total_pixel_bytes = (ihdr.height as u64)
-                        .checked_mul(this_bytes_per_row as u64)
-                        .ok_or_else(|| {
-                            CodecError::Format(cafe_format::CafeError::TruncatedFile(
-                                "overflow computing total pixel buffer size".into(),
-                            ))
-                        })?;
-                    pixels = Some(vec![0u8; total_pixel_bytes as usize]);
-                    layout = Some(built);
+                    layout = Some((built, this_bpp));
                 }
-                let this_bpp = effective_bpp.unwrap();
-                let this_bytes_per_row = bytes_per_row.unwrap();
-                let layout_ref = layout.as_ref().unwrap();
-                if tiles_seen >= layout_ref.tile_count() {
+                let (layout_ref, _) = layout.as_ref().unwrap();
+                if idat_chunks.len() >= layout_ref.tile_count() {
                     return Err(CodecError::TilingMismatch(format!(
                         "file contains more IDAT chunks than iDIM declares tiles ({})",
                         layout_ref.tile_count()
                     )));
                 }
-                let (origin_x, origin_y, tile_w, tile_h) = layout_ref.tile_rect(tiles_seen);
-                let tile_bytes_per_row = tile_w.checked_mul(this_bpp).ok_or_else(|| {
-                    CodecError::Format(cafe_format::CafeError::TruncatedFile(
-                        "overflow computing tile bytes_per_row".into(),
-                    ))
-                })?;
-                let expected_tile_payload = (tile_h as u64)
-                    .checked_mul(tile_bytes_per_row as u64 + 1)
-                    .ok_or_else(|| {
-                        CodecError::Format(cafe_format::CafeError::TruncatedFile(
-                            "overflow computing expected tile IDAT payload size".into(),
-                        ))
-                    })?;
-
-                let raw = decompress_with_limit(chunk.flag, &chunk.data, expected_tile_payload)?;
-                let tile_pixels = decode_tile_rows(&raw, tile_h, tile_bytes_per_row, this_bpp)?;
-
-                let pixels_buf = pixels.as_mut().unwrap();
-                let row_bytes = (tile_w * this_bpp) as usize;
-                for row in 0..tile_h {
-                    let dst_start = (origin_y + row) as usize * this_bytes_per_row as usize
-                        + origin_x as usize * this_bpp as usize;
-                    let src_start = row as usize * tile_bytes_per_row as usize;
-                    pixels_buf[dst_start..dst_start + row_bytes]
-                        .copy_from_slice(&tile_pixels[src_start..src_start + row_bytes]);
-                }
-                tiles_seen += 1;
+                idat_chunks.push(chunk);
             }
             b"IEND" => {
                 saw_iend = true;
@@ -277,24 +244,208 @@ pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
         )));
     }
 
-    let layout = layout.ok_or_else(|| {
+    let (layout, effective_bpp) = layout.ok_or_else(|| {
         CodecError::Format(cafe_format::CafeError::TruncatedFile(
             "file contains no IDAT chunk".into(),
         ))
     })?;
-    if tiles_seen != layout.tile_count() {
+    if idat_chunks.len() != layout.tile_count() {
         return Err(CodecError::TilingMismatch(format!(
-            "iDIM declares {} tile(s), but only {tiles_seen} IDAT chunk(s) were present",
-            layout.tile_count()
+            "iDIM declares {} tile(s), but only {} IDAT chunk(s) were present",
+            layout.tile_count(),
+            idat_chunks.len()
         )));
     }
-
-    let pixels = pixels.ok_or_else(|| {
+    let bytes_per_row = ihdr.width.checked_mul(effective_bpp).ok_or_else(|| {
         CodecError::Format(cafe_format::CafeError::TruncatedFile(
-            "file contains no IDAT chunk".into(),
+            "overflow computing bytes_per_row (width * bpp)".into(),
         ))
     })?;
 
+    Ok(ParsedFile {
+        ihdr,
+        layout,
+        effective_bpp,
+        bytes_per_row,
+        plte,
+        exif,
+        json_chunks,
+        icc_profile,
+        xmp,
+        idat_chunks,
+    })
+}
+
+/// Decodes a whole in-memory `.cafe` file into pixel bytes.
+///
+/// Streaming (chunk-at-a-time, without requiring the whole file in memory)
+/// is deferred to a `Decoder<R>` type in a later phase (mirrors
+/// `cafe-format`'s Phase 4 decision to defer the `Read`-based chunk
+/// primitive) — this is the reference, whole-buffer path golden files are
+/// validated against.
+///
+/// This decodes tiles one at a time, sequentially, in scan order — see
+/// [`decode_bytes_parallel`] for a version that decompresses/unfilters
+/// tiles across multiple threads once framing has been validated (both
+/// produce byte-for-byte identical [`DecodedImage::pixels`]).
+pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
+    let parsed = parse_chunks(buf)?;
+    let total_pixel_bytes = (parsed.ihdr.height as u64)
+        .checked_mul(parsed.bytes_per_row as u64)
+        .ok_or_else(|| {
+            CodecError::Format(cafe_format::CafeError::TruncatedFile(
+                "overflow computing total pixel buffer size".into(),
+            ))
+        })?;
+    let mut pixels = vec![0u8; total_pixel_bytes as usize];
+
+    for (index, chunk) in parsed.idat_chunks.iter().enumerate() {
+        decode_tile_into(
+            &parsed.layout,
+            index,
+            chunk.flag,
+            &chunk.data,
+            parsed.effective_bpp,
+            parsed.bytes_per_row,
+            &mut pixels,
+        )?;
+    }
+
+    finish_decoded_image(
+        parsed.ihdr,
+        pixels,
+        parsed.plte,
+        parsed.exif,
+        parsed.json_chunks,
+        parsed.icc_profile,
+        parsed.xmp,
+    )
+}
+
+/// Parallel counterpart to [`decode_bytes`]: identical chunk-framing,
+/// validation, and error behavior (built on the exact same
+/// [`parse_chunks`] pass — a malformed file is rejected the same way,
+/// with the same [`CodecError`] variant, regardless of which function
+/// decodes it), but once every `IDAT` chunk's bytes have been collected
+/// in scan order, their decompression + predictor-reversal + copy into
+/// the final pixel buffer runs across multiple threads instead of one
+/// (spec section 4.4: "Each `IDAT` is independent ... decoded as soon as
+/// it arrives" is exactly the independence property this relies on — see
+/// `AGENTS.md`'s parallel-tiling benchmark for the measurements that
+/// motivated adding this).
+///
+/// Produces byte-for-byte identical [`DecodedImage`] output to
+/// [`decode_bytes`] for the same input — confirmed by this module's
+/// `test_decode_bytes_parallel_matches_sequential_*` tests. For small
+/// tile counts (below an internal threshold, see
+/// `crate::parallel::MIN_TILES_FOR_PARALLEL`) or on a single-core host,
+/// this transparently falls back to the same sequential loop
+/// [`decode_bytes`] uses, so there's no reason to prefer [`decode_bytes`]
+/// over this function purely to avoid thread overhead on small files —
+/// the only reason to still call [`decode_bytes`] directly is to force
+/// single-threaded, deterministic-scheduling behavior explicitly.
+pub fn decode_bytes_parallel(buf: &[u8]) -> Result<DecodedImage> {
+    let parsed = parse_chunks(buf)?;
+    let total_pixel_bytes = (parsed.ihdr.height as u64)
+        .checked_mul(parsed.bytes_per_row as u64)
+        .ok_or_else(|| {
+            CodecError::Format(cafe_format::CafeError::TruncatedFile(
+                "overflow computing total pixel buffer size".into(),
+            ))
+        })?;
+    let mut pixels = vec![0u8; total_pixel_bytes as usize];
+
+    // SAFETY: `TileLayout::tile_rect` partitions the image into
+    // non-overlapping rectangles (spec section 4.2: tiles tile the image
+    // on a uniform grid), so distinct tile indices always write disjoint
+    // byte ranges of `pixels` — see `decode_tile_into`'s row-copy loop,
+    // which is the only code touching `pixels_buf` inside this closure.
+    let raw_pixels = crate::parallel::RawSliceMut::new(&mut pixels);
+    let layout = &parsed.layout;
+    let idat_chunks = &parsed.idat_chunks;
+    let bpp = parsed.effective_bpp;
+    let bytes_per_row = parsed.bytes_per_row;
+    crate::parallel::for_each_parallel(idat_chunks.len(), move |index| {
+        let chunk = &idat_chunks[index];
+        let pixels_buf = unsafe { raw_pixels.as_mut_slice() };
+        decode_tile_into(
+            layout,
+            index,
+            chunk.flag,
+            &chunk.data,
+            bpp,
+            bytes_per_row,
+            pixels_buf,
+        )
+    })?;
+
+    finish_decoded_image(
+        parsed.ihdr,
+        pixels,
+        parsed.plte,
+        parsed.exif,
+        parsed.json_chunks,
+        parsed.icc_profile,
+        parsed.xmp,
+    )
+}
+
+/// Decompresses+unfilters tile `index`'s `IDAT` payload and copies the
+/// reconstructed rows into the correct rectangular region of the shared
+/// `pixels_buf` — the single per-tile work unit shared by
+/// [`decode_bytes`]'s sequential loop and [`decode_bytes_parallel`]'s
+/// per-thread work, so the two can never drift in how a tile's bytes turn
+/// into pixels.
+#[allow(clippy::too_many_arguments)]
+fn decode_tile_into(
+    layout: &TileLayout,
+    index: usize,
+    flag: u8,
+    data: &[u8],
+    bpp: u32,
+    full_bytes_per_row: u32,
+    pixels_buf: &mut [u8],
+) -> Result<()> {
+    let (origin_x, origin_y, tile_w, tile_h) = layout.tile_rect(index);
+    let tile_bytes_per_row = tile_w.checked_mul(bpp).ok_or_else(|| {
+        CodecError::Format(cafe_format::CafeError::TruncatedFile(
+            "overflow computing tile bytes_per_row".into(),
+        ))
+    })?;
+    let expected_tile_payload = (tile_h as u64)
+        .checked_mul(tile_bytes_per_row as u64 + 1)
+        .ok_or_else(|| {
+            CodecError::Format(cafe_format::CafeError::TruncatedFile(
+                "overflow computing expected tile IDAT payload size".into(),
+            ))
+        })?;
+
+    let raw = decompress_with_limit(flag, data, expected_tile_payload)?;
+    let tile_pixels = decode_tile_rows(&raw, tile_h, tile_bytes_per_row, bpp)?;
+
+    let row_bytes = (tile_w * bpp) as usize;
+    for row in 0..tile_h {
+        let dst_start = (origin_y + row) as usize * full_bytes_per_row as usize
+            + origin_x as usize * bpp as usize;
+        let src_start = row as usize * tile_bytes_per_row as usize;
+        pixels_buf[dst_start..dst_start + row_bytes]
+            .copy_from_slice(&tile_pixels[src_start..src_start + row_bytes]);
+    }
+    Ok(())
+}
+
+/// Shared tail end of [`decode_bytes`]/[`decode_bytes_parallel`]: expands
+/// palette indices back to direct pixels (if `plte` is present) and
+/// assembles the final [`DecodedImage`].
+fn finish_decoded_image(
+    ihdr: Ihdr,
+    pixels: Vec<u8>,
+    plte: Option<Plte>,
+    exif: Option<Vec<u8>>,
+    json_chunks: Vec<JsonChunk>,
+    icc_profile: Option<Vec<u8>>,
+    xmp: Option<Xmpd>,
+) -> Result<DecodedImage> {
     // When PLTE is present, everything decoded above is palette indices
     // (one byte per pixel), not final channel bytes — expand them into
     // real pixels here so DecodedImage::pixels always holds direct
@@ -1138,5 +1289,103 @@ mod tests {
         assert!(img.json_chunks.is_empty());
         assert_eq!(img.icc_profile, None);
         assert_eq!(img.xmp, None);
+    }
+
+    // --- decode_bytes_parallel parity tests -------------------------------
+    //
+    // `decode_bytes_parallel` shares `parse_chunks`/`decode_tile_into`/
+    // `finish_decoded_image` with `decode_bytes`, so these tests focus
+    // specifically on confirming the two produce identical output across a
+    // range of tile counts (including counts below/above
+    // `crate::parallel::MIN_TILES_FOR_PARALLEL`), not on re-testing framing
+    // rules already covered above.
+
+    fn encode_test_image(
+        width: u32,
+        height: u32,
+        color_type: u8,
+        tile_size: Option<(u16, u16)>,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let channels = match color_type {
+            COLOR_TYPE_GRAY => 1u32,
+            COLOR_TYPE_RGBA => 4,
+            other => panic!("unsupported color_type {other} in test helper"),
+        };
+        let raw: Vec<u8> = (0..(width * height * channels))
+            .map(|i| ((i * 37 + 11) % 251) as u8)
+            .collect();
+        let buf = crate::encoder::encode_bytes(
+            width,
+            height,
+            8,
+            SAMPLE_FORMAT_UINT,
+            color_type,
+            &raw,
+            crate::encoder::EncoderOptions {
+                tile_size,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        (buf, raw)
+    }
+
+    #[test]
+    fn test_decode_bytes_parallel_matches_sequential_single_tile() {
+        let (buf, raw) = encode_test_image(4, 4, COLOR_TYPE_GRAY, None);
+        let seq = decode_bytes(&buf).unwrap();
+        let par = decode_bytes_parallel(&buf).unwrap();
+        assert_eq!(seq, par);
+        assert_eq!(seq.pixels, raw);
+    }
+
+    #[test]
+    fn test_decode_bytes_parallel_matches_sequential_below_threshold_tile_count() {
+        // 2x2 tiles of 3x2 pixels each = 4 tiles total, below
+        // MIN_TILES_FOR_PARALLEL (falls back to sequential internally, but
+        // must still match decode_bytes exactly).
+        let (buf, raw) = encode_test_image(6, 4, COLOR_TYPE_GRAY, Some((3, 2)));
+        let seq = decode_bytes(&buf).unwrap();
+        let par = decode_bytes_parallel(&buf).unwrap();
+        assert_eq!(seq, par);
+        assert_eq!(seq.pixels, raw);
+    }
+
+    #[test]
+    fn test_decode_bytes_parallel_matches_sequential_many_tiles() {
+        // 8x8 tiles of 4x4 pixels each = 16 tiles, well above the
+        // parallel threshold, RGBA to also exercise bpp > 1.
+        let (buf, raw) = encode_test_image(32, 32, COLOR_TYPE_RGBA, Some((4, 4)));
+        let seq = decode_bytes(&buf).unwrap();
+        let par = decode_bytes_parallel(&buf).unwrap();
+        assert_eq!(seq, par);
+        assert_eq!(seq.pixels, raw);
+    }
+
+    #[test]
+    fn test_decode_bytes_parallel_matches_sequential_with_partial_edge_tiles() {
+        // 5x5 image with 2x2 tiles: tiles_x=tiles_y=3, right/bottom tiles
+        // are partial.
+        let (buf, raw) = encode_test_image(5, 5, COLOR_TYPE_GRAY, Some((2, 2)));
+        let seq = decode_bytes(&buf).unwrap();
+        let par = decode_bytes_parallel(&buf).unwrap();
+        assert_eq!(seq, par);
+        assert_eq!(seq.pixels, raw);
+    }
+
+    #[test]
+    fn test_decode_bytes_parallel_propagates_same_errors_as_sequential() {
+        let malformed = read_malformed("bad_signature.cafe");
+        let seq_err = decode_bytes(&malformed).unwrap_err();
+        let par_err = decode_bytes_parallel(&malformed).unwrap_err();
+        assert_eq!(format!("{seq_err:?}"), format!("{par_err:?}"));
+    }
+
+    #[test]
+    fn test_decode_bytes_parallel_matches_sequential_against_golden_fixture() {
+        let buf = read_golden("minimal_2x2_rgba.cafe");
+        let seq = decode_bytes(&buf).unwrap();
+        let par = decode_bytes_parallel(&buf).unwrap();
+        assert_eq!(seq, par);
     }
 }
