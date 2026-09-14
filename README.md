@@ -18,32 +18,42 @@ notes.
 
 ## Status
 
-All phases through **Phase 10 (benchmark vs. PNG) plus a corpus-population
-follow-up** are complete: chunk framing and `IHDR`/`iDIM` validation
-(`cafe-format`), a full scalar decode/encode path with 2D tiling
-(`cafe-codec`), fuzzing/proptest robustness coverage, a real CLI
-(`cafe-cli`: `inspect`/`verify`/`explain`/`benchmark` plus
-`cafe-encode`/`cafe-decode`), and a benchmark harness (`cafe-bench`) are all
-implemented and tested (206 tests across the workspace).
+All phases through **parallel tile encode/decode** (see `AGENTS.md`'s full
+phased roadmap) are complete: chunk framing and `IHDR`/`iDIM`/`PLTE`
+validation (`cafe-format`), a full scalar+SIMD decode/encode path with 2D
+tiling, indexed-color palette transform, multi-threaded tile
+encode/decode, and metadata chunks (`cafe-codec`), fuzzing/proptest
+robustness coverage, a real CLI (`cafe-cli`: `inspect`/`verify`/`explain`/
+`benchmark` plus `cafe-encode`/`cafe-decode`, both with HDR/16-bit/metadata
+support), and a benchmark harness (`cafe-bench`) are all implemented and
+tested (327 tests across the workspace).
 
 Running `cargo run -p cafe-cli --bin cafe -- benchmark` against the full
-22-entry `corpus/manifest.json` (8 synthetic gradient/pixelart/texture/
-synthetic images plus 14 real photo/lineart/illustration/screenshot images
-— see [`corpus/ATTRIBUTION.md`](corpus/ATTRIBUTION.md) for sourcing/
-licensing) shows CAFE beating PNG on **every single entry**:
+24-entry `corpus/manifest.json` (8 synthetic gradient/pixelart/texture/
+synthetic images, 14 real photo/lineart/illustration/screenshot images, and
+2 HDR `.exr` fixtures registered separately — see
+[`corpus/ATTRIBUTION.md`](corpus/ATTRIBUTION.md) for sourcing/licensing)
+shows CAFE beating PNG on **every single non-HDR entry**:
 
 ```
-TOTAL: raw=3760128 png=1324113 (35.2%) cafe=795462 (21.2%)
+TOTAL: raw=3760128 png=1324113 (35.2%) cafe=751155 (20.0%)
 ```
+
+(`corpus/hdr/` actually holds 12 `.exr` fixtures; the manifest table above
+only counts the 22 PNG-comparable entries. HDR is compared against the
+original `.exr` file, not PNG, in a separate table `cafe benchmark` prints
+— CAFE wins on 2 of the 12 HDR fixtures and loses on the other 10, since
+OpenEXR's own PIZ/B44/ZIP wavelet-based compression is often better tuned
+for HDR float/half data than CAFE's uint-delta predictor set; see
+`AGENTS.md`'s HDR follow-up phases for the full breakdown.)
 
 Per `AGENTS.md`'s "every feature proves itself with a benchmark first"
-principle, SIMD, indexed palette, and ZSTD dictionary support (all planned
-for 0.2+) are currently a **no-go**: nothing in this corpus shows scalar
-predictor/ZSTD throughput as a bottleneck, no category has a
-palette-favorable small-distinct-color profile that isn't already
-near-optimal, and this corpus's images are large/varied singles, not the
-small/similar/many-files scenario a shared dictionary would pay off on. See
-`AGENTS.md`'s Phase 10 entry for the full reasoning.
+principle: **SIMD (AVX2/NEON) and indexed palette (`PLTE`) were both
+reopened and implemented** after later benchmarks justified them (see
+`AGENTS.md`'s "SIMD (0.2) for predictors" and "Palette (0.3)
+implementation" phases). ZSTD dictionary support remains a no-go — this
+corpus's images are large/varied singles, not the small/similar/many-files
+scenario a shared dictionary would pay off on.
 
 ## Key Features
 
@@ -59,6 +69,10 @@ small/similar/many-files scenario a shared dictionary would pay off on. See
   supports
 - Encoder heuristic: Shannon-entropy scoring picks the lowest-entropy
   candidate per row, ties favor the smaller predictor code
+- **SIMD fast paths** (AVX2 on x86_64, NEON on aarch64): `filter_row` for
+  all 6 predictor codes, `unfilter_row` for None/Up — byte-identical to
+  the scalar reference, dispatched automatically when available (falls
+  back to scalar below a length threshold or on unsupported hardware)
 
 ### Tiling
 - Single `iDIM`-based mechanism: default single implicit tile (no `iDIM`
@@ -66,10 +80,19 @@ small/similar/many-files scenario a shared dictionary would pay off on. See
 - Row-major or Z-order (Morton) scan order
 - Edge-truncated tiles when width/height aren't exact multiples of the
   tile size
+- **Parallel encode/decode**: `encode_bytes_parallel`/
+  `decode_bytes_parallel` fan out per-tile work (predictor
+  selection/reversal + ZSTD compress/decompress) across threads via
+  `std::thread::scope`, byte-for-byte/struct-identical to the sequential
+  functions, with automatic sequential fallback below 4 tiles or on a
+  single-core host
 
 ### Color & sample formats
-- **Color types**: Grayscale, RGB, Grayscale+Alpha, RGBA (no indexed
-  palette in 0.1 — deferred to 0.3 as an encoder-side transform)
+- **Color types**: Grayscale, RGB, Grayscale+Alpha, RGBA
+- **Indexed palette (`PLTE`)**: optional encoder-side transform for 8-bit
+  RGB/RGBA content with ≤256 distinct exact colors — one index byte per
+  pixel in `IDAT` instead of direct channel bytes; `cafe-encode` races it
+  automatically against the direct encode and keeps whichever is smaller
 - **Bit depths**: uint8, uint16, float32
 - Big-endian multi-byte fields and samples throughout
 
@@ -89,11 +112,13 @@ small/similar/many-files scenario a shared dictionary would pay off on. See
   bit-flips, truncations) at both the chunk-parsing and whole-file-decode
   layers, and (locally, Linux/nightly) two libFuzzer harnesses
 
-### What's deferred (not in 0.1)
-Indexed palette (0.3), ZSTD dictionary (0.4), SIMD (0.2), Adam7/even-odd
-interlace (removed permanently), full HDR tone-mapping (unscheduled) — see
-`spec/CAFE-spec.md` section 11 and `AGENTS.md`'s "What v0.1 keeps, defers,
-or removes" table for the full list and rationale.
+### What's deferred (not implemented)
+Palette quantization algorithms (median-cut/k-means, for images with
+*more* than 256 distinct colors — `PLTE` itself is implemented), ZSTD
+dictionary (0.4), Adam7/even-odd interlace (removed permanently), full HDR
+tone-mapping (unscheduled) — see `spec/CAFE-spec.md` section 11 and
+`AGENTS.md`'s "Core v0.1 design decisions" table for the full list and
+rationale.
 
 ---
 
@@ -144,6 +169,7 @@ the legacy-named `cafe-encode`/`cafe-decode` binaries.
 | Type | Description |
 |------|-----------|
 | `IHDR` | Header, 12-byte payload (always first, never compressed) |
+| `PLTE` | Optional indexed-color palette (see `spec/CAFE-spec.md` section 4.3) |
 | `IDAT` | Pixel data (1 or more per file, one per tile) |
 | `IEND` | End marker (always last, zero-length payload) |
 
@@ -158,7 +184,7 @@ the legacy-named `cafe-encode`/`cafe-decode` binaries.
 | `xMPd` | XMP metadata |
 
 Mandatory chunk order: `IHDR` → `iDIM` → `eXIF` → `jSON` → `iCCP` →
-`xMPd` → `IDAT`(s) → `IEND`. See `spec/CAFE-spec.md` section 5.
+`xMPd` → `PLTE` → `IDAT`(s) → `IEND`. See `spec/CAFE-spec.md` section 5.
 
 ---
 
@@ -175,9 +201,10 @@ cargo build --release
 ./target/release/cafe inspect output.cafe
 ```
 
-v0.1's CLI scope is deliberately narrow: PNG-only, 8-bit-only I/O
-(`cafe-codec` itself already supports uint16/float32 — CLI support for
-those is a later pass).
+`cafe-encode`/`cafe-decode` support 8-bit and 16-bit uint PNG input
+(gray/gray+alpha/RGB/RGBA) and float32 HDR input such as `.exr`
+(RGB/RGBA) — which bridge applies is decided by the *decoded* color type,
+not the file extension or a CLI flag.
 
 ### CLI
 
@@ -191,15 +218,33 @@ cafe-encode input.png output.cafe --tile-size 64x64 --scan-order z
 # Encode without ZSTD (every IDAT written raw)
 cafe-encode input.png output.cafe --no-zstd
 
-# Decode
+# Encode a 16-bit or float32 HDR (.exr) source — same command, dispatch
+# is automatic based on the decoded color type
+cafe-encode input16bit.png output.cafe
+cafe-encode input.exr output.cafe
+
+# Skip the automatic indexed-palette (PLTE) race for 8-bit RGB/RGBA input
+cafe-encode input.png output.cafe --no-palette
+
+# Embed metadata chunks (eXIF/iCCP/xMPd single-instance, jSON repeatable)
+cafe-encode input.png output.cafe \
+    --exif photo.exif --icc profile.icc --xmp meta.xmp \
+    --json app.editor:notes.json
+
+# Decode (writes PNG for uint output, .exr for float32 output based on
+# the decoded Ihdr's sample_format)
 cafe-decode output.cafe decoded.png
+
+# Extract embedded metadata while decoding
+cafe-decode output.cafe decoded.png \
+    --extract-exif out.exif --extract-icc out.icc --extract-xmp out.xmp
 
 # Inspect chunk layout / validate against the spec / explain predictor choices
 cafe inspect output.cafe
 cafe verify output.cafe
 cafe explain output.cafe
 
-# Benchmark a corpus against PNG
+# Benchmark a corpus against PNG (and HDR fixtures against their source .exr)
 cafe benchmark corpus/
 ```
 
@@ -244,27 +289,53 @@ for tile_pixels in tiles_in_scan_order {
 let _file = encoder.finish()?; // writes IEND
 ```
 
+For multi-tile images, `encode_bytes_parallel`/`decode_bytes_parallel`
+fan the per-tile work (predictor selection/reversal, ZSTD
+compress/decompress) out across threads via `std::thread::scope`,
+byte-for-byte/struct-identical to `encode_bytes`/`decode_bytes` for the
+same input (with automatic sequential fallback below 4 tiles or on a
+single-core host):
+
+```rust
+use cafe_codec::{decode_bytes_parallel, encode_bytes_parallel, EncoderOptions};
+
+let options = EncoderOptions { tile_size: Some((64, 64)), ..Default::default() };
+let cafe_bytes = encode_bytes_parallel(width, height, 8, SAMPLE_FORMAT_UINT, COLOR_TYPE_RGBA, &raw_rgba_pixels, options)?;
+let decoded = decode_bytes_parallel(&cafe_bytes)?;
+```
+
+`cafe_codec::palette::build_palette` builds an indexed-color transform
+(`EncoderOptions::palette`) for 8-bit RGB/RGBA content with ≤256 distinct
+exact colors — see `cafe-encode`'s source for the encode-both-and-keep-
+smaller pattern.
+
 `cafe-format` is also usable on its own for low-level chunk work
 (`cafe_format::chunk::{read_chunk, write_chunk}`, `cafe_format::Ihdr`,
-`cafe_format::Idim`).
+`cafe_format::Idim`, `cafe_format::Plte`).
 
 ---
 
 ## Performance
 
 See [Status](#status) above for the current full-corpus benchmark. In
-short: CAFE beats PNG on every entry tried so far, from a ~2x margin on
-mid-frequency synthetic texture content up to two orders of magnitude on
-smooth gradients/flat pixel art, and a comfortable margin (roughly half the
-bytes of PNG) on real photos/screenshots/line art. Run it yourself with:
+short: CAFE beats PNG on every non-HDR entry tried so far, from a ~2x
+margin on mid-frequency synthetic texture content up to two orders of
+magnitude on smooth gradients/flat pixel art, and a comfortable margin on
+real photos/screenshots/line art (indexed palette pushes line
+art/illustration further still). HDR (`.exr`) is a mixed result against
+OpenEXR's own compression — see `AGENTS.md`'s HDR follow-up phases. Run it
+yourself with:
 
 ```bash
 cargo run -p cafe-cli --bin cafe -- benchmark
 cargo run -p cafe-bench --bin cafe-bench   # in-memory synthetic matrix + criterion benches
 ```
 
-SIMD is deferred to 0.2 and has not been implemented or benchmarked yet —
-current numbers are all scalar.
+SIMD (AVX2/NEON) is implemented for the predictor filter/unfilter paths
+and used automatically — see `crates/cafe-codec/benches/predictor_simd.rs`
+for per-predictor speedup numbers, and
+`crates/cafe-codec/benches/parallel_tiles.rs` for multi-threaded tile
+encode/decode speedups.
 
 ---
 
@@ -296,9 +367,9 @@ serde_json = "1.0"  # JSON metadata / corpus manifest
 ## Documentation
 
 - [`spec/CAFE-spec.md`](spec/CAFE-spec.md) — normative Format 0.1
-  specification (signature, chunk structure, `IHDR`/`iDIM`/`IDAT`/metadata
-  chunks, mandatory order, streaming, security, versioning, future
-  extensions)
+  specification (signature, chunk structure, `IHDR`/`iDIM`/`PLTE`/`IDAT`/
+  metadata chunks, mandatory order, streaming, security, versioning,
+  future extensions)
 - [`spec/invariants/*.toml`](spec/invariants/) — the same rules as
   machine-readable data, cross-checked for consistency by
   `crates/cafe-format/tests/spec_invariants.rs`
@@ -316,11 +387,11 @@ Licensed under **BSD-3-Clause** — see [LICENSE](LICENSE).
 ## Contributing
 
 The phased roadmap in [`AGENTS.md`](AGENTS.md) is the source of truth for
-what's done, what's deferred, and why. Before proposing a 0.2+ feature
-(SIMD, palette, dictionary), check `AGENTS.md`'s Phase 10 go/no-go
-verdicts — per this project's guiding principle, "every feature proves
-itself with a benchmark first" (`cafe-bench`/`cafe benchmark` exist
-specifically to make that case).
+what's done, what's deferred, and why. Before proposing a new feature
+(e.g. ZSTD dictionary, palette quantization), check `AGENTS.md`'s
+go/no-go verdicts for that area — per this project's guiding principle,
+"every feature proves itself with a benchmark first" (`cafe-bench`/`cafe
+benchmark` exist specifically to make that case).
 
 ```bash
 cargo build
