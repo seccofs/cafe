@@ -107,7 +107,7 @@ pub fn filter_row(row: &[u8], prev_row: Option<&[u8]>, code: u8, bpp: usize) -> 
 
 /// Scalar reference implementation of [`filter_row`] — the format
 /// definition itself, never bypassed for correctness. See
-/// [`crate::simd`]'s module doc for the scalar-is-reference architecture
+/// `crate::simd`'s module doc for the scalar-is-reference architecture
 /// this split exists for.
 pub fn filter_row_scalar(
     row: &[u8],

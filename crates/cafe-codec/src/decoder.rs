@@ -323,7 +323,7 @@ pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
 
 /// Parallel counterpart to [`decode_bytes`]: identical chunk-framing,
 /// validation, and error behavior (built on the exact same
-/// [`parse_chunks`] pass — a malformed file is rejected the same way,
+/// `parse_chunks` pass — a malformed file is rejected the same way,
 /// with the same [`CodecError`] variant, regardless of which function
 /// decodes it), but once every `IDAT` chunk's bytes have been collected
 /// in scan order, their decompression + predictor-reversal + copy into

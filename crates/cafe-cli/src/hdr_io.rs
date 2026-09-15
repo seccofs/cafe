@@ -123,8 +123,10 @@ pub fn cafe_pixels_to_dynamic_image_hdr(
     }
 
     let samples: Vec<f32> = raw_pixels
-        .chunks_exact(4)
-        .map(|chunk| f32::from_be_bytes(chunk.try_into().expect("chunks_exact(4) yields 4 bytes")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_be_bytes(*chunk))
         .collect();
 
     match color_type {

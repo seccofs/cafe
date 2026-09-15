@@ -105,8 +105,10 @@ fn u16_samples_to_be_bytes(samples: &[u16]) -> Vec<u8> {
 /// buffer from a decoded CAFE image's raw pixels.
 fn be_bytes_to_u16_samples(raw_pixels: &[u8]) -> Vec<u16> {
     raw_pixels
-        .chunks_exact(2)
-        .map(|chunk| u16::from_be_bytes(chunk.try_into().expect("chunks_exact(2) yields 2 bytes")))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| u16::from_be_bytes(*chunk))
         .collect()
 }
 

@@ -34,8 +34,8 @@ use std::fs;
 use std::path::Path;
 
 /// Maximum edge length real-content images are downscaled to, matching the
-/// largest synthetic size in [`crate::manifest::SIZES`] so the real
-/// categories don't dominate repo size.
+/// largest synthetic size (256x256, `crate::manifest`'s internal `SIZES`)
+/// so the real categories don't dominate repo size.
 pub const MAX_DIMENSION: u32 = 256;
 
 /// One source image staged for import: where it lives on disk, which
@@ -199,7 +199,8 @@ pub struct HdrSource {
 /// docs). Dimensions come from decoding the file just far enough to read
 /// its header via `image::ImageReader`; `bit_depth` is always `32`
 /// (float32) and `format` is `"exr"`, distinguishing these entries from
-/// every PNG entry [`generate_corpus`]/[`import_sources`] produce.
+/// every PNG entry [`crate::manifest::generate_corpus`]/[`import_sources`]
+/// produce.
 pub fn register_hdr_sources(
     corpus_root: &Path,
     sources: &[HdrSource],

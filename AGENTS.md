@@ -1621,6 +1621,56 @@ binaries.
       + 17 `cafe-bench` (unchanged). All workspace tests, `cargo fmt --all
       --check`, `cargo clippy --all-targets -- -D warnings`, and
       `cargo +nightly check --manifest-path fuzz/Cargo.toml` pass cleanly.
+- [x] **CI breakage fix: newer stable Rust's Clippy lint + stricter rustdoc
+      link checking (post-parallel-tile-encode/decode follow-up).** CI's
+      `Clippy` and `Documentation` jobs both started failing (exit code
+      101) with no source change of this project's own — the root cause
+      was `dtolnay/rust-toolchain@stable` picking up a newer stable Rust
+      release (1.98.1) than what this phase's own code had been written
+      and verified against, not a regression introduced by any prior
+      phase's code. Two independent issues, both fixed without changing
+      any runtime behavior:
+      1. **Clippy:** the previous phase's `hdr_io.rs`/`png_io.rs` byte<->
+         sample conversions (`raw_pixels.chunks_exact(4).map(|c|
+         f32::from_be_bytes(c.try_into().unwrap()))` and the `u16`
+         equivalent) tripped a Clippy lint new to this Rust release,
+         `clippy::chunks_exact_to_as_chunks` (`-D warnings` promotes it to
+         an error) — both call sites were rewritten to the now-stable
+         `[u8]::as_chunks::<N>()` (stabilized in this same Rust release),
+         which returns the array chunks directly instead of needing a
+         `try_into().expect(...)` per chunk.
+      2. **Documentation:** newer rustdoc in the same release started
+         flagging two doc-comment mistakes in this project's own docs that
+         an older rustdoc silently tolerated: `rustdoc::
+         private_intra_doc_links` (four `[`...`]`-style doc links in
+         `cafe-codec`'s `decoder.rs`/`encoder.rs`/`predictor.rs` pointing
+         at genuinely private items — `parse_chunks`, `encode_tile_chunk`
+         [twice], `crate::parallel::map_parallel`, `crate::simd` — from
+         public-item doc comments, which rustdoc can no longer resolve
+         into a real hyperlink) and `rustdoc::broken_intra_doc_links` (two
+         in `cafe-bench`'s `import.rs`: `[`crate::manifest::SIZES`]`
+         referencing a constant that is intentionally private, and an
+         unqualified `[`generate_corpus`]` outside that item's own module
+         scope). Fixed by downgrading the four private-item links to plain
+         `` `code span` `` text (no working public link exists for them,
+         so a real hyperlink was never possible) and correcting
+         `import.rs`'s two links to reference the real, resolvable
+         `crate::manifest::generate_corpus` path (`SIZES` itself stays
+         prose-described rather than linked, since it is genuinely
+         private and has no public alternative to point at).
+
+      This phase intentionally added zero new tests and changed zero
+      runtime logic (verified by the full `cargo test --workspace` run
+      below reporting the exact same 328 passing tests as the
+      parallel-tile-encode/decode phase, byte-for-byte unchanged) — it is
+      purely a compatibility fix for a stricter toolchain, the kind of
+      drift `AGENTS.md`'s "boringly simple" philosophy doesn't generally
+      need to plan around but does need to react to when a language/tool
+      upgrade tightens what was previously permitted. All workspace tests
+      (328, unchanged), `cargo fmt --all --check`, `cargo clippy
+      --workspace --all-targets -- -D warnings`, and `cargo doc --workspace
+      --no-deps` (with `RUSTDOCFLAGS=-D warnings`, matching CI's `doc` job
+      exactly) pass cleanly on Rust 1.98.1.
 
 ## Commands
 

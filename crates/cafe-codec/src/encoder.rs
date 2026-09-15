@@ -431,9 +431,9 @@ pub fn encode_bytes(
 /// metadata/`PLTE` handling (via the same [`Encoder::new`], which still
 /// runs once, sequentially, up front — none of that depends on pixel
 /// data), but every tile's predictor selection + ZSTD fallback race +
-/// chunk framing (the work [`encode_tile_chunk`] does) runs concurrently
+/// chunk framing (the work `encode_tile_chunk` does) runs concurrently
 /// across tiles instead of one at a time, via
-/// [`crate::parallel::map_parallel`]. The resulting `IDAT` chunks are
+/// `crate::parallel::map_parallel`. The resulting `IDAT` chunks are
 /// then written to the output buffer sequentially, in scan order — spec
 /// section 4.2's "the N-th `IDAT` in the file corresponds to the N-th
 /// position in this enumeration order" is a file-structure requirement,
@@ -457,7 +457,7 @@ pub fn encode_bytes(
 /// threads. This function instead calls [`Encoder::new`] only for its
 /// header/metadata-writing side effect, extracting the tile geometry it
 /// needs (`bpp`, `layout`) before computing every tile's chunk bytes via
-/// [`encode_tile_chunk`] directly.
+/// `encode_tile_chunk` directly.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_bytes_parallel(
     width: u32,
