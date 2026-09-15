@@ -300,15 +300,14 @@ pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
     let mut pixels = vec![0u8; total_pixel_bytes as usize];
 
     for (index, chunk) in parsed.idat_chunks.iter().enumerate() {
-        decode_tile_into(
+        let tile = decode_tile(
             &parsed.layout,
             index,
             chunk.flag,
             &chunk.data,
             parsed.effective_bpp,
-            parsed.bytes_per_row,
-            &mut pixels,
         )?;
+        copy_tile_into_slice(&tile, parsed.bytes_per_row, &mut pixels);
     }
 
     finish_decoded_image(
@@ -355,11 +354,19 @@ pub fn decode_bytes_parallel(buf: &[u8]) -> Result<DecodedImage> {
         })?;
     let mut pixels = vec![0u8; total_pixel_bytes as usize];
 
-    // SAFETY: `TileLayout::tile_rect` partitions the image into
-    // non-overlapping rectangles (spec section 4.2: tiles tile the image
-    // on a uniform grid), so distinct tile indices always write disjoint
-    // byte ranges of `pixels` — see `decode_tile_into`'s row-copy loop,
-    // which is the only code touching `pixels_buf` inside this closure.
+    // Each worker thread decodes its assigned tile(s) fully into its own
+    // freshly-allocated `Vec<u8>` first (no shared-buffer access at all
+    // during decompression/unfiltering), then copies only that tile's
+    // rows into `pixels` via `RawSliceMut::write_at` — a raw-pointer
+    // `copy_nonoverlapping`, never a `&mut [u8]` over the shared buffer
+    // (see `RawSliceMut`'s doc comment for why the latter is UB under
+    // Rust's aliasing model even when the actual byte ranges written
+    // never overlap, a real bug this design was changed to fix after
+    // `cargo miri test` caught it in an earlier version of this
+    // function). `TileLayout::tile_rect` partitioning the image into
+    // non-overlapping rectangles (spec section 4.2) is what guarantees
+    // distinct tile indices always target disjoint byte ranges of
+    // `pixels`.
     let raw_pixels = crate::parallel::RawSliceMut::new(&mut pixels);
     let layout = &parsed.layout;
     let idat_chunks = &parsed.idat_chunks;
@@ -367,16 +374,9 @@ pub fn decode_bytes_parallel(buf: &[u8]) -> Result<DecodedImage> {
     let bytes_per_row = parsed.bytes_per_row;
     crate::parallel::for_each_parallel(idat_chunks.len(), move |index| {
         let chunk = &idat_chunks[index];
-        let pixels_buf = unsafe { raw_pixels.as_mut_slice() };
-        decode_tile_into(
-            layout,
-            index,
-            chunk.flag,
-            &chunk.data,
-            bpp,
-            bytes_per_row,
-            pixels_buf,
-        )
+        let tile = decode_tile(layout, index, chunk.flag, &chunk.data, bpp)?;
+        copy_tile_into_raw_slice(&tile, bytes_per_row, &raw_pixels);
+        Ok(())
     })?;
 
     finish_decoded_image(
@@ -390,22 +390,38 @@ pub fn decode_bytes_parallel(buf: &[u8]) -> Result<DecodedImage> {
     )
 }
 
-/// Decompresses+unfilters tile `index`'s `IDAT` payload and copies the
-/// reconstructed rows into the correct rectangular region of the shared
-/// `pixels_buf` — the single per-tile work unit shared by
-/// [`decode_bytes`]'s sequential loop and [`decode_bytes_parallel`]'s
-/// per-thread work, so the two can never drift in how a tile's bytes turn
-/// into pixels.
-#[allow(clippy::too_many_arguments)]
-fn decode_tile_into(
+/// One tile's fully decompressed+unfiltered pixel rows, plus the
+/// rectangular region of the whole image they belong in — an
+/// intermediate result held entirely in its own freshly-allocated
+/// buffer, with no reference to (or access of) any other tile's data or
+/// the final shared pixel buffer. This separation (decode fully in
+/// isolation, *then* copy into place) is what lets
+/// [`decode_bytes_parallel`] avoid ever constructing a `&mut [u8]` over
+/// the shared output buffer from multiple threads (see `RawSliceMut`'s
+/// doc comment).
+struct DecodedTile {
+    origin_x: u32,
+    origin_y: u32,
+    tile_w: u32,
+    tile_h: u32,
+    bpp: u32,
+    tile_bytes_per_row: u32,
+    pixels: Vec<u8>,
+}
+
+/// Decompresses+unfilters tile `index`'s `IDAT` payload into its own
+/// buffer — the single per-tile work unit shared by [`decode_bytes`]'s
+/// sequential loop and [`decode_bytes_parallel`]'s per-thread work, so
+/// the two can never drift in how a tile's bytes turn into pixels. Does
+/// not touch the final image-sized pixel buffer at all; see
+/// [`copy_tile_into_slice`]/[`copy_tile_into_raw_slice`] for that step.
+fn decode_tile(
     layout: &TileLayout,
     index: usize,
     flag: u8,
     data: &[u8],
     bpp: u32,
-    full_bytes_per_row: u32,
-    pixels_buf: &mut [u8],
-) -> Result<()> {
+) -> Result<DecodedTile> {
     let (origin_x, origin_y, tile_w, tile_h) = layout.tile_rect(index);
     let tile_bytes_per_row = tile_w.checked_mul(bpp).ok_or_else(|| {
         CodecError::Format(cafe_format::CafeError::TruncatedFile(
@@ -421,17 +437,62 @@ fn decode_tile_into(
         })?;
 
     let raw = decompress_with_limit(flag, data, expected_tile_payload)?;
-    let tile_pixels = decode_tile_rows(&raw, tile_h, tile_bytes_per_row, bpp)?;
+    let pixels = decode_tile_rows(&raw, tile_h, tile_bytes_per_row, bpp)?;
 
-    let row_bytes = (tile_w * bpp) as usize;
-    for row in 0..tile_h {
-        let dst_start = (origin_y + row) as usize * full_bytes_per_row as usize
-            + origin_x as usize * bpp as usize;
-        let src_start = row as usize * tile_bytes_per_row as usize;
+    Ok(DecodedTile {
+        origin_x,
+        origin_y,
+        tile_w,
+        tile_h,
+        bpp,
+        tile_bytes_per_row,
+        pixels,
+    })
+}
+
+/// Copies a [`DecodedTile`]'s rows into the correct rectangular region of
+/// `pixels_buf` via ordinary slice indexing — used by [`decode_bytes`]'s
+/// sequential loop, which owns `pixels_buf` exclusively and has no
+/// concurrent-access concern at all.
+fn copy_tile_into_slice(tile: &DecodedTile, full_bytes_per_row: u32, pixels_buf: &mut [u8]) {
+    let row_bytes = (tile.tile_w * tile.bpp) as usize;
+    for row in 0..tile.tile_h {
+        let dst_start = (tile.origin_y + row) as usize * full_bytes_per_row as usize
+            + tile.origin_x as usize * tile.bpp as usize;
+        let src_start = row as usize * tile.tile_bytes_per_row as usize;
         pixels_buf[dst_start..dst_start + row_bytes]
-            .copy_from_slice(&tile_pixels[src_start..src_start + row_bytes]);
+            .copy_from_slice(&tile.pixels[src_start..src_start + row_bytes]);
     }
-    Ok(())
+}
+
+/// Copies a [`DecodedTile`]'s rows into the correct rectangular region of
+/// a shared [`crate::parallel::RawSliceMut`] via
+/// [`crate::parallel::RawSliceMut::write_at`] — used by
+/// [`decode_bytes_parallel`]'s per-thread work, where `pixels_buf` is
+/// shared across threads and must never be reconstructed as a `&mut
+/// [u8]` (see `RawSliceMut`'s doc comment). Each `write_at` call targets
+/// exactly one row's `row_bytes`-length range, which
+/// [`TileLayout::tile_rect`]'s non-overlapping-rectangles guarantee (spec
+/// section 4.2) ensures no other thread ever touches concurrently.
+fn copy_tile_into_raw_slice(
+    tile: &DecodedTile,
+    full_bytes_per_row: u32,
+    pixels_buf: &crate::parallel::RawSliceMut,
+) {
+    let row_bytes = (tile.tile_w * tile.bpp) as usize;
+    for row in 0..tile.tile_h {
+        let dst_start = (tile.origin_y + row) as usize * full_bytes_per_row as usize
+            + tile.origin_x as usize * tile.bpp as usize;
+        let src_start = row as usize * tile.tile_bytes_per_row as usize;
+        // SAFETY: distinct tile indices' rectangles never overlap (spec
+        // section 4.2 / `TileLayout::tile_rect`'s grid-partitioning
+        // geometry), so this row's `[dst_start, dst_start + row_bytes)`
+        // range is never targeted by any other concurrent `write_at`
+        // call on this same `RawSliceMut`.
+        unsafe {
+            pixels_buf.write_at(dst_start, &tile.pixels[src_start..src_start + row_bytes]);
+        }
+    }
 }
 
 /// Shared tail end of [`decode_bytes`]/[`decode_bytes_parallel`]: expands

@@ -38,12 +38,28 @@ pub(crate) const MIN_TILES_FOR_PARALLEL: usize = 4;
 ///
 /// This is the standard "known-disjoint-writes" pattern used by, e.g.,
 /// `[T]::chunks_mut`/rayon's parallel iterators internally — the safety
-/// obligation is pushed onto the caller of [`RawSliceMut::as_mut_slice`],
-/// not onto this type itself, since Rust's aliasing rules have no way to
+/// obligation is pushed onto the caller of [`RawSliceMut::write_at`], not
+/// onto this type itself, since Rust's aliasing rules have no way to
 /// express "these two threads never touch the same bytes" through the
 /// type system alone here (the tile rectangles' non-overlap is a property
 /// of [`crate::tiling::TileLayout`]'s geometry, not something encodable in
 /// the slice's type).
+///
+/// **Miri-confirmed pitfall this type deliberately avoids:** an earlier
+/// version of this type exposed `unsafe fn as_mut_slice(&self) -> &mut
+/// [u8]`, reconstructing a `&mut [u8]` over the *entire* buffer on every
+/// call. Even though every call site only ever wrote a disjoint
+/// sub-range through the returned slice, `cargo miri test` caught this
+/// as genuine Undefined Behavior: two `&mut` references simultaneously
+/// covering the same memory extent are a data race under Rust's aliasing
+/// model regardless of whether the actual writes performed through them
+/// overlap — the model operates on reference *provenance/extent*, not on
+/// which bytes are touched. [`write_at`](RawSliceMut::write_at) below
+/// fixes this by never materializing a Rust reference over the shared
+/// buffer at all — it writes through a raw pointer
+/// (`copy_nonoverlapping`), which carries no aliasing requirements of its
+/// own beyond "the target bytes aren't concurrently accessed", exactly
+/// the property every call site already guarantees by construction.
 pub(crate) struct RawSliceMut {
     ptr: *mut u8,
     len: usize,
@@ -52,7 +68,7 @@ pub(crate) struct RawSliceMut {
 // SAFETY: `RawSliceMut` is just a pointer + length with no interior
 // mutability of its own; sending it across threads is safe because it
 // grants no access by itself — all actual access happens through the
-// unsafe `as_mut_slice` method below, whose own safety contract is what
+// unsafe `write_at` method below, whose own safety contract is what
 // prevents data races, not `Send`/`Sync`.
 unsafe impl Send for RawSliceMut {}
 unsafe impl Sync for RawSliceMut {}
@@ -65,25 +81,32 @@ impl RawSliceMut {
         }
     }
 
-    /// Reconstructs the full `&mut [u8]` this was built from.
+    /// Copies `src` into this buffer starting at byte offset `offset`,
+    /// via a raw-pointer `copy_nonoverlapping` rather than
+    /// `std::slice::from_raw_parts_mut` + `copy_from_slice` — see this
+    /// type's doc comment for why the latter is unsound to call
+    /// concurrently even when the actual byte ranges written never
+    /// overlap.
     ///
     /// # Safety
     ///
-    /// The caller must ensure that, across all concurrent calls to this
-    /// method (from any thread) on the same `RawSliceMut`, no two calls
-    /// ever read or write overlapping byte ranges of the returned slice.
-    /// Every call site in this crate satisfies this by construction:
-    /// [`crate::tiling::TileLayout::tile_rect`] partitions the image into
-    /// non-overlapping rectangles, and each worker thread only ever writes
-    /// the rows belonging to the tile indices it was assigned.
-    // clippy's `mut_from_ref` lint exists to catch accidental unsound
-    // `&self -> &mut T` APIs, but that's exactly this type's intentional,
-    // documented purpose (see the safety contract above) — every caller
-    // in this crate is reviewed for disjoint access, so this is allowed
-    // rather than restructured around the lint.
-    #[allow(clippy::mut_from_ref)]
-    pub(crate) unsafe fn as_mut_slice(&self) -> &mut [u8] {
-        std::slice::from_raw_parts_mut(self.ptr, self.len)
+    /// The caller must ensure `offset + src.len() <= self.len`, and
+    /// that across all concurrent calls to this method (from any
+    /// thread) on the same `RawSliceMut`, no two calls ever target
+    /// overlapping `[offset, offset + src.len())` byte ranges. Every
+    /// call site in this crate satisfies this by construction:
+    /// [`crate::tiling::TileLayout::tile_rect`] partitions the image
+    /// into non-overlapping rectangles, and each worker thread only
+    /// ever writes the rows belonging to the tile indices it was
+    /// assigned.
+    pub(crate) unsafe fn write_at(&self, offset: usize, src: &[u8]) {
+        debug_assert!(
+            offset
+                .checked_add(src.len())
+                .is_some_and(|end| end <= self.len),
+            "write_at target range out of bounds"
+        );
+        std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.add(offset), src.len());
     }
 }
 
@@ -246,10 +269,8 @@ mod tests {
             for t in 0..4 {
                 let raw = &raw;
                 s.spawn(move || {
-                    let slice = unsafe { raw.as_mut_slice() };
-                    for byte in slice.iter_mut().skip(t * 25).take(25) {
-                        *byte = t as u8;
-                    }
+                    let chunk = vec![t as u8; 25];
+                    unsafe { raw.write_at(t * 25, &chunk) };
                 });
             }
         });
