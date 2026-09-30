@@ -1671,6 +1671,80 @@ binaries.
       --workspace --all-targets -- -D warnings`, and `cargo doc --workspace
       --no-deps` (with `RUSTDOCFLAGS=-D warnings`, matching CI's `doc` job
       exactly) pass cleanly on Rust 1.98.1.
+- [x] **Remove `unsafe` from parallel decode: `RawSliceMut` replaced with
+      `map_parallel` (post-CI-breakage-fix follow-up).** An audit of every
+      `unsafe` block remaining in the workspace (prompted by a direct
+      question, not a benchmark) found exactly two categories:
+      `cafe-codec::simd`'s AVX2/NEON intrinsics (inherently `unsafe` —
+      calling architecture-specific CPU intrinsics has no safe equivalent
+      in Rust, and is already isolated, contract-documented, and
+      parity-tested per the SIMD (0.2) phase above) and
+      `cafe-codec::parallel`'s `RawSliceMut` (a raw-pointer
+      `unsafe impl Send + Sync` type plus an `unsafe fn write_at`,
+      letting `decode_bytes_parallel`'s worker threads write into
+      disjoint byte ranges of one shared pixel buffer without a lock).
+      Unlike the SIMD case, `RawSliceMut` was not inherent to what the
+      code needed to do — `decode_bytes_parallel` already had every
+      piece needed for a fully safe equivalent sitting right next to it:
+      `decode_tile` already decoded each tile into its own isolated
+      `Vec<u8>` with zero shared-buffer access during the actual
+      decompression/predictor-reversal work, `copy_tile_into_slice`
+      already existed as the ordinary-slice-indexing copy step
+      `decode_bytes`'s sequential loop used, and
+      `crate::parallel::map_parallel` (the value-returning fan-out
+      primitive `encode_bytes_parallel` already used for exactly the same
+      "concurrently produce N independent outputs, then assemble them in
+      order" shape of problem) was sitting unused by the decoder side.
+
+      **Fix:** `decode_bytes_parallel` was rewritten to call
+      `map_parallel` (collecting every tile's `DecodedTile` into a
+      `Vec<DecodedTile>` in scan order, computed concurrently) followed by
+      a single-threaded loop over `copy_tile_into_slice` — an exact
+      structural mirror of how `encode_bytes_parallel` already worked, so
+      the two parallel entry points are now consistent with each other
+      instead of using two different concurrency primitives for the same
+      class of problem. `RawSliceMut`, its `unsafe impl Send`/`unsafe impl
+      Sync`, its `unsafe fn write_at`, `for_each_parallel` (the
+      success/failure-only fan-out primitive only `RawSliceMut`-based code
+      ever called), and `copy_tile_into_raw_slice` were all deleted
+      outright — none had any remaining caller. This removes every
+      `unsafe` block outside `cafe-codec::simd`; a full-workspace
+      `rg unsafe` after this change matches only SIMD intrinsic calls and
+      the doc comments describing them.
+
+      **Cost/benefit, stated plainly rather than assumed:** the change
+      trades a small amount of copy parallelism (the final per-tile
+      `copy_from_slice` into the shared pixel buffer, previously done
+      concurrently via `write_at`, now done sequentially after
+      `map_parallel` returns) for eliminating `unsafe` entirely from this
+      code path. That copy was never the bottleneck this feature's own
+      benchmark (see the parallel-tile-encode/decode phase above) was
+      measuring — ZSTD decompression and predictor reversal dominate
+      per-tile cost by a wide margin — so no new benchmark run was judged
+      necessary to justify this; the pre-existing
+      `test_decode_bytes_parallel_matches_sequential_*` parity tests
+      (byte-for-byte comparison against `decode_bytes`, unchanged by this
+      phase) are sufficient to confirm correctness, since they were
+      already written against the public API, not against `RawSliceMut`'s
+      internals.
+
+      5 tests were removed (`test_raw_slice_mut_disjoint_writes_are_safe`,
+      `test_for_each_parallel_runs_every_index`,
+      `test_for_each_parallel_below_threshold_runs_sequentially`,
+      `test_for_each_parallel_propagates_first_error_by_index`,
+      `test_for_each_parallel_empty_is_ok`) and 1 was added
+      (`test_map_parallel_runs_every_index_exactly_once`, covering the
+      same "every index visited exactly once" property `for_each_parallel`'s
+      removed test covered, now against `map_parallel`), for a net of -4
+      and 324 total workspace tests (down from 328 at the end of the
+      CI-breakage-fix phase — a real decrease, not an error, since the
+      deleted code's own tests are gone along with it): 158 `cafe-codec`
+      (lib, down from 162) + 12 + 3 + 8 (`cafe-codec` integration files,
+      unchanged) + 79 `cafe-format` lib (unchanged) + 3 `chunk_proptest`
+      (unchanged) + 18 `cafe-cli` (unchanged) + 12 golden (unchanged) + 14
+      spec-invariants (unchanged) + 17 `cafe-bench` (unchanged). All
+      workspace tests (324), `cargo fmt --all --check`, and
+      `cargo clippy --all-targets -- -D warnings` pass cleanly.
 
 ## Commands
 
