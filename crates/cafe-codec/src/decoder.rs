@@ -343,6 +343,21 @@ pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
 /// over this function purely to avoid thread overhead on small files —
 /// the only reason to still call [`decode_bytes`] directly is to force
 /// single-threaded, deterministic-scheduling behavior explicitly.
+///
+/// Contains no `unsafe` code: each worker thread decodes its assigned
+/// tile(s) fully into its own freshly-allocated `Vec<u8>`
+/// ([`decode_tile`], via [`crate::parallel::map_parallel`] — no thread
+/// ever touches the final pixel buffer, or any other thread's tile, at
+/// all), and only once every tile has been collected back in scan order
+/// does the (single-threaded) copy into the final pixel buffer happen,
+/// via the same ordinary-slice-indexing [`copy_tile_into_slice`]
+/// [`decode_bytes`] itself uses. An earlier version of this function
+/// shared the pixel buffer across threads directly (a raw-pointer
+/// `write_at` primitive, since removed) to avoid this second copy pass;
+/// that copy is cheap relative to each tile's own ZSTD
+/// decompression/predictor-reversal work (the actual bottleneck, per
+/// `AGENTS.md`'s parallel-tiling benchmark), so trading a small amount
+/// of copy parallelism for a fully safe implementation was a clear win.
 pub fn decode_bytes_parallel(buf: &[u8]) -> Result<DecodedImage> {
     let parsed = parse_chunks(buf)?;
     let total_pixel_bytes = (parsed.ihdr.height as u64)
@@ -354,30 +369,16 @@ pub fn decode_bytes_parallel(buf: &[u8]) -> Result<DecodedImage> {
         })?;
     let mut pixels = vec![0u8; total_pixel_bytes as usize];
 
-    // Each worker thread decodes its assigned tile(s) fully into its own
-    // freshly-allocated `Vec<u8>` first (no shared-buffer access at all
-    // during decompression/unfiltering), then copies only that tile's
-    // rows into `pixels` via `RawSliceMut::write_at` — a raw-pointer
-    // `copy_nonoverlapping`, never a `&mut [u8]` over the shared buffer
-    // (see `RawSliceMut`'s doc comment for why the latter is UB under
-    // Rust's aliasing model even when the actual byte ranges written
-    // never overlap, a real bug this design was changed to fix after
-    // `cargo miri test` caught it in an earlier version of this
-    // function). `TileLayout::tile_rect` partitioning the image into
-    // non-overlapping rectangles (spec section 4.2) is what guarantees
-    // distinct tile indices always target disjoint byte ranges of
-    // `pixels`.
-    let raw_pixels = crate::parallel::RawSliceMut::new(&mut pixels);
     let layout = &parsed.layout;
     let idat_chunks = &parsed.idat_chunks;
     let bpp = parsed.effective_bpp;
-    let bytes_per_row = parsed.bytes_per_row;
-    crate::parallel::for_each_parallel(idat_chunks.len(), move |index| {
+    let tiles = crate::parallel::map_parallel(idat_chunks.len(), move |index| {
         let chunk = &idat_chunks[index];
-        let tile = decode_tile(layout, index, chunk.flag, &chunk.data, bpp)?;
-        copy_tile_into_raw_slice(&tile, bytes_per_row, &raw_pixels);
-        Ok(())
+        decode_tile(layout, index, chunk.flag, &chunk.data, bpp)
     })?;
+    for tile in &tiles {
+        copy_tile_into_slice(tile, parsed.bytes_per_row, &mut pixels);
+    }
 
     finish_decoded_image(
         parsed.ihdr,
@@ -396,9 +397,10 @@ pub fn decode_bytes_parallel(buf: &[u8]) -> Result<DecodedImage> {
 /// buffer, with no reference to (or access of) any other tile's data or
 /// the final shared pixel buffer. This separation (decode fully in
 /// isolation, *then* copy into place) is what lets
-/// [`decode_bytes_parallel`] avoid ever constructing a `&mut [u8]` over
-/// the shared output buffer from multiple threads (see `RawSliceMut`'s
-/// doc comment).
+/// [`decode_bytes_parallel`] run every tile's decompression/predictor-
+/// reversal work concurrently via [`crate::parallel::map_parallel`]
+/// while keeping the final copy into the shared pixel buffer
+/// single-threaded and entirely free of `unsafe` code.
 struct DecodedTile {
     origin_x: u32,
     origin_y: u32,
@@ -414,7 +416,7 @@ struct DecodedTile {
 /// sequential loop and [`decode_bytes_parallel`]'s per-thread work, so
 /// the two can never drift in how a tile's bytes turn into pixels. Does
 /// not touch the final image-sized pixel buffer at all; see
-/// [`copy_tile_into_slice`]/[`copy_tile_into_raw_slice`] for that step.
+/// [`copy_tile_into_slice`] for that step.
 fn decode_tile(
     layout: &TileLayout,
     index: usize,
@@ -462,36 +464,6 @@ fn copy_tile_into_slice(tile: &DecodedTile, full_bytes_per_row: u32, pixels_buf:
         let src_start = row as usize * tile.tile_bytes_per_row as usize;
         pixels_buf[dst_start..dst_start + row_bytes]
             .copy_from_slice(&tile.pixels[src_start..src_start + row_bytes]);
-    }
-}
-
-/// Copies a [`DecodedTile`]'s rows into the correct rectangular region of
-/// a shared [`crate::parallel::RawSliceMut`] via
-/// [`crate::parallel::RawSliceMut::write_at`] — used by
-/// [`decode_bytes_parallel`]'s per-thread work, where `pixels_buf` is
-/// shared across threads and must never be reconstructed as a `&mut
-/// [u8]` (see `RawSliceMut`'s doc comment). Each `write_at` call targets
-/// exactly one row's `row_bytes`-length range, which
-/// [`TileLayout::tile_rect`]'s non-overlapping-rectangles guarantee (spec
-/// section 4.2) ensures no other thread ever touches concurrently.
-fn copy_tile_into_raw_slice(
-    tile: &DecodedTile,
-    full_bytes_per_row: u32,
-    pixels_buf: &crate::parallel::RawSliceMut,
-) {
-    let row_bytes = (tile.tile_w * tile.bpp) as usize;
-    for row in 0..tile.tile_h {
-        let dst_start = (tile.origin_y + row) as usize * full_bytes_per_row as usize
-            + tile.origin_x as usize * tile.bpp as usize;
-        let src_start = row as usize * tile.tile_bytes_per_row as usize;
-        // SAFETY: distinct tile indices' rectangles never overlap (spec
-        // section 4.2 / `TileLayout::tile_rect`'s grid-partitioning
-        // geometry), so this row's `[dst_start, dst_start + row_bytes)`
-        // range is never targeted by any other concurrent `write_at`
-        // call on this same `RawSliceMut`.
-        unsafe {
-            pixels_buf.write_at(dst_start, &tile.pixels[src_start..src_start + row_bytes]);
-        }
     }
 }
 
