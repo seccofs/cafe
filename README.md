@@ -1,7 +1,7 @@
 # CAFE — Compression Adaptive Filtering Experiment
 
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-green)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange)](https://www.rust-lang.org)
 
 A chunk-based image format inspired by PNG: instead of reinventing a
 general-purpose compressor, CAFE adaptively transforms pixels (per-row
@@ -12,7 +12,9 @@ predictors) so that Zstandard compresses them exceptionally well.
 boringly-simple spec. See [Status](#status) and [`AGENTS.md`](AGENTS.md)
 for the full phased roadmap, design rationale, and per-phase implementation
 notes.
-**Compatibility**: Rust 2021+
+**Compatibility**: Rust 2021 edition, MSRV 1.88 (set by the `image` crate,
+a direct dependency of `cafe-cli`/`cafe-bench` — CAFE's own source only
+needs 1.82)
 
 ---
 

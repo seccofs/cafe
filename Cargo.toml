@@ -10,6 +10,13 @@ members = [
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
+# MSRV is dictated by the `image` crate (a direct production dependency of
+# cafe-cli/cafe-bench), not by cafe's own source code, which only needs
+# 1.82 (Option::is_none_or). Verified empirically: 1.85.0 fails to build
+# this workspace's Cargo.lock (`built@0.8.1` requires >=1.87, `image
+# 0.25.10` requires >=1.88.0); 1.88.0 builds cleanly. Bump this only after
+# re-verifying with `cargo +<version> check --workspace --all-targets`.
+rust-version = "1.88"
 authors = ["Daniel Secco <barista@format.cafe>"]
 license = "BSD-3-Clause"
 repository = "https://github.com/seccofs/cafe"

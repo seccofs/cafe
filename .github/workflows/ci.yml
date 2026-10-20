@@ -35,6 +35,16 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --release
 
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Check workspace builds on the documented MSRV
+        run: cargo check --workspace --all-targets
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest

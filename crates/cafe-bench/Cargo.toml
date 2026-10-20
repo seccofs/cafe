@@ -3,6 +3,7 @@ name = "cafe-bench"
 description = "Comparative benchmark harness: CAFE vs PNG (and later WebP/JPEG XL/AVIF) over the corpus/ dataset."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
