@@ -346,11 +346,11 @@ pub fn decode_bytes(buf: &[u8]) -> Result<DecodedImage> {
 ///
 /// Contains no `unsafe` code: each worker thread decodes its assigned
 /// tile(s) fully into its own freshly-allocated `Vec<u8>`
-/// ([`decode_tile`], via [`crate::parallel::map_parallel`] — no thread
+/// (`decode_tile`, via `crate::parallel::map_parallel` — no thread
 /// ever touches the final pixel buffer, or any other thread's tile, at
 /// all), and only once every tile has been collected back in scan order
 /// does the (single-threaded) copy into the final pixel buffer happen,
-/// via the same ordinary-slice-indexing [`copy_tile_into_slice`]
+/// via the same ordinary-slice-indexing `copy_tile_into_slice`
 /// [`decode_bytes`] itself uses. An earlier version of this function
 /// shared the pixel buffer across threads directly (a raw-pointer
 /// `write_at` primitive, since removed) to avoid this second copy pass;
